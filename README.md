@@ -36,3 +36,7 @@ Run the commands from this folder, in this order. Command names follow your inst
    `/speckit-implement` → `/speckit-converge` (repeat until it reports "Converged.").
 
 Specs say what and why, never the tech stack; the stack lives in the plan. `docs/SPEC.md` stays the reference each prompt cites.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Each port carries its own copy (for example `ports/py/LICENSE`).

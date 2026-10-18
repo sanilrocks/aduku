@@ -67,3 +67,7 @@ This code sits in `ports/py/` of the aduku repository while the specification an
 assumption (recorded in the plan, and open to change) is that once they are stable it moves to its own `aduku-py`
 repository, with `conformance/` shared with the other ports (`aduku-java`, `aduku-rs`, `aduku-js`) as a Git submodule or
 a pinned release.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
