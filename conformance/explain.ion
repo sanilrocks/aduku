@@ -1,0 +1,23 @@
+// US6: the answer names the winning entry and the rule; a defaulted field nobody wrote comes from the default.
+case::{
+  name: "explain",
+  schema: schema::{
+    id: "customer", version: 1, tiers: [backfill, user, admin],
+    fields: {
+      "/age": {type: int, merge: max},
+      "/name": {type: string, merge: lww},
+      "/currency": {type: string, merge: lww, default: "USD"}
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/age", value: 10}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/age", value: 30}] },
+      expect: { accepted: [{seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/age", value: 20}] },
+      expect: { accepted: [{seq: 3}] } },
+    { explain: { doc: "d1", path: "/age" }, expect: { rule: "max@1", winner_seq: 2 } },
+    { explain: { doc: "d1", path: "/currency" }, expect: { winner: "default", rule: "lww@1" } },
+    { explain: { doc: "d1", path: "/name" }, expect: { winner: null } }
+  ]
+}

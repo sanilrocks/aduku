@@ -1,0 +1,42 @@
+// US4: a default is the lowest layer; a contribution replaces it; a delete beats it unless the field says on_delete: default.
+case::{
+  name: "defaults-on-delete",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: {
+      "/currency": {type: string, merge: lww, default: "USD", on_delete: absent},
+      "/plan": {type: string, merge: lww, default: "free", on_delete: default}
+    }
+  },
+  steps: [
+    // no contributions: the document holds only the defaults
+    { get: "d1", expect: { document: '{currency:"USD",plan:"free"}' } },
+
+    // any contribution replaces the default
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/currency", value: "EUR"}, {tier: user, path: "/plan", value: "pro"}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { get: "d1", expect: { document: '{currency:"EUR",plan:"pro"}' } },
+
+    // a delete removes currency (on_delete: absent) and sends plan back to its default (on_delete: default)
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]},
+                entries: [{tier: admin, path: "/currency", op: delete}, {tier: admin, path: "/plan", op: delete}] },
+      expect: { accepted: [{seq: 3}, {seq: 4}] } },
+    { get: "d1", expect: { document: '{plan:"free"}' } },
+
+    // a later write from a lower tier cannot revive the deleted field
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]},
+                entries: [{tier: backfill, path: "/currency", value: "GBP"}] },
+      expect: { accepted: [{seq: 5}] } },
+    { get: "d1", expect: { document: '{plan:"free"}' } },
+
+    // the deleting tier can create it again
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]},
+                entries: [{tier: admin, path: "/currency", value: "JPY"}] },
+      expect: { accepted: [{seq: 6}] } },
+    { get: "d1", expect: { document: '{currency:"JPY",plan:"free"}' } },
+
+    // another document is independent and still shows the defaults
+    { get: "d2", expect: { document: '{currency:"USD",plan:"free"}' } }
+  ]
+}

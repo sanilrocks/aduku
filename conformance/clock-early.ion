@@ -1,0 +1,23 @@
+// One of a pair of cases that differ only in the harness clock (this one: early). tx_time is informational, so the two
+// must give identical results; in the later case the clock even runs backwards.
+case::{
+  name: "clock-early",
+  clock: {start: 2020-01-01T00:00:00Z, step_seconds: 1},
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user],
+    fields: {
+      "/name": {type: string, merge: lww},
+      "/age": {type: int, merge: max},
+      "/tags": {type: "list<string>", merge: union}
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", value: "first"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/name", value: "backfilled"}, {tier: backfill, path: "/age", value: 40}] },
+      expect: { accepted: [{seq: 2}, {seq: 3}] } },
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", value: "second"}, {tier: user, path: "/age", value: 41}, {tier: user, path: "/tags", value: ["b", "a"]}] },
+      expect: { accepted: [{seq: 4}, {seq: 5}, {seq: 6}] } },
+    { get: "d1", expect: { document: '{age:41,name:"second",tags:["b","a"]}', model_errors: [] } }
+  ]
+}

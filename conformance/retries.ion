@@ -1,0 +1,37 @@
+// FR-008: a retry with the same request key, payload and identity is a no-op; a deliberate repeat without a key is applied.
+case::{
+  name: "retries",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 1}], duplicate: false } },
+
+    // retry: same key, payload and identity -> not admitted, original entries returned
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 1}], duplicate: true } },
+
+    // same key, different payload -> rejected, original kept
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "Mallory"}] },
+      expect: { rejected: { code: REQUEST_KEY_REUSED } } },
+
+    // another writer changes the value, then the first writer sets it back, without a key: applied again
+    { append: { doc: "d1", contributor: {id: "bob", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Bob"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 3}], duplicate: false } },
+
+    // reusing an entry idempotency key rejects the request
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/age", value: 1, idem_key: "E1"}] },
+      expect: { accepted: [{seq: 4}] } },
+    { append: { doc: "d1", contributor: {id: "bob", tiers: [user]},
+                entries: [{tier: user, path: "/age", value: 2, idem_key: "E1"}] },
+      expect: { rejected: { code: DUPLICATE_IDEM_KEY } } }
+  ]
+}

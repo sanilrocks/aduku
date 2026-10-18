@@ -1,0 +1,72 @@
+// SPEC 16.1 through P3: thirteen requests in seq order, the merged document, and a rejected write to a derived field.
+// Derived fields are parsed and unwritable in this feature, so `displayName` is absent from the document.
+// The audit on/off behaviour for the rejection is checked in tests/golden/test_worked_example.py.
+case::{
+  name: "worked-example-16-1",
+  schema:
+  schema::{
+    id: "customer", version: 7,
+    tiers: [backfill, user, admin],
+    lenient: { allowed: [backfill] },
+
+    fields: {
+      "/name":         { type: string, merge: lww, validate: [non_empty, max_len::{n: 120}] },
+      "/age":          { type: int, merge: max, validate: [range::{min: 0, max: 150}] },
+      "/tags":         { type: "list<string>", merge: union },
+      "/address":      { type: struct, merge: struct },
+      "/address/city": { type: string, merge: lww },
+      "/address/zip":  { type: string, merge: lww },
+      "/country":      { type: string, merge: lww },
+      "/spouses":      { type: "list<string>", merge: lww },
+      "/phone":        { type: string, merge: lww },
+      "/currency":     { type: string, merge: lww, default: "USD", on_delete: absent },
+      "/plan":         { type: string, merge: lww, default: "free", authority: [admin] },
+
+      "/displayName":  { type: string, computed: { macro: upper, args: ["/name"] } },
+
+      "/*":            { merge: lww }
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/name", value: "A. Smith"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/phone", value: "555-0100"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/age", value: 30}] },
+      expect: { accepted: [{seq: 3}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/tags", value: ["x"]}] },
+      expect: { accepted: [{seq: 4}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 5}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/address/zip", value: "78701"}] },
+      expect: { accepted: [{seq: 6}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 28}] },
+      expect: { accepted: [{seq: 7}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/tags", value: ["y"]}] },
+      expect: { accepted: [{seq: 8}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/tags", value: ["z"]}] },
+      expect: { accepted: [{seq: 9}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice S."}] },
+      expect: { accepted: [{seq: 10}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/phone", op: delete}] },
+      expect: { accepted: [{seq: 11}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/address/city", value: "Paris"}] },
+      expect: { accepted: [{seq: 12}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/currency", value: "EUR"}] },
+      expect: { accepted: [{seq: 13}] } },
+
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",name:"Alice S.",plan:"free",tags:["x","y","z"]}',
+                           model_errors: [] } },
+
+    // an admin may not write a derived field; the request is rejected, is not a ledger entry and consumes no seq
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName", value: "HACKED"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/displayName"}] } } },
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",name:"Alice S.",plan:"free",tags:["x","y","z"]}' } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice S."}] },
+      expect: { accepted: [{seq: 14}] } },
+
+    { explain: { doc: "d1", path: "/age" }, expect: { rule: "max@1", winner_seq: 3 } },
+    { explain: { doc: "d1", path: "/plan" }, expect: { winner: "default" } },
+    { rebuild: "d1", expect: { identical: true } }
+  ]
+}

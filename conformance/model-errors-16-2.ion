@@ -1,0 +1,67 @@
+// SPEC 16.2 steps 1 to 7.
+case::{
+  name: "model-errors-16-2",
+  fixtures: ["acme.max_spouses_by_country@1"],
+  schemas: [
+    schema::{
+      id: "customer", version: 7, tiers: [backfill, user, admin],
+      lenient: { allowed: [backfill] },
+      fields: {
+        "/name": {type: string, merge: lww},
+        "/age": {type: int, merge: lww, validate: [range::{min: 0, max: 150}]},
+        "/country": {type: string, merge: lww},
+        "/spouses": {type: "list<string>", merge: lww}
+      },
+      document_validate: ["acme.max_spouses_by_country@1"]
+    },
+    schema::{
+      id: "customer", version: 8, tiers: [backfill, user, admin],
+      lenient: { allowed: [backfill] },
+      fields: {
+        "/name": {type: string, merge: lww, validate: [max_len::{n: 2}]},
+        "/age": {type: int, merge: lww, validate: [range::{min: 0, max: 150}]},
+        "/country": {type: string, merge: lww},
+        "/spouses": {type: "list<string>", merge: lww}
+      },
+      document_validate: ["acme.max_spouses_by_country@1"]
+    }
+  ],
+  steps: [
+    // 1: a permitted writer records data that breaks the rule; it is kept, with model error E1
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, lenient: true,
+                entries: [{tier: backfill, path: "/country", value: "US"}, {tier: backfill, path: "/spouses", value: ["A", "B"]}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { get: "d1", expect: { document: '{country:"US",spouses:["A","B"]}',
+                           model_errors: [{rule: "max_spouses_by_country", path: "/spouses"}] } },
+
+    // 2: an unrelated update is accepted; the errors are unchanged
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Pat"}] },
+      expect: { accepted: [{seq: 3}] } },
+    { get: "d1", expect: { model_errors: [{rule: "max_spouses_by_country", path: "/spouses"}] } },
+
+    // 3: an unflagged request that would add an error is rejected
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/age", value: -5}] },
+      expect: { rejected: { code: MODEL_ERROR_INTRODUCED } } },
+
+    // 4: a writer the schema does not permit may not use the flag, even for data that is fine
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, lenient: true,
+                entries: [{tier: user, path: "/age", value: 30}] },
+      expect: { rejected: { code: LENIENT_NOT_PERMITTED } } },
+
+    // 5: a permitted flagged request adds an error on a document that already has one
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, lenient: true,
+                entries: [{tier: backfill, path: "/age", value: -5}] },
+      expect: { accepted: [{seq: 4}] } },
+    { get: "d1", expect: { model_errors: [{rule: "max_spouses_by_country", path: "/spouses"}, {rule: "range", path: "/age"}] } },
+
+    // 6: a request that fixes one error and adds none is accepted; the other error stays
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/spouses", value: ["A"]}] },
+      expect: { accepted: [{seq: 5}] } },
+    { get: "d1", expect: { document: '{age:-5,country:"US",name:"Pat",spouses:["A"]}',
+                           model_errors: [{rule: "range", path: "/age"}] } },
+
+    // 7: schema v8 adds max_len 2 on /name; the first read after the change re-derives and shows E3 beside E2
+    { activate_schema: 8 },
+    { get: "d1", expect: { model_errors: [{rule: "max_len", path: "/name"}, {rule: "range", path: "/age"}] } }
+  ]
+}

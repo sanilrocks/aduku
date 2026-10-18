@@ -1,0 +1,69 @@
+// US3 scenario 4 (FR-011) and the fail-closed rules of SPEC 5.1: every refused schema reports a stable problem code.
+// Ports compare codes, not message text.
+case::{
+  name: "schema-load-failures",
+  fixtures: ["acme.subtract@1", "acme.longest@1"],
+  steps: [
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a, b],
+        fields: {"/age": {type: int, merge: max}, "/tags": {type: "list<string>", merge: union},
+                 "/note": {type: string, merge: custom::"acme.longest@1"}, "/*": {merge: lww}}}''',
+      expect: { ok: true } },
+
+    // a custom merge rule that does not declare associativity is refused
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: custom::"acme.subtract@1"}}}''',
+      expect: { problems: [MERGE_NOT_ASSOCIATIVE] } },
+
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: telepathy}}}''',
+      expect: { problems: [UNKNOWN_BEHAVIOR] } },
+
+    // max and min need an ordered type
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/flag": {type: bool, merge: max}, "/loose": {merge: min}}}''',
+      expect: { problems: [MERGE_TYPE_UNSUITABLE] } },
+
+    // nothing may depend on a deferred field
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {
+          "/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "credit.score@1", depends: ["/name"]}},
+          "/label": {type: string, computed: {macro: concat, args: ["/score"]}}}}''',
+      expect: { problems: [DEPENDS_ON_DEFERRED] } },
+
+    // derived fields may not depend on each other in a loop
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {
+          "/a": {type: int, computed: {macro: copy, args: ["/b"]}}, "/b": {type: int, computed: {macro: copy, args: ["/a"]}}}}''',
+      expect: { problems: [DEPENDENCY_CYCLE] } },
+
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: lww, default: "x", on_delete: default}}}''',
+      expect: { problems: [DEFAULT_TYPE_MISMATCH] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: lww, on_delete: default}}}''',
+      expect: { problems: [ON_DELETE_NEEDS_DEFAULT] } },
+
+    // tiers named by the schema must exist; tier names must be unique
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], lenient: {allowed: [ghost]}, fields: {"/n": {type: int, merge: lww, authority: [phantom]}}}''',
+      expect: { problems: [UNKNOWN_TIER] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a, a], fields: {}}''',
+      expect: { problems: [DUPLICATE_TIER] } },
+
+    // an enabled rejection audit needs a retention limit
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], rejection_audit: {enabled: true}, fields: {}}''',
+      expect: { problems: [AUDIT_RETENTION_REQUIRED] } },
+
+    // a default needs an exact path
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/*": {merge: lww, default: 1}}}''',
+      expect: { problems: [DEFAULT_ON_PATTERN] } },
+
+    // an operation that does not exist yet, and a retention age of zero
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: lww, ops: [increment]}}}''',
+      expect: { problems: [OP_NOT_SUPPORTED] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], rejection_audit: {enabled: true, retention: {max_age: "0s"}}, fields: {}}''',
+      expect: { problems: [RETENTION_NOT_POSITIVE] } },
+
+    // validator arguments are checked when the schema loads, not when the first write fails
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: lww, validate: [range::{min: "x"}]}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+
+    // several problems at once are all reported
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a, a], rejection_audit: {enabled: true},
+          fields: {"/x": {type: bool, merge: max}, "/y": {type: int, merge: telepathy}}}''',
+      expect: { problems: [DUPLICATE_TIER, AUDIT_RETENTION_REQUIRED, MERGE_TYPE_UNSUITABLE, UNKNOWN_BEHAVIOR] } }
+  ]
+}

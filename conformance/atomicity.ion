@@ -1,0 +1,33 @@
+// US1 scenarios 3, 4 and 6 and the atomicity rule (FR-029): a rejected request records nothing and consumes no seq.
+case::{
+  name: "atomicity",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max}, "/displayName": {type: string, computed: {macro: upper, args: ["/name"]}} }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "Alice"}, {tier: user, path: "/age", value: 30}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+
+    // one bad entry among good ones: the whole request is rejected, every reason is listed
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/age", value: 31}, {tier: user, path: "/nope", value: 1},
+                          {tier: user, path: "/age", value: "x"}, {tier: user, path: "/displayName", value: "HACKED"}] },
+      expect: { rejected: { code: UNKNOWN_PATH,
+                            reasons: [{path: "/nope"}, {path: "/age"}, {path: "/displayName"}] } } },
+
+    // the rejected request consumed no sequence numbers
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 32}] },
+      expect: { accepted: [{seq: 3}] } },
+
+    // entries of one request may depend on each other: only the final result of the request matters
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", op: delete}, {tier: user, path: "/name", value: "Bob"}] },
+      expect: { accepted: [{seq: 4}, {seq: 5}] } },
+
+    // another document has its own sequence
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Eve"}] },
+      expect: { accepted: [{seq: 1}] } }
+  ]
+}

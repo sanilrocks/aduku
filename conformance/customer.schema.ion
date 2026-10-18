@@ -1,0 +1,28 @@
+// Shared schema for the worked examples (docs/SPEC.md 16.1, 16.2) and the quickstart.
+// Parameterized types are quoted strings ("list<string>") because list<string> is not valid Ion syntax.
+schema::{
+  id: "customer", version: 7,
+  tiers: [backfill, user, admin],
+  lenient: { allowed: [backfill] },
+  rejection_audit: { enabled: true, mode: full, retention: { max_entries: 1000, max_age: "90d" } },
+
+  fields: {
+    "/name":         { type: string, merge: lww, validate: [non_empty, max_len::{n: 120}] },
+    "/age":          { type: int, merge: max, validate: [range::{min: 0, max: 150}] },
+    "/tags":         { type: "list<string>", merge: union },
+    "/address":      { type: struct, merge: struct },
+    "/address/city": { type: string, merge: lww },
+    "/address/zip":  { type: string, merge: lww },
+    "/country":      { type: string, merge: lww },
+    "/spouses":      { type: "list<string>", merge: lww },
+    "/phone":        { type: string, merge: lww },
+    "/currency":     { type: string, merge: lww, default: "USD", on_delete: absent },
+    "/plan":         { type: string, merge: lww, default: "free", authority: [admin] },
+
+    // Derived: parsed and made unwritable in this feature, evaluated by later features.
+    "/displayName":  { type: string, computed: { macro: upper, args: ["/name"] } },
+
+    "/*":            { merge: lww }
+  }
+  // The 16.2 document rule (max_spouses_by_country) is a fixture behavior; its schema is in model-errors-16-2.ion.
+}
