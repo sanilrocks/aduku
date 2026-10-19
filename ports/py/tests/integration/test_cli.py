@@ -315,3 +315,110 @@ def test_recompute_of_a_field_that_cannot_be_called_exits_1(
 ) -> None:
     code, out, _ = run(capsys, *impure_env, "recompute", "d1", "/taxId", "--contributor", "root", "--tier", "admin")
     assert code == 1 and out["failed"] == [{"field": "/taxId", "kind": "missing_input"}]
+
+
+# -- feature 003: deferred fields ------------------------------------------------------------------------------------
+
+DEFERRED_SCHEMA = pathlib.Path(DEMO) / "deferred.schema.ion"
+
+
+@pytest.fixture
+def deferred_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    monkeypatch.syspath_prepend(DEMO)
+    monkeypatch.delenv("DEMO_DOWN", raising=False)
+    return ["--db", str(tmp_path / "cli.db"), "--schema", str(DEFERRED_SCHEMA), "--behaviors", "demo_sources"]
+
+
+def write(capsys: pytest.CaptureFixture[str], env: list[str], doc: str, *sets: str) -> None:
+    flags = [item for s in sets for item in ("--set", s)]
+    code, _, _ = run(capsys, *env, "append", doc, "--contributor", "alice", "--tier", "user", *flags)
+    assert code == 0
+
+
+def test_get_prints_deferred_values_and_the_statuses_and_calls_each_source_once(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"', '/country="US"')
+    code, out, err = run(capsys, *deferred_env, "get", "d1")
+    assert code == 0 and "creditScore:deferred::712" in out["document"] and "fxRate:deferred::0.92" in out["document"]
+    assert "creditLimit:deferred::7120" in out["document"]
+    statuses = {d["path"]: d["status"] for d in out["deferred"]}
+    assert statuses["/creditScore"] == statuses["/fxRate"] == statuses["/creditLimit"] == "ok"
+    assert err.count("fx.score called") == 1 and err.count("fx.rate called") == 1 and "fx.batch" not in err
+    code, out, err = run(capsys, *deferred_env, "get", "d1")
+    assert code == 0 and "called" not in err  # served from the store: no call
+
+
+def test_get_fresh_asks_the_per_fetch_source_again_and_pending_says_what_waits(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"')  # no country
+    run(capsys, *deferred_env, "get", "d1")
+    code, out, err = run(capsys, *deferred_env, "get", "d1", "--fresh", "--include", "pending")
+    assert err.count("fx.rate called") == 1 and "fx.score" not in err
+    limit = next(d for d in out["deferred"] if d["path"] == "/creditLimit")
+    assert (limit["status"], limit["reason"], limit["waiting_for"]) == ("pending", "inputs_missing", ["/country"])
+
+
+def test_invalidate_scheduler_and_notify_through_the_cli(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"', '/country="US"')
+    run(capsys, *deferred_env, "get", "d1")
+    refused = ["--contributor", "eve", "--tier", "user"]
+    code, out, _ = run(capsys, *deferred_env, "invalidate", "d1", "/creditScore", *refused)
+    assert code == 1 and out["rejected"]["code"] == "NOT_AUTHORIZED"
+    admin = ["--contributor", "root", "--tier", "admin"]
+    code, out, _ = run(capsys, *deferred_env, "invalidate", "d1", "/creditScore", *admin)
+    assert code == 0 and out["marked"] == 1
+    code, out, err = run(capsys, *deferred_env, "get", "d1")
+    assert err.count("fx.score called") == 1  # asked again, once
+    code, out, err = run(capsys, *deferred_env, "scheduler", "run", "fx.batch@1", *admin)
+    assert (
+        code == 0
+        and (out["attempted"], out["succeeded"], out["calls"]) == (1, 1, 1)
+        and "fx.batch called with 1" in err
+    )
+    code, out, _ = run(capsys, *deferred_env, "scheduler", "run", "fx.batch@1", *refused)
+    assert code == 1 and out["rejected"]["code"] == "NOT_AUTHORIZED"
+    code, out, _ = run(capsys, *deferred_env, "scheduler", "run", "sanctions.check@1", *admin)
+    assert out["attempted"] == 1
+    code, out, _ = run(capsys, *deferred_env, "notify", "sanctions.updated", "d1")
+    assert code == 0 and out["marked"] == 1
+    code, out, err = run(capsys, *deferred_env, "scheduler", "run", "sanctions.check@1", *admin)
+    assert out["attempted"] == 1 and "sanctions.check called" in err
+
+
+def test_deferred_list_shows_the_stored_state_and_never_a_value(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"', '/country="US"')
+    run(capsys, *deferred_env, "get", "d1")
+    code, out, _ = run(capsys, *deferred_env, "deferred", "list", "d1")
+    fields = {item["field"]: item for item in out["deferred"]}
+    assert code == 0 and fields["/creditScore"]["status"] == "ok" and fields["/creditScore"]["invalidated"] is False
+    assert "712" not in json.dumps(out)
+
+
+def test_explain_of_a_deferred_path_and_schema_check_inventory(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"', '/country="US"')
+    run(capsys, *deferred_env, "get", "d1")
+    code, out, _ = run(capsys, *deferred_env, "explain", "d1", "/creditScore")
+    assert (out["winner"], out["rule"], out["status"]) == ("deferred", "fx.score@1", "ok")
+    assert out["dependencies"] == [{"path": "/name", "value": '"Alice"'}]
+    code, out, _ = run(capsys, *deferred_env, "schema", "check", str(DEFERRED_SCHEMA))
+    fields = {item["field"]: item for item in out["deferred"]}
+    assert code == 0 and set(fields) >= {"/creditScore", "/fxRate", "/riskBand", "/sanctionsFlag"}
+    assert fields["/fxRate"]["ttl"] == 300.0 and fields["/fxRate"]["on_failure"] == "serve_stale"
+    assert fields["/creditScore"]["invalidate_by"] == ["admin"] and fields["/riskBand"]["refresh"] == ["scheduled"]
+
+
+def test_a_down_source_does_not_fail_the_read(
+    deferred_env: list[str], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(capsys, deferred_env, "d1", '/name="Alice"', '/currency="EUR"', '/country="US"')
+    monkeypatch.setenv("DEMO_DOWN", "1")
+    code, out, _ = run(capsys, *deferred_env, "get", "d1")
+    assert code == 0 and next(d for d in out["deferred"] if d["path"] == "/fxRate")["status"] == "error"

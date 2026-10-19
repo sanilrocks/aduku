@@ -1,0 +1,63 @@
+// Feature 003, US6: a failing source changes only a field's status. The three on_failure modes, a stale value for changed
+// inputs, a failed attempt held until the ttl, and a write that is accepted whatever the sources do.
+//   err   : on_failure error,       source fx.down@1 (always fails)
+//   abs   : on_failure absent,      source fx.fail@1 (always fails; another source, so another breaker)
+//   stale : on_failure serve_stale, source fx.flaky@1 (fails the first call for an input, then answers "tax-" + country)
+case::{
+  name: "deferred-failures",
+  fixtures: ["fx.down@1", "fx.fail@1", "fx.flaky@1"],
+  clock: { start: 2026-10-19T12:00:00Z, step_seconds: 0 },
+  schema:
+  schema::{
+    id: "failures", version: 1,
+    tiers: [backfill, user, admin],
+    fields: {
+      "/country": { type: string, merge: lww },
+
+      "/err":   { type: string, deferred: { hook: "fx.down@1", depends: ["/country"], refresh: per_fetch, ttl: "5m",
+                                             on_failure: error, retry: {max: 0}, invalidate_by: [admin] } },
+      "/abs":   { type: string, deferred: { hook: "fx.fail@1", depends: ["/country"], refresh: per_fetch, ttl: "5m",
+                                             on_failure: absent, retry: {max: 0}, invalidate_by: [admin] } },
+      "/stale": { type: string, deferred: { hook: "fx.flaky@1", depends: ["/country"], refresh: per_fetch, ttl: "5m",
+                                             on_failure: serve_stale, retry: {max: 0}, invalidate_by: [admin] } }
+    }
+  },
+  steps: [
+    // a write is accepted whatever the sources do, and adds no model error
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 1}] } },
+
+    // every source fails (flaky fails its first call): each field follows its own policy
+    { get: "d1", expect: { model_errors: [],
+        document: '{country:"US",err:deferred::null,stale:deferred::null}',
+        deferred: { "/err": { status: error }, "/abs": { status: error, absent: true }, "/stale": { status: error } } } },
+    { source_calls: "fx.down@1", expect: { count: 1 } },
+    { source_calls: "fx.fail@1", expect: { count: 1 } },
+    { source_calls: "fx.flaky@1", expect: { count: 1 } },
+
+    // a failed attempt is not repeated inside the ttl
+    { get: "d1", expect: {} },
+    { source_calls: "fx.down@1", expect: { count: 1 } },
+
+    // at the ttl the sources are asked again: flaky answers now, the others fail again
+    { clock: { advance: "5m" } },
+    { get: "d1", expect: { deferred: { "/err": { status: error }, "/stale": { status: ok, value: "tax-US" } } } },
+    { source_calls: "fx.down@1", expect: { count: 2 } },
+    { source_calls: "fx.flaky@1", expect: { count: 2 } },
+
+    // a changed input is asked at once; flaky fails for it, so the last good value is served, marked stale
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "DE"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { get: "d1", expect: { model_errors: [],
+        document: '{country:"DE",err:deferred::null,stale:deferred::"tax-US"}',
+        deferred: { "/err": { status: error }, "/abs": { status: error, absent: true }, "/stale": { status: stale, value: "tax-US" } } } },
+    { source_calls: "fx.flaky@1", expect: { count: 3 } },
+    { get: "d1", expect: { deferred: { "/stale": { status: stale } } } },
+    { source_calls: "fx.flaky@1", expect: { count: 3 } },
+
+    // a failure never reaches the core: a rebuild is identical and calls nothing
+    { rebuild: "d1", expect: { identical: true } },
+    { source_calls: "fx.down@1", expect: { count: 3 } },
+    { source_calls: "fx.flaky@1", expect: { count: 3 } }
+  ]
+}

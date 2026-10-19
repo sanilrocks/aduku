@@ -1,0 +1,31 @@
+// A schema for trying deferred fields from the command line:
+//   aduku --behaviors demo_sources --schema examples/deferred.schema.ion ...   (with PYTHONPATH=examples)
+schema::{
+  id: "customer", version: 1,
+  tiers: [backfill, user, admin],
+
+  fields: {
+    "/name":     { type: string, merge: lww },
+    "/currency": { type: string, merge: lww },
+    "/country":  { type: string, merge: lww },
+
+    // fetched once, on the first read, and kept
+    "/creditScore": { type: int, deferred: { hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [admin] } },
+
+    // fetched on read, at most every five minutes; the last good rate is shown if the service is down
+    "/fxRate": { type: decimal, deferred: { hook: "fx.rate@1", depends: ["/currency"], refresh: per_fetch, ttl: "5m",
+                                             on_failure: serve_stale, invalidate_by: [admin] } },
+
+    // needs the score: asked only once the score has a value
+    "/creditLimit": { type: int, deferred: { hook: "fx.limit@1", depends: ["/creditScore", "/country"], refresh: once,
+                                              invalidate_by: [admin] } },
+
+    // refreshed hourly by `aduku scheduler run fx.batch@1`, in batches
+    "/riskBand": { type: string, deferred: { hook: "fx.batch@1", depends: ["/country"], refresh: scheduled::{every: "1h"},
+                                              invalidate_by: [admin] } },
+
+    // recomputed by `scheduler run` after `aduku notify sanctions.updated`
+    "/sanctionsFlag": { type: string, deferred: { hook: "sanctions.check@1", depends: ["/name"],
+                                                   refresh: notification::{topic: "sanctions.updated"}, invalidate_by: [admin] } }
+  }
+}

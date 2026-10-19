@@ -116,10 +116,10 @@ def test_a_retry_whose_view_cannot_be_read_says_so(monkeypatch: pytest.MonkeyPat
     service = make_service(backend)
     service.append("d1", [put()], contributor=ALICE, request_key="K")
 
-    def failing(doc: str):  # type: ignore[no-untyped-def]
+    def failing(doc: str, schema: object):  # type: ignore[no-untyped-def]
         raise StorageError("disk error")
 
-    monkeypatch.setattr(service, "get", failing)
+    monkeypatch.setattr(service, "_core", failing)  # the view of a retry is the merged document (never a source call)
     with pytest.raises(StorageError):
         service.append("d1", [put()], contributor=ALICE, request_key="K")
     assert len(service.list_entries("d1")) == 1  # nothing was written by the retry

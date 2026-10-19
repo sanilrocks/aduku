@@ -6,20 +6,29 @@ import re
 from typing import Any
 
 from aduku.behaviors.registry import BehaviorRegistry
+from aduku.engine.schedule import ScheduleError, parse_schedule
 from aduku.errors import SchemaError
 from aduku.ion_codec import Annotated, FrozenStruct, IonError, Symbol, parse
 from aduku.paths import PathError, parse_path, parse_pattern
 from aduku.schema.model import (
+    DEFAULT_SOURCE_BACKOFF,
+    DEFAULT_SOURCE_DEADLINE,
+    DEFAULT_SOURCE_RETRIES,
+    DEFAULT_SOURCE_TIMEOUT,
     MAX_HOOK_DEADLINE,
     MAX_HOOK_RETRIES,
     MAX_HOOK_TIMEOUT,
+    MAX_SOURCE_BACKOFF,
+    MIN_TTL,
     MISSING,
     AuditSettings,
     BehaviorRef,
     ComputedSpec,
+    DeferredSpec,
     FieldSpec,
     ImpureSpec,
     MacroArg,
+    RefreshPolicy,
     Schema,
     conforms,
     parse_type,
@@ -35,6 +44,7 @@ TOP_KEYS = {
     "lenient",
     "rejection_audit",
     "impure_failure_mode",
+    "deferred_on_failure",
     "fields",
     "document_validate",
     "doc",
@@ -57,12 +67,25 @@ FIELD_KEYS = {
 COMPUTED_KEYS = {"macro", "args", "impure", "doc"}
 IMPURE_REQUIRED = ("hook", "depends", "reason", "timeout", "retry", "deadline", "recompute_by")
 IMPURE_KEYS = {*IMPURE_REQUIRED, "failure_mode"}
+DEFERRED_REQUIRED = ("hook", "depends", "refresh", "invalidate_by")
+DEFERRED_KEYS = {
+    *DEFERRED_REQUIRED,
+    "ttl",
+    "on_dependency_change",
+    "on_failure",
+    "timeout",
+    "retry",
+    "deadline",
+    "doc",
+}
+ON_FAILURE = ("error", "serve_stale", "absent")
+REFRESH_KINDS = ("once", "per_fetch", "scheduled", "notification")
 ON_MISSING = ("null", "absent", "error")
 FAILURE_MODES = {"reject_on_failure", "model_error_on_failure"}
 CORE_OPS = {"set", "delete"}
 EXTENSION_OPS = {"increment", "append", "reset"}  # SPEC 4.3: arrive in v1.1
 _DURATION = re.compile(r"(\d+)([smhdw])\Z")
-_SHORT_DURATION = re.compile(r"(\d+)(ms|s|m|h)\Z")  # hook timings: 200ms, 2s, 1m
+_SHORT_DURATION = re.compile(r"(\d+)(ms|s|m|h|d)\Z")  # hook timings: 200ms, 2s, 1m, 1d
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
@@ -144,6 +167,11 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
         problems.append(f'"impure_failure_mode" must be one of {sorted(FAILURE_MODES)}')
         mode = "reject_on_failure"
 
+    on_failure = top.get("deferred_on_failure", "error")
+    if on_failure not in ON_FAILURE:
+        problems.append(f'"deferred_on_failure" must be one of {list(ON_FAILURE)}')
+        on_failure = "error"
+
     fields: list[FieldSpec] = []
     raw_fields = top.get("fields", FrozenStruct())
     if not isinstance(raw_fields, FrozenStruct):
@@ -169,6 +197,7 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
         rejection_audit=audit,
         document_validate=document_validate,
         impure_failure_mode=str(mode),
+        deferred_on_failure=str(on_failure),
     )
     _check_computed(schema, behaviors, problems)
     _semantic(schema, problems)  # runs even after structural problems, so that everything is reported together
@@ -290,13 +319,22 @@ def _field(
     impure_spec: ImpureSpec | None = None
     if "computed" in raw:
         computed_spec, impure_spec = _computed(raw["computed"], where, names, problems)
+    deferred_spec = (
+        _deferred(raw["deferred"], where, type_text, names, behaviors, problems) if "deferred" in raw else None
+    )
     # the setting named `null` reads as the Ion null value when written bare
     on_missing = ("null" if raw["on_missing"] is None else str(raw["on_missing"])) if "on_missing" in raw else "null"
     if on_missing not in ON_MISSING:
-        problems.append(f"{where}: on_missing must be one of {list(ON_MISSING)}, not {on_missing!r}")
+        code = "BAD_DEFERRED_OPTION: " if "deferred" in raw else ""
+        problems.append(f"{code}{where}: on_missing must be one of {list(ON_MISSING)}, not {on_missing!r}")
         on_missing = "null"
-    elif "on_missing" in raw and "computed" not in raw:
-        problems.append(f"{where}: on_missing applies only to computed fields")
+    elif "on_missing" in raw and "computed" not in raw and "deferred" not in raw:
+        problems.append(f"{where}: on_missing applies only to computed and deferred fields")
+    elif on_missing == "error" and "deferred" in raw:
+        problems.append(
+            f"BAD_DEFERRED_OPTION: {where}: a deferred field never produces a model error; on_missing is null or absent"
+        )
+        on_missing = "null"
     return FieldSpec(
         pattern=pattern,
         type=type_text,
@@ -312,6 +350,7 @@ def _field(
         redact=raw.get("redact"),
         computed=computed_spec,
         impure=impure_spec,
+        deferred=deferred_spec,
         on_missing=on_missing,  # type: ignore[arg-type]
     )
 
@@ -378,7 +417,7 @@ def _seconds(raw: Any, where: str, problems: list[str]) -> float | None:
     if not match:
         problems.append(f"{where} {raw!r} is not a duration such as 200ms, 2s, 1m")
         return None
-    unit = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[match.group(2)]
+    unit = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[match.group(2)]
     return int(match.group(1)) * unit
 
 
@@ -498,6 +537,194 @@ def _impure(raw: Any, where: str, names: tuple[str, ...], problems: list[str]) -
         deadline=deadline,
         recompute_by=recompute_by,
         failure_mode=failure_mode,
+    )
+
+
+def _deferred_seconds(raw: Any, what: str, problems: list[str]) -> float | None:
+    match = _SHORT_DURATION.match(str(raw))
+    if not match:
+        problems.append(f"BAD_DEFERRED_OPTION: {what} {raw!r} is not a duration such as 200ms, 2s, 5m, 1d")
+        return None
+    unit = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[match.group(2)]
+    return int(match.group(1)) * unit
+
+
+def _refresh(raw: Any, where: str, problems: list[str]) -> tuple[RefreshPolicy, ...]:
+    """`refresh:` is one policy or a list of them: `once`, `per_fetch`, `scheduled::{...}`, `notification::{...}`."""
+    items = raw if isinstance(raw, tuple) else (raw,)
+    found: list[RefreshPolicy] = []
+    for item in items:
+        options: Any = FrozenStruct()
+        if isinstance(item, Annotated):
+            kind, options = (item.annotations[0] if len(item.annotations) == 1 else ""), item.value
+        elif isinstance(item, Symbol | str):
+            kind = str(item)
+        else:
+            kind = ""
+        if kind not in REFRESH_KINDS or not isinstance(options, FrozenStruct):
+            problems.append(f"BAD_REFRESH_POLICY: {where}: {item!r} is not one of {list(REFRESH_KINDS)}")
+            continue
+        if kind in ("once", "per_fetch"):
+            if options or isinstance(item, Annotated):
+                problems.append(f"BAD_REFRESH_POLICY: {where}: {kind} takes no options")
+            elif any(p.kind == kind for p in found):
+                problems.append(f"BAD_REFRESH_POLICY: {where}: {kind} is listed twice")
+            else:
+                found.append(RefreshPolicy(kind))  # type: ignore[arg-type]
+        elif kind == "scheduled":
+            policy = _scheduled(options, where, problems)
+            if policy is not None:
+                found.append(policy)
+        else:
+            topic = options.get("topic") if set(options) <= {"topic"} else None
+            if not isinstance(topic, str) or not topic.strip():
+                problems.append(f"BAD_REFRESH_POLICY: {where}: notification needs a non-empty topic")
+            else:
+                found.append(RefreshPolicy("notification", topic=topic))
+    return tuple(found)
+
+
+def _scheduled(options: FrozenStruct, where: str, problems: list[str]) -> RefreshPolicy | None:
+    unknown = set(options) - {"every", "cron"}
+    if unknown or ("every" in options) == ("cron" in options):
+        problems.append(f"BAD_REFRESH_POLICY: {where}: scheduled takes exactly one of every and cron")
+        return None
+    try:
+        if "every" in options:
+            every = _deferred_seconds(options["every"], f"{where}: scheduled.every", problems)
+            if every is None:
+                return None
+            parse_schedule(every=every)
+            return RefreshPolicy("scheduled", every=every)
+        cron = options["cron"]
+        if not isinstance(cron, str):
+            raise ScheduleError("cron is text of five fields")
+        parse_schedule(cron=cron)
+        return RefreshPolicy("scheduled", cron=cron)
+    except ScheduleError as error:
+        problems.append(f"BAD_REFRESH_POLICY: {where}: scheduled: {error}")
+        return None
+
+
+def _deferred(
+    raw: Any,
+    where: str,
+    type_text: str | None,
+    names: tuple[str, ...],
+    behaviors: BehaviorRegistry,
+    problems: list[str],
+) -> DeferredSpec | None:
+    """`deferred: { hook, depends, refresh, invalidate_by, ... }` (SPEC 9.5, contracts/schema-format.md)."""
+    if not isinstance(raw, FrozenStruct):
+        problems.append(f"{where}: deferred must be a struct")
+        return None
+    before = len(problems)
+    for key in raw:
+        if key not in DEFERRED_KEYS:
+            problems.append(f'BAD_DEFERRED_OPTION: {where}: unknown key "deferred.{key}"')
+    for key in DEFERRED_REQUIRED:
+        if key not in raw:
+            problems.append(f"DEFERRED_DECLARATION_INCOMPLETE: {where}: a deferred field needs {key}")
+    if type_text is None:
+        problems.append(f"DEFERRED_DECLARATION_INCOMPLETE: {where}: a deferred field needs a type")
+    if not all(key in raw for key in DEFERRED_REQUIRED):
+        return None
+    ref = _ref(raw["hook"], f"{where}: deferred.hook", problems)
+    if ref is not None:
+        hook = behaviors.get(ref.name, ref.version)
+        if hook is None or hook.kind != "hook":
+            problems.append(f"UNKNOWN_BEHAVIOR: {where}: no hook {ref.name}@{ref.version} is registered")
+    depends = _names(raw["depends"], f"{where}: deferred.depends", problems)
+    if not depends:
+        problems.append(f"DEFERRED_DECLARATION_INCOMPLETE: {where}: a deferred field needs at least one dependency")
+    for path_text in depends:
+        try:
+            parse_path(path_text)
+        except PathError as error:
+            problems.append(f"UNKNOWN_DEPENDENCY: {where}: dependency {path_text!r} is not a valid path ({error})")
+    refresh = _refresh(raw["refresh"], where, problems)
+    if raw["refresh"] == () or not (refresh or len(problems) > before):
+        problems.append(f"DEFERRED_DECLARATION_INCOMPLETE: {where}: a deferred field needs a refresh policy")
+    kinds = {p.kind for p in refresh}
+    ttl: float | None = None
+    if "ttl" in raw:
+        ttl = _deferred_seconds(raw["ttl"], f"{where}: deferred.ttl", problems)
+        if ttl is not None and ttl < MIN_TTL:
+            problems.append(f"BAD_DEFERRED_OPTION: {where}: ttl is at least {MIN_TTL:g}s")
+        if "per_fetch" not in kinds:
+            problems.append(f"BAD_DEFERRED_OPTION: {where}: ttl belongs to the per_fetch policy")
+    elif "per_fetch" in kinds:
+        problems.append(f"BAD_DEFERRED_OPTION: {where}: per_fetch needs a ttl")
+    change = str(raw["on_dependency_change"]) if "on_dependency_change" in raw else "keep"
+    if change not in ("keep", "recompute"):
+        problems.append(f"BAD_DEFERRED_OPTION: {where}: on_dependency_change is keep or recompute, not {change!r}")
+        change = "keep"
+    elif "on_dependency_change" in raw and "once" not in kinds:
+        problems.append(f"BAD_DEFERRED_OPTION: {where}: on_dependency_change belongs to the once policy")
+    on_failure = str(raw["on_failure"]) if "on_failure" in raw else None
+    if on_failure is not None and on_failure not in ON_FAILURE:
+        problems.append(f"BAD_DEFERRED_OPTION: {where}: on_failure is one of {list(ON_FAILURE)}, not {on_failure!r}")
+        on_failure = None
+    timeout = _deferred_seconds(raw["timeout"], f"{where}: deferred.timeout", problems) if "timeout" in raw else None
+    if timeout is None:
+        timeout_value = DEFAULT_SOURCE_TIMEOUT
+    else:
+        timeout_value = timeout
+        if not 0 < timeout <= MAX_HOOK_TIMEOUT:
+            problems.append(
+                f"BAD_DEFERRED_OPTION: {where}: timeout must be above zero and at most {MAX_HOOK_TIMEOUT:g}s"
+            )
+    retry_max, backoff = DEFAULT_SOURCE_RETRIES, DEFAULT_SOURCE_BACKOFF
+    if "retry" in raw:
+        retry = raw["retry"]
+        if not isinstance(retry, FrozenStruct) or "max" not in retry or set(retry) - {"max", "backoff"}:
+            problems.append(f"BAD_DEFERRED_OPTION: {where}: retry is {{max, backoff}} and needs max")
+        else:
+            count = retry["max"]
+            if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_HOOK_RETRIES:
+                problems.append(
+                    f"BAD_DEFERRED_OPTION: {where}: retry.max is a whole number from 0 to {MAX_HOOK_RETRIES}"
+                )
+            else:
+                retry_max = count
+            backoff = 0.0
+            if "backoff" in retry:
+                found = _deferred_seconds(retry["backoff"], f"{where}: deferred.retry.backoff", problems)
+                if found is not None and found > MAX_SOURCE_BACKOFF:
+                    problems.append(f"BAD_DEFERRED_OPTION: {where}: retry.backoff is at most {MAX_SOURCE_BACKOFF:g}s")
+                backoff = found or 0.0
+    deadline = DEFAULT_SOURCE_DEADLINE
+    if "deadline" in raw:
+        found = _deferred_seconds(raw["deadline"], f"{where}: deferred.deadline", problems)
+        if found is not None:
+            deadline = found
+            if found > MAX_HOOK_DEADLINE or found < timeout_value:
+                problems.append(
+                    f"BAD_DEFERRED_OPTION: {where}: deadline is at least the timeout and at most {MAX_HOOK_DEADLINE:g}s"
+                )
+    invalidate_by = _names(raw["invalidate_by"], f"{where}: deferred.invalidate_by", problems)
+    if not invalidate_by:
+        problems.append(f"DEFERRED_DECLARATION_INCOMPLETE: {where}: invalidate_by must list at least one tier or role")
+    for name in invalidate_by:
+        if name not in names:
+            problems.append(
+                f"UNKNOWN_TIER: {where}: invalidate_by names {name!r}, which is neither a tier nor a declared role"
+            )
+    if ref is None or len(problems) > before:
+        return None
+    return DeferredSpec(
+        hook=ref.name,
+        version=ref.version,
+        depends=depends,
+        refresh=refresh,
+        invalidate_by=invalidate_by,
+        ttl=ttl,
+        on_dependency_change=change,  # type: ignore[arg-type]
+        on_failure=on_failure,
+        timeout=timeout_value,
+        retry_max=retry_max,
+        backoff=backoff,
+        deadline=deadline,
     )
 
 
@@ -625,6 +852,7 @@ def _semantic(schema: Schema, problems: list[str]) -> None:
         for path_text in (
             *(spec.computed.paths if spec.computed else ()),
             *(spec.impure.depends if spec.impure else ()),
+            *(spec.deferred.depends if spec.deferred else ()),
         ):
             try:
                 path = parse_path(path_text)
@@ -634,7 +862,7 @@ def _semantic(schema: Schema, problems: list[str]) -> None:
                 continue  # reported where the declaration was parsed
             if not declared:
                 problems.append(
-                    f"UNKNOWN_DEPENDENCY: computed field {spec.pattern} depends on {path_text},"
+                    f"UNKNOWN_DEPENDENCY: {spec.derived} field {spec.pattern} depends on {path_text},"
                     " which no field of the schema declares"
                 )
         if spec.derived == "deferred" and spec.validate:

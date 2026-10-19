@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 from aduku.errors import StorageError
 from aduku.ion_codec import parse, to_canonical
-from aduku.model import Entry
+from aduku.model import DerivedRecord, Entry, SchedulerRun
 from aduku.storage.base import (
     AuditRow,
     ConstraintError,
@@ -94,6 +94,41 @@ CREATE TRIGGER IF NOT EXISTS effects_no_delete BEFORE DELETE ON effects
 WHEN (SELECT active FROM effects_pruning WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'effects are append-only'); END;
 
+-- Results of deferred fields (feature 003): the latest per document and field, mutable by design, never read by the core.
+CREATE TABLE IF NOT EXISTS derived_values (
+    doc TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value TEXT,
+    has_value INTEGER NOT NULL,
+    as_of TEXT,
+    input_fingerprint TEXT NOT NULL,
+    hook TEXT NOT NULL,
+    shape TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    attempts INTEGER NOT NULL,
+    last_attempt TEXT,
+    invalidated INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (doc, field)
+);
+CREATE INDEX IF NOT EXISTS derived_values_field ON derived_values (field, doc);
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    hook TEXT NOT NULL,
+    started TEXT NOT NULL,
+    finished TEXT NOT NULL,
+    attempted INTEGER NOT NULL,
+    succeeded INTEGER NOT NULL,
+    failed INTEGER NOT NULL,
+    skipped INTEGER NOT NULL,
+    calls INTEGER NOT NULL,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS scheduler_runs_hook ON scheduler_runs (hook, id);
+CREATE TABLE IF NOT EXISTS scheduler_leases (hook TEXT PRIMARY KEY, owner TEXT NOT NULL, expires TEXT NOT NULL);
+
 -- Audit-only data: never read by derivation (SPEC 4.5).
 CREATE TABLE IF NOT EXISTS rejection_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +156,53 @@ def _stamp(moment: datetime) -> str:
 
 def _unstamp(text: str) -> datetime:
     return datetime.strptime(text, TIME_FORMAT).replace(tzinfo=UTC)
+
+
+def _maybe_stamp(moment: datetime | None) -> str | None:
+    return None if moment is None else _stamp(moment)
+
+
+def _maybe_unstamp(text: str | None) -> datetime | None:
+    return None if text is None else _unstamp(text)
+
+
+def _derived(row: sqlite3.Row) -> DerivedRecord:
+    return DerivedRecord(
+        doc=row["doc"],
+        field=row["field"],
+        value=row["value"],
+        has_value=bool(row["has_value"]),
+        as_of=_maybe_unstamp(row["as_of"]),
+        input_fingerprint=row["input_fingerprint"],
+        hook=row["hook"],
+        shape=row["shape"],
+        schema_version=row["schema_version"],
+        status=row["status"],
+        error=row["error"],
+        attempts=row["attempts"],
+        last_attempt=_maybe_unstamp(row["last_attempt"]),
+        invalidated=bool(row["invalidated"]),
+    )
+
+
+def _run(row: sqlite3.Row) -> SchedulerRun:
+    return SchedulerRun(
+        run_id=row["run_id"],
+        hook=row["hook"],
+        started=_unstamp(row["started"]),
+        finished=_unstamp(row["finished"]),
+        attempted=row["attempted"],
+        succeeded=row["succeeded"],
+        failed=row["failed"],
+        skipped=row["skipped"],
+        calls=row["calls"],
+        reason=row["reason"],
+    )
+
+
+def _chunks(items: Sequence[str], size: int = 400) -> Iterator[Sequence[str]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def _effect(row: sqlite3.Row) -> EffectRecord:
@@ -371,6 +453,133 @@ class _SqliteTx:
             self._c.execute("UPDATE effects_pruning SET active = 0 WHERE id = 1")
         return len(doomed)
 
+    # -- the derived store of deferred fields (feature 003) ----------------------------------------------------------
+
+    @live
+    def get_derived(self, doc: str) -> list[DerivedRecord]:
+        rows = self._c.execute("SELECT * FROM derived_values WHERE doc = ? ORDER BY field", (doc,)).fetchall()
+        return [_derived(row) for row in rows]
+
+    @live
+    def put_derived(self, records: Sequence[DerivedRecord]) -> None:
+        for r in records:
+            self._c.execute(
+                "INSERT INTO derived_values (doc, field, value, has_value, as_of, input_fingerprint, hook, shape,"
+                " schema_version, status, error, attempts, last_attempt, invalidated)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (doc, field) DO UPDATE SET value = excluded.value, has_value = excluded.has_value,"
+                " as_of = excluded.as_of, input_fingerprint = excluded.input_fingerprint, hook = excluded.hook,"
+                " shape = excluded.shape, schema_version = excluded.schema_version, status = excluded.status,"
+                " error = excluded.error, attempts = excluded.attempts, last_attempt = excluded.last_attempt,"
+                " invalidated = excluded.invalidated",
+                (
+                    r.doc,
+                    r.field,
+                    r.value,
+                    int(r.has_value),
+                    _maybe_stamp(r.as_of),
+                    r.input_fingerprint,
+                    r.hook,
+                    r.shape,
+                    r.schema_version,
+                    r.status,
+                    r.error,
+                    r.attempts,
+                    _maybe_stamp(r.last_attempt),
+                    int(r.invalidated),
+                ),
+            )
+
+    def _where(self, fields: Sequence[str] | None, docs: Sequence[str] | None) -> Iterator[tuple[str, list[str]]]:
+        """WHERE clauses covering the given fields and documents, split so no statement has too many parameters."""
+        field_parts = list(_chunks(fields)) if fields is not None else [None]
+        doc_parts = list(_chunks(docs)) if docs is not None else [None]
+        for field_part in field_parts:
+            for doc_part in doc_parts:
+                clauses: list[str] = []
+                params: list[str] = []
+                if field_part is not None:
+                    clauses.append(f"field IN ({','.join('?' * len(field_part))})")
+                    params.extend(field_part)
+                if doc_part is not None:
+                    clauses.append(f"doc IN ({','.join('?' * len(doc_part))})")
+                    params.extend(doc_part)
+                yield (" AND ".join(clauses) or "1"), params
+
+    @live
+    def list_derived(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> list[DerivedRecord]:
+        if not fields or (docs is not None and not docs):
+            return []
+        found: list[DerivedRecord] = []
+        for clause, params in self._where(fields, docs):
+            rows = self._c.execute(f"SELECT * FROM derived_values WHERE {clause}", params).fetchall()
+            found.extend(_derived(row) for row in rows)
+        return sorted(found, key=lambda r: (r.doc, r.field))
+
+    @live
+    def mark_invalidated(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> int:
+        if not fields or (docs is not None and not docs):
+            return 0
+        total = 0
+        for clause, params in self._where(fields, docs):
+            total += self._c.execute(f"UPDATE derived_values SET invalidated = 1 WHERE {clause}", params).rowcount
+        return total
+
+    @live
+    def delete_derived(self, docs: Sequence[str] | None = None, fields: Sequence[str] | None = None) -> int:
+        if (docs is not None and not docs) or (fields is not None and not fields):
+            return 0
+        total = 0
+        for clause, params in self._where(fields, docs):
+            total += self._c.execute(f"DELETE FROM derived_values WHERE {clause}", params).rowcount
+        return total
+
+    @live
+    def append_run(self, run: SchedulerRun) -> None:
+        self._c.execute(
+            "INSERT INTO scheduler_runs (run_id, hook, started, finished, attempted, succeeded, failed, skipped, calls,"
+            " reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                run.run_id,
+                run.hook,
+                _stamp(run.started),
+                _stamp(run.finished),
+                run.attempted,
+                run.succeeded,
+                run.failed,
+                run.skipped,
+                run.calls,
+                run.reason,
+            ),
+        )
+
+    @live
+    def list_runs(self, hook: str, limit: int | None = None) -> list[SchedulerRun]:
+        rows = self._c.execute("SELECT * FROM scheduler_runs WHERE hook = ? ORDER BY id", (hook,)).fetchall()
+        found = [_run(row) for row in rows]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
+    @live
+    def take_lease(self, hook: str, owner: str, expires: datetime, now: datetime) -> bool:
+        cursor = self._c.execute(
+            "INSERT INTO scheduler_leases (hook, owner, expires) VALUES (?,?,?) ON CONFLICT (hook) DO UPDATE SET"
+            " owner = excluded.owner, expires = excluded.expires"
+            " WHERE scheduler_leases.owner = excluded.owner OR scheduler_leases.expires <= ?",
+            (hook, owner, _stamp(expires), _stamp(now)),
+        )
+        return cursor.rowcount > 0
+
+    @live
+    def renew_lease(self, hook: str, owner: str, expires: datetime) -> bool:
+        cursor = self._c.execute(
+            "UPDATE scheduler_leases SET expires = ? WHERE hook = ? AND owner = ?", (_stamp(expires), hook, owner)
+        )
+        return cursor.rowcount > 0
+
+    @live
+    def release_lease(self, hook: str, owner: str) -> None:
+        self._c.execute("DELETE FROM scheduler_leases WHERE hook = ? AND owner = ?", (hook, owner))
+
 
 class _SqliteReadTx(_SqliteTx):
     """A read-only handle: reads like any transaction, refuses every write."""
@@ -382,6 +591,27 @@ class _SqliteReadTx(_SqliteTx):
         raise RuntimeError("read-only transaction")
 
     def drop_view(self, doc: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def put_derived(self, records: Sequence[DerivedRecord]) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def mark_invalidated(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def delete_derived(self, docs: Sequence[str] | None = None, fields: Sequence[str] | None = None) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def append_run(self, run: SchedulerRun) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def take_lease(self, hook: str, owner: str, expires: datetime, now: datetime) -> bool:
+        raise RuntimeError("read-only transaction")
+
+    def renew_lease(self, hook: str, owner: str, expires: datetime) -> bool:
+        raise RuntimeError("read-only transaction")
+
+    def release_lease(self, hook: str, owner: str) -> None:
         raise RuntimeError("read-only transaction")
 
 

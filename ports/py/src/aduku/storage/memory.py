@@ -7,12 +7,12 @@ A write therefore costs what it changes, not the size of the ledger, and a read 
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from aduku.model import Entry
+from aduku.model import DerivedRecord, Entry, SchedulerRun
 from aduku.storage.base import (
     AuditRow,
     ConstraintError,
@@ -34,6 +34,9 @@ class _State:
     views: dict[str, ViewRow] = field(default_factory=dict)
     effects: list[EffectRecord] = field(default_factory=list)
     effect_counter: int = 0
+    derived: dict[tuple[str, str], DerivedRecord] = field(default_factory=dict)  # (doc, field) -> latest result
+    runs: list[SchedulerRun] = field(default_factory=list)
+    leases: dict[str, tuple[str, datetime]] = field(default_factory=dict)  # source -> (owner, expires)
 
 
 class _MemoryTx:
@@ -184,6 +187,111 @@ class _MemoryTx:
         self._undo.append(lambda: state.effects.__setitem__(slice(None), before))
         return len(doomed)
 
+    # -- the derived store of deferred fields (feature 003) ----------------------------------------------------------
+
+    @live
+    def get_derived(self, doc: str) -> list[DerivedRecord]:
+        return sorted((r for (d, _), r in self._s.derived.items() if d == doc), key=lambda r: r.field)
+
+    @live
+    def put_derived(self, records: Sequence[DerivedRecord]) -> None:
+        state = self._s
+        before = {(r.doc, r.field): state.derived.get((r.doc, r.field)) for r in records}
+        for record in records:
+            state.derived[(record.doc, record.field)] = record
+        self._undo.append(lambda: self._restore_derived(before))
+
+    @live
+    def list_derived(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> list[DerivedRecord]:
+        return self._matching(fields, docs)
+
+    @live
+    def mark_invalidated(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> int:
+        matching = self._matching(fields, docs)
+        before = {(r.doc, r.field): r for r in matching}
+        for record in matching:
+            self._s.derived[(record.doc, record.field)] = replace(record, invalidated=True)
+        self._undo.append(lambda: self._restore_derived(before))
+        return len(matching)
+
+    @live
+    def delete_derived(self, docs: Sequence[str] | None = None, fields: Sequence[str] | None = None) -> int:
+        doomed = {
+            key: record
+            for key, record in self._s.derived.items()
+            if (docs is None or key[0] in docs) and (fields is None or key[1] in fields)
+        }
+        for key in doomed:
+            del self._s.derived[key]
+        self._undo.append(lambda: self._restore_derived(dict(doomed)))
+        return len(doomed)
+
+    @live
+    def append_run(self, run: SchedulerRun) -> None:
+        runs = self._s.runs
+        runs.append(run)
+
+        def undo() -> None:
+            runs.pop()
+
+        self._undo.append(undo)
+
+    @live
+    def list_runs(self, hook: str, limit: int | None = None) -> list[SchedulerRun]:
+        found = [r for r in self._s.runs if r.hook == hook]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
+    @live
+    def take_lease(self, hook: str, owner: str, expires: datetime, now: datetime) -> bool:
+        held = self._s.leases.get(hook)
+        if held is not None and held[0] != owner and held[1] > now:
+            return False
+        self._set_lease(hook, (owner, expires))
+        return True
+
+    @live
+    def renew_lease(self, hook: str, owner: str, expires: datetime) -> bool:
+        held = self._s.leases.get(hook)
+        if held is None or held[0] != owner:
+            return False
+        self._set_lease(hook, (owner, expires))
+        return True
+
+    @live
+    def release_lease(self, hook: str, owner: str) -> None:
+        held = self._s.leases.get(hook)
+        if held is not None and held[0] == owner:
+            self._set_lease(hook, None)
+
+    def _matching(self, fields: Sequence[str], docs: Sequence[str] | None) -> list[DerivedRecord]:
+        return sorted(
+            (r for (d, f), r in self._s.derived.items() if f in fields and (docs is None or d in docs)),
+            key=lambda r: (r.doc, r.field),
+        )
+
+    def _restore_derived(self, before: Mapping[tuple[str, str], DerivedRecord | None]) -> None:
+        for key, record in before.items():
+            if record is None:
+                self._s.derived.pop(key, None)
+            else:
+                self._s.derived[key] = record
+
+    def _set_lease(self, hook: str, value: tuple[str, datetime] | None) -> None:
+        leases = self._s.leases
+        previous = leases.get(hook)
+        if value is None:
+            leases.pop(hook, None)
+        else:
+            leases[hook] = value
+
+        def undo() -> None:
+            if previous is None:
+                leases.pop(hook, None)
+            else:
+                leases[hook] = previous
+
+        self._undo.append(undo)
+
     def _restore_view(self, doc: str, previous: ViewRow | None) -> None:
         if previous is None:
             self._s.views.pop(doc, None)
@@ -207,6 +315,27 @@ class _MemoryReadTx(_MemoryTx):
         raise RuntimeError("read-only transaction")
 
     def drop_view(self, doc: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def put_derived(self, records: Sequence[DerivedRecord]) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def mark_invalidated(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def delete_derived(self, docs: Sequence[str] | None = None, fields: Sequence[str] | None = None) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def append_run(self, run: SchedulerRun) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def take_lease(self, hook: str, owner: str, expires: datetime, now: datetime) -> bool:
+        raise RuntimeError("read-only transaction")
+
+    def renew_lease(self, hook: str, owner: str, expires: datetime) -> bool:
+        raise RuntimeError("read-only transaction")
+
+    def release_lease(self, hook: str, owner: str) -> None:
         raise RuntimeError("read-only transaction")
 
 

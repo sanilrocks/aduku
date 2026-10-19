@@ -1,0 +1,98 @@
+// Feature 003, US1, US2 and US4: the refresh policies of deferred fields.
+//   keep   : once, keeps its value when the input changes          rate  : per_fetch with a 5 minute ttl
+//   track  : once with on_dependency_change: recompute              band  : scheduled every hour, by a batch source
+// The harness clock does not step. Source call counts are checked after each step that could change them.
+case::{
+  name: "deferred-policies",
+  fixtures: ["fx.score@1", "fx.rate@1", "fx.rate2@1", "fx.pair@1"],
+  clock: { start: 2026-10-19T12:00:00Z, step_seconds: 0 },
+  schema:
+  schema::{
+    id: "policies", version: 1,
+    tiers: [backfill, user, admin],
+    fields: {
+      "/name":     { type: string, merge: lww },
+      "/country":  { type: string, merge: lww },
+      "/currency": { type: string, merge: lww },
+
+      "/keep":  { type: int, deferred: { hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [admin] } },
+      "/track": { type: decimal, deferred: { hook: "fx.rate2@1", depends: ["/name"], refresh: once,
+                                              on_dependency_change: recompute, invalidate_by: [admin] } },
+      "/rate":  { type: decimal, deferred: { hook: "fx.rate@1", depends: ["/currency"], refresh: per_fetch, ttl: "5m",
+                                              invalidate_by: [admin] } },
+      "/band":  { type: string, deferred: { hook: "fx.pair@1", depends: ["/country"], refresh: scheduled::{every: "1h"},
+                                             invalidate_by: [admin] } }
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/name", value: "Alice"}, {tier: user, path: "/currency", value: "EUR"},
+        {tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { source_calls: "fx.score@1", expect: { count: 0 } },    // a write calls no source
+
+    // once: fetched on the first read, then kept; per_fetch: fetched on read; scheduled: left to the scheduler
+    { get: { doc: "d1", include: [pending] },
+      expect: { deferred: { "/keep": { status: ok, value: 712 }, "/track": { status: ok, value: 0.92 },
+                            "/rate": { status: ok, value: 0.92 }, "/band": { status: pending, reason: not_fetched } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.rate2@1", expect: { count: 1 } },
+    { source_calls: "fx.rate@1", expect: { count: 1 } },
+    { source_calls: "fx.pair@1", expect: { count: 0 } },
+    { get: "d1", expect: { deferred: { "/keep": { status: ok } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+
+    // a changed input: once keeps its value, once with the opt-in asks again exactly once
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alicia"}] },
+      expect: { accepted: [{seq: 4}] } },
+    { get: "d1", expect: { deferred: { "/keep": { status: ok, value: 712 } } } },
+    { get: "d1", expect: { deferred: { "/track": { status: ok } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.rate2@1", expect: { count: 2 } },
+
+    // per_fetch: reused inside the ttl, fetched again at the ttl, again for a changed input, and by a fresh read
+    { clock: { advance: "299s" } },
+    { get: "d1", expect: {} },
+    { source_calls: "fx.rate@1", expect: { count: 1 } },
+    { clock: { advance: "1s" } },
+    { get: "d1", expect: {} },
+    { source_calls: "fx.rate@1", expect: { count: 2 } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/currency", value: "GBP"}] },
+      expect: { accepted: [{seq: 5}] } },
+    { get: "d1", expect: {} },
+    { source_calls: "fx.rate@1", expect: { count: 3 } },
+    { get: { doc: "d1", consistency: fresh }, expect: {} },
+    { source_calls: "fx.rate@1", expect: { count: 4 } },
+    { get: "d1", expect: {} },
+    { source_calls: "fx.rate@1", expect: { count: 4 } },
+
+    // scheduled: five documents are refreshed in batches of two; a second run at once does nothing
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "DE"}] }, expect: {} },
+    { append: { doc: "d3", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "FR"}] }, expect: {} },
+    { append: { doc: "d4", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] }, expect: {} },
+    { append: { doc: "d5", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "DE"}] }, expect: {} },
+    { scheduler_run: { hook: "fx.pair@1", contributor: {id: "eve", tiers: [backfill]} }, expect: { rejected: { code: NOT_AUTHORIZED } } },
+    { source_calls: "fx.pair@1", expect: { count: 0 } },
+    { scheduler_run: { hook: "fx.pair@1", contributor: {id: "root", tiers: [admin]} },
+      expect: { attempted: 5, succeeded: 5, calls: 3 } },
+    { source_calls: "fx.pair@1", expect: { count: 3, batches: [2, 2, 1] } },
+    { scheduler_run: { hook: "fx.pair@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 0, calls: 0 } },
+    { get: "d2", expect: { deferred: { "/band": { status: ok, value: "band-DE" } } } },
+    { source_calls: "fx.pair@1", expect: { count: 3 } },     // a read does not call a scheduled source
+
+    // an hour later every value is due again, and a long-overdue value is still only served by a read
+    { clock: { advance: "3599s" } },
+    { scheduler_run: { hook: "fx.pair@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 0 } },
+    { clock: { advance: "1s" } },
+    { scheduler_run: { hook: "fx.pair@1", contributor: {id: "root", tiers: [admin]} },
+      expect: { attempted: 5, succeeded: 5, calls: 3 } },
+    { clock: { advance: "72h" } },
+    { get: "d3", expect: { deferred: { "/band": { status: ok, value: "band-FR" } } } },
+    { source_calls: "fx.pair@1", expect: { count: 6, batches: [2, 2, 1, 2, 2, 1] } },
+
+    // a rebuild never calls a source
+    { rebuild: "d1", expect: { identical: true } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.pair@1", expect: { count: 6 } }
+  ]
+}

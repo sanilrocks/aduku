@@ -1,7 +1,7 @@
 # aduku-py
 
 The Python port of **aduku**: an append-only ledger of contributions merged into documents by a central annotated schema
-(Document Oriented Design): the core ledger and merge engine (feature 001) and computed fields (feature 002). The specification is
+(Document Oriented Design): the core ledger and merge engine (feature 001) computed fields (feature 002) and deferred fields (feature 003). The specification is
 [`docs/SPEC.md`](../../docs/SPEC.md); the shared test vectors are in [`conformance/`](../../conformance).
 
 ## Install
@@ -46,9 +46,35 @@ The command line takes the same registrations from a module: `aduku --behaviors 
 [`examples/demo_hooks.py`](examples/demo_hooks.py)). The macro language is in
 [`contracts/expression-language.md`](../../specs/002-computed-fields/contracts/expression-language.md).
 
+### Deferred fields
+
+A field can be filled by a source that does IO (a score, a rate). It never touches the merge: the value lives in a separate
+store and is shown as `deferred::712` with a status (`ok`, `stale`, `pending`, `error`). Each field says when it is
+fetched: `once` (first read, then kept), `per_fetch` (on read, reused within a `ttl`), `scheduled` (by `scheduler_run`, in
+batches) or `notification` (marked by `notify`, recomputed by the next run). A failing source only changes a status.
+
+```python
+behaviors.register_hook("fx.rate", 1, lambda inputs, timeout: Decimal("0.92"))
+behaviors.register_hook(
+    "risk.band", 1, band_for_many, batch_max=50, rate_limit=2.0
+)  # one call carries up to 50 documents
+db = Aduku(SqliteStorage("demo.db"), registry, behaviors=behaviors, fetch_deadline=5.0)
+db.get("d1").deferred  # the status of every deferred field
+db.get("d1", consistency="fresh")  # ignore the ttl of per_fetch fields
+db.scheduler_run("risk.band@1", caller=Identity("root", ("admin",)))  # only who the field's invalidate_by lists
+db.notify("sanctions.updated", ["d1"])  # marks values out of date; the next run recomputes them
+```
+
+The command line has the same operations (`aduku get --fresh --include pending`, `invalidate`, `scheduler run`, `notify`,
+`deferred list`); try them with [`examples/demo_sources.py`](examples/demo_sources.py) and
+[`examples/deferred.schema.ion`](examples/deferred.schema.ion), as in
+[`quickstart.md`](../../specs/003-deferred-fields/quickstart.md).
+
 The full API is in
-[`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields,
-[`contracts/library-api.md`](../../specs/002-computed-fields/contracts/library-api.md). `MemoryStorage` and
+[`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields and
+deferred fields, the `contracts/library-api.md` of
+[feature 002](../../specs/002-computed-fields/contracts/library-api.md) and
+[feature 003](../../specs/003-deferred-fields/contracts/library-api.md). `MemoryStorage` and
 `SqliteStorage` implement the same storage contract; there is also a command line, `uv run aduku --help`
 ([`contracts/cli.md`](../../specs/001-core-ledger-merge-engine/contracts/cli.md)).
 

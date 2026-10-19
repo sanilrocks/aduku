@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from aduku.hooks import HookRunner
     from aduku.model import (
         AppendResult,
+        DeferredInfo,
+        DeferredStatus,
         DocumentResult,
         EffectInfo,
         EntryInput,
@@ -22,6 +24,7 @@ if TYPE_CHECKING:
         Identity,
         RebuildReport,
         RecomputeReport,
+        SchedulerReport,
     )
     from aduku.schema.loader import load_schema
     from aduku.schema.registry import SchemaRegistry
@@ -37,6 +40,8 @@ _EXPORTS = {
     "BehaviorRegistry": "aduku.behaviors.registry",
     "Clock": "aduku.storage.base",
     "ComputeFault": "aduku.errors",
+    "DeferredInfo": "aduku.model",
+    "DeferredStatus": "aduku.model",
     "DocumentResult": "aduku.model",
     "EffectInfo": "aduku.model",
     "EntryInput": "aduku.model",
@@ -48,6 +53,7 @@ _EXPORTS = {
     "RebuildReport": "aduku.model",
     "RecomputeReport": "aduku.model",
     "RejectedError": "aduku.errors",
+    "SchedulerReport": "aduku.model",
     "SchemaError": "aduku.errors",
     "SchemaRegistry": "aduku.schema.registry",
     "SqliteStorage": "aduku.storage.sqlite",
@@ -62,6 +68,8 @@ __all__ = [
     "BehaviorRegistry",
     "Clock",
     "ComputeFault",
+    "DeferredInfo",
+    "DeferredStatus",
     "DocumentResult",
     "EffectInfo",
     "EntryInput",
@@ -73,6 +81,7 @@ __all__ = [
     "RebuildReport",
     "RecomputeReport",
     "RejectedError",
+    "SchedulerReport",
     "SchemaError",
     "SchemaRegistry",
     "SqliteStorage",

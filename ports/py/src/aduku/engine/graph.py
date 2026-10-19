@@ -12,7 +12,7 @@ from aduku.ion_codec import Annotated, FrozenStruct
 from aduku.paths import PathError, parse_path, parse_pattern
 from aduku.schema.model import FieldSpec, Schema
 
-__all__ = ["dependency_paths", "edges", "find_cycles", "order"]
+__all__ = ["dependency_paths", "deferred_levels", "edges", "find_cycles", "order"]
 
 
 def dependency_paths(spec: FieldSpec) -> tuple[str, ...]:
@@ -105,3 +105,30 @@ def order(schema: Schema) -> tuple[FieldSpec, ...]:
         for deps in waiting.values():
             deps.difference_update(ready)
     return tuple(result)
+
+
+def deferred_levels(schema: Schema) -> tuple[tuple[FieldSpec, ...], ...]:
+    """The deferred fields in levels: a field is one level above the deepest deferred field it depends on, and level 0
+    when it depends on none (plain, computed and impure inputs are all there before the deferred stage). Within a level
+    the order is by path in code-point order, so the levels are the same for any declaration order.
+
+    A schema with a cycle is refused at load, so none is expected here; fields left in a cycle are omitted.
+    """
+    deferred = {spec.pattern: spec for spec in schema.fields if spec.derived == "deferred"}
+    graph = edges(schema)
+    depth: dict[str, int] = {}
+    pending = set(deferred)
+    while pending:
+        ready = sorted(
+            name for name in pending if all(dep in depth for dep in graph[name] if dep in deferred and dep != name)
+        )
+        if not ready:
+            break
+        for name in ready:
+            above = [depth[dep] for dep in graph[name] if dep in deferred and dep != name]
+            depth[name] = 1 + max(above) if above else 0
+        pending.difference_update(ready)
+    levels: dict[int, list[str]] = {}
+    for name, level in depth.items():
+        levels.setdefault(level, []).append(name)
+    return tuple(tuple(deferred[name] for name in sorted(levels[level])) for level in sorted(levels))

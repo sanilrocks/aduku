@@ -27,11 +27,14 @@ from aduku.paths import Path, most_specific, parse_pattern
 __all__ = [
     "AuditSettings",
     "BehaviorRef",
+    "CallPolicy",
     "ComputedSpec",
+    "DeferredSpec",
     "FieldSpec",
     "ImpureSpec",
     "MISSING",
     "MacroArg",
+    "RefreshPolicy",
     "Schema",
     "conforms",
     "parse_type",
@@ -177,6 +180,17 @@ class ComputedSpec:
 
 
 @dataclass(frozen=True)
+class CallPolicy:
+    """How one hook call is made: seconds per attempt, retries after the first attempt, seconds between attempts, and the
+    seconds the whole envelope may take. Shared by impure computes and deferred sources (features 002 and 003)."""
+
+    timeout: float
+    retry_max: int
+    backoff: float
+    deadline: float
+
+
+@dataclass(frozen=True)
 class ImpureSpec:
     """An impure computed field: a registered hook called with its declared dependencies (SPEC 9.3.1)."""
 
@@ -190,6 +204,62 @@ class ImpureSpec:
     deadline: float
     recompute_by: tuple[str, ...]
     failure_mode: str | None = None  # None: the field's own, then the schema's impure_failure_mode
+
+    @property
+    def policy(self) -> CallPolicy:
+        return CallPolicy(self.timeout, self.retry_max, self.backoff, self.deadline)
+
+
+# Platform bounds and defaults of a deferred field (feature 003, research R-3).
+DEFAULT_SOURCE_TIMEOUT = 2.0
+DEFAULT_SOURCE_RETRIES = 2
+DEFAULT_SOURCE_BACKOFF = 0.2
+DEFAULT_SOURCE_DEADLINE = 6.0
+MAX_SOURCE_BACKOFF = 10.0
+MIN_TTL = 1.0
+
+
+@dataclass(frozen=True)
+class RefreshPolicy:
+    """One way a deferred field is refreshed: `once`, `per_fetch`, `scheduled` (`every` seconds or a `cron`
+    expression) or `notification` (a `topic`)."""
+
+    kind: Literal["once", "per_fetch", "scheduled", "notification"]
+    every: float | None = None
+    cron: str | None = None
+    topic: str | None = None
+
+
+@dataclass(frozen=True)
+class DeferredSpec:
+    """A deferred field: a registered hook (the source) called with its declared dependencies (SPEC 9.5)."""
+
+    hook: str
+    version: int
+    depends: tuple[str, ...]
+    refresh: tuple[RefreshPolicy, ...]
+    invalidate_by: tuple[str, ...]
+    ttl: float | None = None  # per_fetch only
+    on_dependency_change: Literal["keep", "recompute"] = "keep"  # once only
+    on_failure: str | None = None  # None: the schema's deferred_on_failure
+    timeout: float = DEFAULT_SOURCE_TIMEOUT
+    retry_max: int = DEFAULT_SOURCE_RETRIES
+    backoff: float = DEFAULT_SOURCE_BACKOFF
+    deadline: float = DEFAULT_SOURCE_DEADLINE
+
+    @property
+    def source(self) -> str:
+        return f"{self.hook}@{self.version}"
+
+    @property
+    def policy(self) -> CallPolicy:
+        return CallPolicy(self.timeout, self.retry_max, self.backoff, self.deadline)
+
+    def shape(self, type_text: str | None) -> str:
+        """A digest of what makes a stored value reusable: the source and its version, the dependency list and the type.
+        A change in any of them means the stored value answers another question (FR-030)."""
+        text = "|".join([self.source, ",".join(self.depends), type_text or ""])
+        return hashlib.sha256(text.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -208,6 +278,7 @@ class FieldSpec:
     failure_mode: str | None = None
     computed: ComputedSpec | None = None
     impure: ImpureSpec | None = None
+    deferred: DeferredSpec | None = None
     on_missing: Literal["null", "absent", "error"] = "null"  # what a computed field does when an input is missing
 
     @property
@@ -243,6 +314,7 @@ class Schema:
     rejection_audit: AuditSettings = AuditSettings()
     document_validate: tuple[BehaviorRef, ...] = ()
     impure_failure_mode: str = "reject_on_failure"
+    deferred_on_failure: str = "error"  # the default `on_failure` of deferred fields (feature 003)
 
     @cached_property
     def rules_fingerprint(self) -> str:
@@ -251,6 +323,10 @@ class Schema:
         A cached view is only used when it was derived under the same fingerprint (FR-026).
         """
         return hashlib.sha256(_describe(self).encode()).hexdigest()[:16]
+
+    def on_failure_of(self, spec: FieldSpec) -> str:
+        """What a deferred field does when its source fails: its own setting, else the schema's, else `error`."""
+        return (spec.deferred.on_failure if spec.deferred else None) or self.deferred_on_failure
 
     def tier_rank(self, tier: str) -> int:
         return self.tiers.index(tier)

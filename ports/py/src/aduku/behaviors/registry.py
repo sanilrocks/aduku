@@ -77,6 +77,11 @@ class Behavior:
     field_wise: bool = False
     # For a validator: the problems in the arguments a schema gives it (checked when the schema loads).
     check_args: Callable[[Any], list[str]] | None = None
+    # For a hook used by deferred fields (feature 003): items per call, calls per second, and whether the call also
+    # receives the call context (document, field, attempt, deadline).
+    batch_max: int | None = None
+    rate_limit: float | None = None
+    with_context: bool = False
 
 
 class BehaviorRegistry:
@@ -134,9 +139,38 @@ class BehaviorRegistry:
             raise SchemaError(f"BAD_MACRO_EXPRESSION: macro {name}@{version}: {error}") from error
         return self._add(Behavior(name, version, "macro", MacroImpl(name, version, program, accepts_missing)))
 
-    def register_hook(self, name: str, version: int, call: Callable[..., Any]) -> Behavior:
-        """`call(inputs, timeout)` for an impure compute: idempotent, given only its declared dependencies (feature 002)."""
-        return self._add(Behavior(name, version, "hook", call, purity="io"))
+    def register_hook(
+        self,
+        name: str,
+        version: int,
+        call: Callable[..., Any],
+        *,
+        batch_max: int | None = None,
+        rate_limit: float | None = None,
+        with_context: bool = False,
+    ) -> Behavior:
+        """`call(inputs, timeout)` for an impure compute or a deferred field: idempotent, given only its declared
+        dependencies (features 002 and 003).
+
+        `batch_max=N` makes it a batch source, `call(items, timeout) -> list` with one answer per item (a value, or an
+        `Exception` for that item); `rate_limit` is calls per second; `with_context` adds a third argument `ctx`.
+        """
+        if batch_max is not None and batch_max < 1:
+            raise SchemaError(f"hook {name}@{version}: batch_max must be at least 1")
+        if rate_limit is not None and not rate_limit > 0:
+            raise SchemaError(f"hook {name}@{version}: rate_limit must be above zero (calls per second)")
+        return self._add(
+            Behavior(
+                name,
+                version,
+                "hook",
+                call,
+                purity="io",
+                batch_max=batch_max,
+                rate_limit=rate_limit,
+                with_context=with_context,
+            )
+        )
 
     def _add(self, behavior: Behavior) -> Behavior:
         if behavior.kind in ("macro", "hook") and behavior.name in PRESET_NAMES:

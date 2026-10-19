@@ -117,3 +117,59 @@ def test_a_very_long_chain_of_fields_is_checked_without_recursion() -> None:
     with pytest.raises(SchemaError) as caught:
         load_schema(text, BehaviorRegistry.with_builtins())
     assert any(p.startswith("DEPENDENCY_CYCLE") for p in caught.value.problems)
+
+
+# -- feature 003: the levels of deferred fields (FR-013, FR-014) ---------------------------------------------------
+
+
+def deferred(*deps: str) -> str:
+    listed = ", ".join(f'"{d}"' for d in deps)
+    return f'{{type: string, deferred: {{hook: "h@1", depends: [{listed}], refresh: once, invalidate_by: [a]}}}}'
+
+
+def level_names(schema) -> list[list[str]]:  # type: ignore[no-untyped-def]
+    from aduku.engine.graph import deferred_levels
+
+    return [[spec.pattern for spec in level] for level in deferred_levels(schema)]
+
+
+def test_deferred_fields_are_levelled_by_their_deepest_deferred_dependency() -> None:
+    fields = {
+        "/d3": deferred("/d2", "/name"),
+        "/d1": deferred("/name", A),
+        "/d2": deferred("/d1"),
+        "/d0": deferred("/city"),
+        A: computed("/name"),
+    }
+    assert level_names(schema_with(fields)) == [["/d0", "/d1"], ["/d2"], ["/d3"]]
+
+
+def test_the_levels_do_not_depend_on_declaration_order() -> None:
+    fields = {"/x": deferred("/name"), "/y": deferred("/x"), "/z": deferred("/name")}
+    forward = level_names(schema_with(fields))
+    backward = level_names(schema_with(dict(reversed(list(fields.items())))))
+    assert forward == backward == [["/x", "/z"], ["/y"]]
+
+
+def test_a_deferred_field_that_reads_computed_and_impure_fields_is_on_level_zero() -> None:
+    impure = (
+        '{type: string, computed: {impure: {hook: "h@1", depends: ["/name"], reason: "r", timeout: "1s", '
+        'retry: {max: 0}, deadline: "2s", recompute_by: [a]}}}'
+    )
+    fields = {A: computed("/name"), "/tax": impure, "/d": deferred(A, "/tax")}
+    assert level_names(schema_with(fields)) == [["/d"]]
+
+
+def test_a_schema_without_deferred_fields_has_no_levels() -> None:
+    assert level_names(schema_with(CHAIN)) == []
+
+
+def test_a_field_reading_a_struct_is_above_the_deferred_fields_inside_it() -> None:
+    text = (
+        'schema::{id: "t", version: 1, tiers: [a], fields: {"/order": {type: struct, merge: struct}, '
+        '"/order/n": {type: string, merge: lww}, '
+        f'"/order/rate": {deferred("/order/n")}, "/a_all": {deferred("/order")}}}}}'
+    )
+    behaviors = BehaviorRegistry.with_builtins()
+    behaviors.register_hook("h", 1, lambda inputs, timeout: "x")
+    assert level_names(load_schema(text, behaviors)) == [["/order/rate"], ["/a_all"]]

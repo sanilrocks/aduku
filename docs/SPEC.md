@@ -1,6 +1,6 @@
 # aduku — Specification
 
-Status: Draft 0.9 · Audience: implementers and reviewers
+Status: Draft 0.10 · Audience: implementers and reviewers
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** are used as in RFC 2119.
 
@@ -298,10 +298,11 @@ schema::{
 
     "/creditScore": { type: int,
                       deferred: { hook: "credit.fetch_score@1", depends: ["/name"],
-                                  refresh: once, timeout: "2s" } },
+                                  refresh: once, timeout: "2s", invalidate_by: [admin] } },
     "/fxRate":      { type: decimal,
                       deferred: { hook: "fx.rate@2", depends: ["/currency"],
-                                  refresh: per_fetch, ttl: "5m", on_failure: serve_stale } },
+                                  refresh: per_fetch, ttl: "5m", on_failure: serve_stale,
+                                  invalidate_by: [admin] } },
 
     "/*":        { merge: lww }                                // fallback rule
   },
@@ -325,7 +326,7 @@ schema::{
 | `impure_failure_mode` | P4 | Schema-level default for `failure_mode` (section 9.3.1). |
 | `on_missing` | P4 | Computed and impure fields: `null` (default), `absent` or `error`, what the field does when an input has no value (section 9.4). |
 | `recompute_by` | P4 | Impure computes: the tiers or roles allowed to call `recompute` (section 9.3.1). |
-| `deferred` | P5 | IO hook with refresh policy and persistence (section 9.5). |
+| `deferred` | P5 | IO hook with refresh policy and persistence (section 9.5). Requires `invalidate_by`: the tiers or roles allowed to call `hook.invalidate` and `scheduler.run` for the field. |
 | `redact` | P7 | Read-time projection rule (e.g. role-based masking). |
 | `lenient` | P0 | Schema-level: tiers/contributors allowed to use the non-rejection flag (section 10.2). |
 | `rejection_audit` | P0 | Schema-level: enable the rejection audit log and its retention caps (section 4.5). |
@@ -616,16 +617,16 @@ hook(input: { dependency path → value }, ctx: { doc, field, attempt, deadline 
 ```
 
 - Hooks receive only declared dependencies plus metadata. They MAY perform IO. They MUST be idempotent.
-- Output MUST conform to the field's `type`; otherwise it is treated as an error.
+- Output MUST conform to the field's `type`; otherwise it is treated as an error. An answer of no value or null is an error too: a stored deferred value is never null.
 
 **Refresh policies** (`refresh:`):
 
 | Policy | Behavior | Persisted |
 |---|---|---|
 | `once` | Computed before the first full fetch if no persisted value exists; thereafter served from the store. Optional `on_dependency_change: recompute`. | Yes |
-| `per_fetch` | Invoked on every fetch (subject to `ttl`); the value is returned and MAY be stored as last-known-good. | Optional |
+| `per_fetch` | Invoked on every fetch, except that a stored value is reused while its inputs are unchanged and it is younger than `ttl` (a changed input always causes a call); the value is returned and MAY be stored as last-known-good. | Optional |
 | `scheduled` | Refreshed by the engine's scheduler in **batches across documents** on an interval or cron; fetch serves the stored value. | Yes |
-| `notification` | Linked to a topic; a notification invalidates and recomputes affected documents' field. | Yes |
+| `notification` | Linked to a topic; a notification marks the affected documents' stored value out of date and makes no call; the next `scheduler.run` for the source recomputes it (a read serves the stored value meanwhile). | Yes |
 
 Policies MAY be combined (e.g. `refresh: [once, scheduled::{every:"1h"}]`).
 
@@ -637,10 +638,10 @@ derived_value { doc, field, value, as_of, input_fingerprint, hook_version,
 ```
 
 **Failure handling:** see the failure policy below (`on_failure`).
-Hooks have `timeout`, bounded retries with backoff, and a circuit breaker per hook. A `per_fetch` hook on the
-read path MUST NOT exceed the fetch deadline; on timeout it follows `on_failure`.
+Hooks have `timeout`, bounded retries with backoff, and a circuit breaker per hook (one per hook name and version, shared by every field and document that uses it). Deferred calls on the
+read path MUST NOT make a read exceed the fetch deadline, which covers the whole read and all its fields; on timeout the unfinished fields follow `on_failure`, and a field waiting on an unfinished upstream is `pending`.
 
-**Scheduler:** batches documents per hook, honors hook rate limits, is idempotent, and records every run.
+**Scheduler:** batches documents per hook, honors hook rate limits, is idempotent, and records every run. On the read path a source's rate limit is never waited for: a read that finds no token makes no call and the field follows `on_failure` for that read.
 Batch hooks MAY declare `batch: { max: N }` and receive many inputs per call.
 
 **Deferred-to-deferred dependencies (promises).** A deferred field's value is a promise until its hook succeeds. A hook is
@@ -655,6 +656,8 @@ graph in topological order, so a hook never runs with an unresolved deferred inp
 | `error` (default) | Field status is `error`; the write that triggered it is **not** affected. |
 | `serve_stale` | Last good value is returned with `status: stale`. |
 | `absent` | Field is shown absent with `status: error`. |
+
+A failed call leaves no value and is not repeated on every read: a `once` field is asked again when it is invalidated or its inputs change, a `per_fetch` field at its next `ttl`, a scheduled field at its next slot (a refusal by an open breaker or a rate limit is not a call and does not delay this).
 
 A deferred failure never rejects a contribution and is never a model error. It is a **deferred status** held in the
 derived store (`status`, `error`, `attempts`), shown with the field, and cleared by a later successful recompute
@@ -780,6 +783,12 @@ A read normally makes no IO. The one exception is an impure compute with no reco
 fingerprint (for example after a schema change): the read calls the hook once, records the outcome (section 9.3.1) and
 returns a failure as a model error, never as a rejection.
 
+A read may also call the sources of deferred fields (section 9.5): those whose `once` value is missing or whose `per_fetch`
+value is past its `ttl` or was made for other inputs (every `per_fetch` value with `consistency: fresh`). All such calls share
+one fetch deadline for the whole read; a field not finished by then follows its `on_failure`, and a failure is a status in
+`deferred`, never a rejection or a model error. `deferred` lists the status of every deferred field; `include: pending` adds
+what each pending field waits for. A write never calls a source, and `rebuild` never does.
+
 ### 12.3 Explain
 
 ```
@@ -801,7 +810,7 @@ A path the schema does not declare is `UNKNOWN_PATH`.
 ### 12.4 Admin
 
 `list_entries`, `rebuild(doc|all)`, `compact(doc, policy)`, `schema.put/activate`, `hook.invalidate(doc?, field)`,
-`scheduler.run(hook)`, `list_rejections(doc, { since?, limit? })`, `set_rejection_audit(doc, enabled|inherit)`,
+`scheduler.run(hook)` (both permitted only to the tiers and roles a field lists in `invalidate_by`; `NOT_AUTHORIZED` otherwise), `list_rejections(doc, { since?, limit? })`, `set_rejection_audit(doc, enabled|inherit)`,
 `prune_rejections(doc?)`, `recompute(doc, field?)`, `list_effects(doc, field?)`, `prune_effects(doc?)`.
 
 `rebuild` derives each document from the ledger alone and compares it with the cached view. A current view that differs is
@@ -1040,6 +1049,7 @@ Every question below was decided on 2026-10-18. The Decision line says what is i
 
 ## Appendix A. Changelog
 
+- **0.10**: Deferred fields as clarified and built for feature 003 (12.2 now says reads may call deferred sources): `invalidate_by` is required on every deferred field, a `per_fetch` value is reused only while its inputs are unchanged, the circuit breaker is per hook, the fetch deadline covers the whole read, and a notification only marks values out of date (9.5, 5.3, 12.4).
 - **0.9**: Computed fields as built in feature 002: null counts as a missing input, `on_missing: error` model errors count against a request, `COMPUTE_FAULT`, `on_missing` and `recompute_by` in the annotation table (5.3, 9.4, 12.5).
 - **0.8**: Impure computes declare `recompute_by` (who may call `recompute`), decided while clarifying feature 002 (9.3.1).
 - **0.7**: Matched the spec to the first implementation: admission checks struct children, child authority on delete and values with no canonical Ion form (6.5); tier drop refused also at pin and at service start (4.4); built-in validator arguments checked at load (5.1); `explain` shape and winner definition (12.3); `rebuild` semantics (12.4). Example 16.2 step 7 uses `max_len 2`, since "Pat" has 3 characters.

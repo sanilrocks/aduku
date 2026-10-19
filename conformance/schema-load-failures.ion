@@ -2,7 +2,7 @@
 // Ports compare codes, not message text.
 case::{
   name: "schema-load-failures",
-  fixtures: ["acme.subtract@1", "acme.longest@1", "acme.label@1", "fx.echo@1"],
+  fixtures: ["acme.subtract@1", "acme.longest@1", "acme.label@1", "fx.echo@1", "fx.score@1"],
   steps: [
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a, b],
         fields: {"/age": {type: int, merge: max}, "/tags": {type: "list<string>", merge: union},
@@ -23,9 +23,39 @@ case::{
     // nothing may depend on a deferred field
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {
           "/name": {type: string, merge: lww},
-          "/score": {type: int, deferred: {hook: "credit.score@1", depends: ["/name"]}},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [a]}},
           "/label": {type: string, computed: {macro: concat, args: ["/score"]}}}}''',
       expect: { problems: [DEPENDS_ON_DEFERRED] } },
+
+    // a well-formed deferred field loads, with one policy or several (feature 003)
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], roles: [ops], fields: {
+          "/name": {type: string, merge: lww},
+          "/score": {type: int, on_missing: absent, deferred: {hook: "fx.score@1", depends: ["/name"],
+              refresh: [once, per_fetch, scheduled::{every: "1h"}, scheduled::{cron: "0 * * * *"}, notification::{topic: "t"}],
+              ttl: "5m", on_dependency_change: recompute, on_failure: serve_stale, timeout: "2s",
+              retry: {max: 2, backoff: "200ms"}, deadline: "6s", invalidate_by: [a, ops]}}}}''',
+      expect: { ok: true } },
+
+    // the declaration of a deferred field is complete, its policies and options are well-formed, its source exists
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/name"], refresh: once}}}}''',
+      expect: { problems: [DEFERRED_DECLARATION_INCOMPLETE] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/name"], refresh: sometimes, invalidate_by: [a]}}}}''',
+      expect: { problems: [BAD_REFRESH_POLICY] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/name"], refresh: once, ttl: "5m", invalidate_by: [a]}}}}''',
+      expect: { problems: [BAD_DEFERRED_OPTION] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.nobody@1", depends: ["/name"], refresh: once, invalidate_by: [a]}}}}''',
+      expect: { problems: [UNKNOWN_BEHAVIOR] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/nope"], refresh: once, invalidate_by: [a]}}}}''',
+      expect: { problems: [UNKNOWN_DEPENDENCY] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {
+          "/x": {type: int, deferred: {hook: "fx.score@1", depends: ["/y"], refresh: once, invalidate_by: [a]}},
+          "/y": {type: int, deferred: {hook: "fx.score@1", depends: ["/x"], refresh: once, invalidate_by: [a]}}}}''',
+      expect: { problems: [DEPENDENCY_CYCLE] } },
 
     // derived fields may not depend on each other in a loop
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {

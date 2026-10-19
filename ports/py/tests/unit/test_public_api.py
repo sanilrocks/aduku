@@ -31,3 +31,11 @@ def test_every_type_the_computed_fields_contract_names_is_importable() -> None:
     from aduku import ComputeFault, EffectInfo, HookRunner, RecomputeReport  # noqa: F401
 
     assert {"ComputeFault", "EffectInfo", "HookRunner", "RecomputeReport"} <= set(aduku.__all__)
+
+
+def test_every_type_the_deferred_fields_contract_names_is_importable() -> None:
+    """contracts/library-api.md (feature 003): the status, info and report types."""
+    import aduku
+    from aduku import DeferredInfo, DeferredStatus, SchedulerReport  # noqa: F401
+
+    assert {"DeferredInfo", "DeferredStatus", "SchedulerReport"} <= set(aduku.__all__)

@@ -1,9 +1,11 @@
-// SPEC 16.1 through P4: thirteen requests in seq order, the merged document with its computed values, and a rejected
-// write to a computed field. `displayName` is a preset macro; `label` is the custom macro `acme.label@1`.
+// SPEC 16.1 through P5: thirteen requests in seq order, the merged document with its computed and deferred values, and a
+// rejected write to a computed field. `displayName` is a preset macro; `label` is the custom macro `acme.label@1`;
+// `creditScore` is fetched once (712) and `fxRate` on every read within a ttl (0.92). The harness clock does not step.
 // The audit on/off behaviour for the rejection is checked in tests/golden/test_worked_example.py.
 case::{
   name: "worked-example-16-1",
-  fixtures: ["acme.label@1"],
+  fixtures: ["acme.label@1", "fx.score@1", "fx.rate@1"],
+  clock: { start: 2026-10-19T12:00:00Z, step_seconds: 0 },
   schema:
   schema::{
     id: "customer", version: 7,
@@ -25,6 +27,12 @@ case::{
 
       "/displayName":  { type: string, computed: { macro: upper, args: ["/name"] } },
       "/label":        { type: string, computed: { macro: "acme.label@1", args: ["/name", "/address/city"] } },
+
+      "/creditScore":  { type: int,
+                         deferred: { hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [admin] } },
+      "/fxRate":       { type: decimal,
+                         deferred: { hook: "fx.rate@1", depends: ["/currency"], refresh: per_fetch, ttl: "5m",
+                                     on_failure: serve_stale, invalidate_by: [admin] } },
 
       "/*":            { merge: lww }
     }
@@ -57,20 +65,37 @@ case::{
     { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/currency", value: "EUR"}] },
       expect: { accepted: [{seq: 13}] } },
 
-    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",displayName:computed::"ALICE S.",label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}',
-                           model_errors: [] } },
+    { source_calls: "fx.score@1", expect: { count: 0 } },   // a write never calls a deferred source
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,creditScore:deferred::712,currency:"EUR",displayName:computed::"ALICE S.",fxRate:deferred::0.92,label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}',
+                           model_errors: [],
+                           deferred: { "/creditScore": { status: ok, value: 712 }, "/fxRate": { status: ok, value: 0.92 } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.rate@1", expect: { count: 1 } },
 
     // an admin may not write a derived field; the request is rejected, is not a ledger entry and consumes no seq
     { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName", value: "HACKED"}] },
       expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/displayName"}] } } },
-    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",displayName:computed::"ALICE S.",label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}' } },
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,creditScore:deferred::712,currency:"EUR",displayName:computed::"ALICE S.",fxRate:deferred::0.92,label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}' } },
     { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice S."}] },
       expect: { accepted: [{seq: 14}] } },
+
+    // the stored values are served: no new call, inside the ttl and with the same inputs
+    { get: "d1", expect: { deferred: { "/creditScore": { status: ok }, "/fxRate": { status: ok } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.rate@1", expect: { count: 1 } },
+    // past the ttl the rate is fetched again; the once value is kept
+    { clock: { advance: "6m" } },
+    { get: "d1", expect: { deferred: { "/creditScore": { status: ok, value: 712 }, "/fxRate": { status: ok, value: 0.92 } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.rate@1", expect: { count: 2 } },
 
     { explain: { doc: "d1", path: "/age" }, expect: { rule: "max@1", winner_seq: 3 } },
     { explain: { doc: "d1", path: "/displayName" }, expect: { winner: "computed", rule: "upper@1" } },
     { explain: { doc: "d1", path: "/label" }, expect: { winner: "computed", rule: "acme.label@1" } },
     { explain: { doc: "d1", path: "/plan" }, expect: { winner: "default" } },
-    { rebuild: "d1", expect: { identical: true } }
+    { explain: { doc: "d1", path: "/creditScore" }, expect: { winner: "deferred", rule: "fx.score@1" } },
+    { rebuild: "d1", expect: { identical: true } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },    // a rebuild makes no source call
+    { source_calls: "fx.rate@1", expect: { count: 2 } }
   ]
 }

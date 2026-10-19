@@ -38,6 +38,12 @@ class _OpAction(argparse.Action):
         setattr(namespace, self.dest, items)
 
 
+def _caller_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--contributor", required=True)
+    parser.add_argument("--tier", required=True)
+    parser.add_argument("--role", action="append", default=[], help="a role the caller holds (repeatable)")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aduku", description="aduku-py command line")
     parser.add_argument("--db", default=os.environ.get("ADUKU_DB", "aduku.db"))
@@ -64,6 +70,10 @@ def _parser() -> argparse.ArgumentParser:
 
     get = sub.add_parser("get", help="read the merged document")
     get.add_argument("doc")
+    get.add_argument("--fresh", action="store_true", help="ignore the ttl of per_fetch deferred fields")
+    get.add_argument(
+        "--include", action="append", default=[], choices=("pending",), help="say what pending fields wait for"
+    )
 
     rebuild = sub.add_parser("rebuild", help="re-derive from the ledger and compare with the cached views")
     rebuild.add_argument("doc", nargs="?")
@@ -74,6 +84,25 @@ def _parser() -> argparse.ArgumentParser:
     recompute.add_argument("--contributor", required=True)
     recompute.add_argument("--tier", required=True)
     recompute.add_argument("--role", action="append", default=[], help="a role the caller holds (repeatable)")
+
+    invalidate = sub.add_parser("invalidate", help="mark a deferred value out of date (DOC * for every document)")
+    invalidate.add_argument("doc")
+    invalidate.add_argument("field")
+    _caller_options(invalidate)
+
+    scheduler = sub.add_parser("scheduler", help="the deferred scheduler")
+    scheduler_sub = scheduler.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_run = scheduler_sub.add_parser("run", help="refresh what is due for a source (name@version)")
+    scheduler_run.add_argument("hook")
+    _caller_options(scheduler_run)
+
+    notify = sub.add_parser("notify", help="mark the values linked to a topic out of date")
+    notify.add_argument("topic")
+    notify.add_argument("docs", nargs="*")
+
+    deferred = sub.add_parser("deferred", help="the stored state of deferred fields")
+    deferred_sub = deferred.add_subparsers(dest="deferred_command", required=True)
+    deferred_sub.add_parser("list").add_argument("doc")
 
     effects = sub.add_parser("effects", help="the outcomes of impure computes")
     effects_sub = effects.add_subparsers(dest="effects_command", required=True)
@@ -168,7 +197,20 @@ def _inventory(schema: Schema) -> dict[str, Any]:
         for spec in schema.fields
         if spec.impure is not None
     ]
-    return {"computed": computed, "impure": impure}
+    deferred = [
+        {
+            "field": spec.pattern,
+            "hook": spec.deferred.source,
+            "depends": list(spec.deferred.depends),
+            "refresh": [p.kind for p in spec.deferred.refresh],
+            "ttl": spec.deferred.ttl,
+            "on_failure": schema.on_failure_of(spec),
+            "invalidate_by": list(spec.deferred.invalidate_by),
+        }
+        for spec in schema.fields
+        if spec.deferred is not None
+    ]
+    return {"computed": computed, "impure": impure, "deferred": deferred}
 
 
 def _check_schema(args: argparse.Namespace) -> int:
@@ -225,11 +267,12 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
         if args.command == "append":
             return _append(args, service)
         if args.command == "get":
-            result = service.get(args.doc)
+            result = service.get(args.doc, consistency="fresh" if args.fresh else "cached", include=tuple(args.include))
             _emit(
                 args,
                 {
                     "document": to_canonical(result.document),
+                    "deferred": [_deferred_status(d) for d in result.deferred],
                     "model_errors": [_model_error(e) for e in result.model_errors],
                     "skipped": list(result.skipped),
                     "conflicts": list(result.conflicts),
@@ -239,6 +282,28 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
             return 0
         if args.command == "recompute":
             return _recompute(args, service)
+        if args.command in ("invalidate", "scheduler"):
+            return _deferred_admin(args, service)
+        if args.command == "notify":
+            _emit(args, {"marked": service.notify(args.topic, args.docs or None)})
+            return 0
+        if args.command == "deferred":
+            _emit(
+                args,
+                {
+                    "deferred": [
+                        {
+                            "field": i.field,
+                            "status": i.status,
+                            "as_of": i.as_of.isoformat() if i.as_of else None,
+                            "attempts": i.attempts,
+                            "invalidated": i.invalidated,
+                        }
+                        for i in service.list_deferred(args.doc)
+                    ]
+                },
+            )
+            return 0
         if args.command == "effects":
             if args.effects_command == "list":
                 found = service.list_effects(args.doc, args.field)
@@ -279,6 +344,8 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                         for path, value in why.dependencies
                     ],
                     "effect_seq": why.effect_seq,
+                    "status": why.status,
+                    "as_of": why.as_of.isoformat() if why.as_of else None,
                 },
             )
             return 0
@@ -301,6 +368,46 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
         return _audit(args, service)
     finally:
         service.storage.close()
+
+
+def _deferred_status(status: Any) -> dict[str, Any]:
+    return {
+        "path": status.path,
+        "status": status.status,
+        "as_of": status.as_of.isoformat() if status.as_of else None,
+        "error": status.error,
+        "attempts": status.attempts,
+        "waiting_for": list(status.waiting_for),
+        "reason": status.reason,
+    }
+
+
+def _deferred_admin(args: argparse.Namespace, service: Aduku) -> int:
+    caller = Identity(args.contributor, (args.tier,), tuple(args.role))
+    try:
+        if args.command == "invalidate":
+            marked = service.invalidate(None if args.doc == "*" else args.doc, args.field, caller=caller)
+            _emit(args, {"marked": marked})
+            return 0
+        report = service.scheduler_run(args.hook, caller=caller)
+    except RejectedError as rejection:
+        _emit(args, {"rejected": {"code": rejection.code.value, "reasons": [_reason(r) for r in rejection.reasons]}})
+        for reason in rejection.reasons:
+            print(f"{reason.code.value}: {reason.message}", file=sys.stderr)
+        return 1
+    _emit(
+        args,
+        {
+            "run_id": report.run_id,
+            "attempted": report.attempted,
+            "succeeded": report.succeeded,
+            "failed": report.failed,
+            "skipped": report.skipped,
+            "calls": report.calls,
+            "reason": report.reason,
+        },
+    )
+    return 0
 
 
 def _recompute(args: argparse.Namespace, service: Aduku) -> int:

@@ -1,0 +1,74 @@
+// Feature 003, US4 and US5: a notification only marks values out of date and the next scheduler run recomputes them; a field
+// with combined policies is fetched by a read once and refreshed by the scheduler; a rate limit stops a run, which goes on later.
+//   flag  : notification on sanctions.updated, batch source fx.batch@1
+//   both  : once + scheduled every hour, source fx.score@1
+//   paced : scheduled, source fx.paced@1 (a batch of one, one call a second); the run may take 1500 ms
+case::{
+  name: "deferred-notifications",
+  fixtures: ["fx.batch@1", "fx.score@1", "fx.paced@1"],
+  clock: { start: 2026-10-19T12:00:00Z, step_seconds: 0 },
+  options: { scheduler_budget: "1500ms" },
+  schema:
+  schema::{
+    id: "notifications", version: 1,
+    tiers: [user, admin],
+    fields: {
+      "/name":    { type: string, merge: lww },
+      "/country": { type: string, merge: lww },
+
+      "/flag":  { type: string, deferred: { hook: "fx.batch@1", depends: ["/country"], refresh: notification::{topic: "sanctions.updated"},
+                                             invalidate_by: [admin] } },
+      "/both":  { type: int, deferred: { hook: "fx.score@1", depends: ["/name"], refresh: [once, scheduled::{every: "1h"}],
+                                          invalidate_by: [admin] } },
+      "/paced": { type: string, deferred: { hook: "fx.paced@1", depends: ["/country"], refresh: scheduled::{every: "1h"},
+                                             invalidate_by: [admin] } }
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/name", value: "Alice"}, {tier: user, path: "/country", value: "US"}] }, expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/name", value: "Bob"}, {tier: user, path: "/country", value: "DE"}] }, expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d3", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/name", value: "Cy"}, {tier: user, path: "/country", value: "FR"}] }, expect: { accepted: [{seq: 1}, {seq: 2}] } },
+
+    // a notification field has no value until the scheduler makes its first fetch
+    { notify: { topic: "sanctions.updated" }, expect: { marked: 0 } },
+    { scheduler_run: { hook: "fx.batch@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 3, succeeded: 3, calls: 1 } },
+    { source_calls: "fx.batch@1", expect: { count: 1, batches: [3] } },
+
+    // a notification marks and calls nothing; a read serves the stored value meanwhile
+    { notify: { topic: "other.topic", docs: [d2] }, expect: { marked: 0 } },
+    { notify: { topic: "sanctions.updated", docs: [d2, nobody] }, expect: { marked: 1 } },
+    { notify: { topic: "sanctions.updated", docs: [d2] }, expect: { marked: 1 } },     // delivered twice: the same state
+    { source_calls: "fx.batch@1", expect: { count: 1 } },
+    { get: "d2", expect: { deferred: { "/flag": { status: ok, value: "band-DE" } } } },
+    { source_calls: "fx.batch@1", expect: { count: 1 } },
+
+    // the next run recomputes exactly the marked document, once
+    { scheduler_run: { hook: "fx.batch@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 1, succeeded: 1, calls: 1 } },
+    { source_calls: "fx.batch@1", expect: { count: 2, batches: [3, 1] } },
+    { scheduler_run: { hook: "fx.batch@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 0, calls: 0 } },
+
+    // once + scheduled: a read makes the first fetch; refreshing is the scheduler's, an hour later
+    { source_calls: "fx.score@1", expect: { count: 1 } },      // the read of d2 above made d2's first fetch of /both
+    { get: "d1", expect: { deferred: { "/both": { status: ok, value: 712 } } } },
+    { source_calls: "fx.score@1", expect: { count: 2 } },
+    { clock: { advance: "2h" } },
+    { get: "d1", expect: { deferred: { "/both": { status: ok } } } },
+    { source_calls: "fx.score@1", expect: { count: 2 } },      // a read leaves refreshing to the scheduler
+    { scheduler_run: { hook: "fx.score@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 3, succeeded: 3, calls: 3 } },
+    { source_calls: "fx.score@1", expect: { count: 5 } },       // d1 and d2 refreshed; d3 never had a first fetch
+
+    // a rate limit of one call a second and a run that may take 1.5 seconds: two of the three, the third waits for the next run
+    { scheduler_run: { hook: "fx.paced@1", contributor: {id: "root", tiers: [admin]} },
+      expect: { attempted: 2, succeeded: 2, skipped: 1, calls: 2, reason: "time limit" } },
+    { clock: { advance: "5s" } },
+    { scheduler_run: { hook: "fx.paced@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 1, succeeded: 1, calls: 1 } },
+    { scheduler_run: { hook: "fx.paced@1", contributor: {id: "root", tiers: [admin]} }, expect: { attempted: 0, calls: 0 } },
+    { source_calls: "fx.paced@1", expect: { count: 3, batches: [1, 1, 1] } },
+
+    { rebuild: "d1", expect: { identical: true } },
+    { source_calls: "fx.batch@1", expect: { count: 2 } }
+  ]
+}

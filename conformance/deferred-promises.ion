@@ -1,0 +1,64 @@
+// Feature 003, US3 and US8: a deferred field that needs another is asked only when that one has a value, in order.
+//   creditScore -> creditLimit : a chain of once fields; the limit also reads the plain /country
+//   code        -> dep         : the upstream fails the first time (fx.flaky@1), so the dependent is held back
+case::{
+  name: "deferred-promises",
+  fixtures: ["fx.score@1", "fx.limit@1", "fx.flaky@1", "fx.rate@1"],
+  clock: { start: 2026-10-19T12:00:00Z, step_seconds: 0 },
+  schema:
+  schema::{
+    id: "promises", version: 1,
+    tiers: [user, admin],
+    fields: {
+      "/name":    { type: string, merge: lww },
+      "/country": { type: string, merge: lww },
+
+      "/creditScore": { type: int, deferred: { hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [admin] } },
+      "/creditLimit": { type: int, deferred: { hook: "fx.limit@1", depends: ["/creditScore", "/country"], refresh: once,
+                                               invalidate_by: [admin] } },
+
+      "/code": { type: string, deferred: { hook: "fx.flaky@1", depends: ["/country"], refresh: once, retry: {max: 0},
+                                           invalidate_by: [admin] } },
+      "/dep":  { type: decimal, deferred: { hook: "fx.rate@1", depends: ["/code"], refresh: once, invalidate_by: [admin] } }
+    }
+  },
+  steps: [
+    // a plain input is missing: the limit waits for it and names it; its source is not asked
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { get: { doc: "d1", include: [pending] },
+      expect: { deferred: { "/creditScore": { status: ok, value: 712 },
+                            "/creditLimit": { status: pending, reason: inputs_missing, waiting_for: ["/country"] },
+                            "/code": { status: pending, reason: inputs_missing, waiting_for: ["/country"] },
+                            "/dep": { status: pending, reason: upstream, waiting_for: ["/code"] } } } },
+    { source_calls: "fx.limit@1", expect: { count: 0 } },
+
+    // the input arrives: the score is already there, so the limit is asked once, with the score's value
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { get: { doc: "d1", include: [pending] },
+      expect: { deferred: { "/creditScore": { status: ok, value: 712 }, "/creditLimit": { status: ok, value: 7120 } } } },
+    { source_calls: "fx.score@1", expect: { count: 1 } },
+    { source_calls: "fx.limit@1", expect: { count: 1 } },
+
+    // the upstream failed its first call: it is in error, and the dependent is held back and not asked
+    { get: { doc: "d1", include: [pending] },
+      expect: { deferred: { "/code": { status: error }, "/dep": { status: pending, reason: upstream, waiting_for: ["/code"] } } } },
+    { source_calls: "fx.flaky@1", expect: { count: 1 } },
+    { source_calls: "fx.rate@1", expect: { count: 0 } },
+
+    // only an authorized caller may mark the upstream out of date
+    { invalidate: { doc: "d1", field: "/code", contributor: {id: "alice", tiers: [user]} }, expect: { rejected: { code: NOT_AUTHORIZED } } },
+    { invalidate: { doc: "d1", field: "/code", contributor: {id: "root", tiers: [admin]} }, expect: { marked: 1 } },
+    { source_calls: "fx.flaky@1", expect: { count: 1 } },     // marking calls nothing
+
+    // the next read asks the upstream again; it answers, and the dependent is asked right after, in the same read
+    { get: { doc: "d1", include: [pending] },
+      expect: { deferred: { "/code": { status: ok, value: "tax-US" }, "/dep": { status: ok, value: 0.92 } } } },
+    { source_calls: "fx.flaky@1", expect: { count: 2 } },
+    { source_calls: "fx.rate@1", expect: { count: 1 } },
+
+    { rebuild: "d1", expect: { identical: true } },
+    { source_calls: "fx.rate@1", expect: { count: 1 } }
+  ]
+}

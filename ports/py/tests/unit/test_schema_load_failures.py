@@ -9,6 +9,8 @@ from tests.fixtures import register_fixtures
 
 BEHAVIORS = BehaviorRegistry.with_builtins()
 register_fixtures(BEHAVIORS)
+BEHAVIORS.register_hook("credit.score", 1, lambda inputs, timeout: 700)
+BEHAVIORS.register_hook("h", 1, lambda inputs, timeout: 1)
 
 
 def wrap(fields: str, top: str = "") -> str:
@@ -69,7 +71,7 @@ def test_ordered_and_list_types_are_accepted() -> None:
         load_schema(wrap(fields), BEHAVIORS)
 
 
-DEFERRED = '"/score": {type: int, deferred: {hook: "credit.score@1", depends: ["/name"], refresh: once}}, "/name": {type: string, merge: lww}'
+DEFERRED = '"/score": {type: int, deferred: {hook: "credit.score@1", depends: ["/name"], refresh: once, invalidate_by: [admin]}}, "/name": {type: string, merge: lww}'
 
 
 def test_nothing_may_depend_on_a_deferred_field() -> None:
@@ -96,8 +98,8 @@ def test_a_deferred_field_may_depend_on_plain_computed_and_deferred_fields() -> 
         wrap(
             '"/name": {type: string, merge: lww},'
             ' "/label": {type: string, computed: {macro: upper, args: ["/name"]}},'
-            ' "/a": {type: int, deferred: {hook: "h@1", depends: ["/name", "/label"]}},'
-            ' "/b": {type: int, deferred: {hook: "h@1", depends: ["/a"]}}'
+            ' "/a": {type: int, deferred: {hook: "h@1", depends: ["/name", "/label"], refresh: once, invalidate_by: [admin]}},'
+            ' "/b": {type: int, deferred: {hook: "h@1", depends: ["/a"], refresh: once, invalidate_by: [admin]}}'
         ),
         BEHAVIORS,
     )
@@ -107,7 +109,7 @@ def test_derived_fields_must_not_form_a_cycle() -> None:
     cycle = '"/a": {type: int, computed: {macro: copy, args: ["/b"]}}, "/b": {type: int, computed: {macro: copy, args: ["/a"]}}'
     assert "DEPENDENCY_CYCLE" in codes_of(wrap(cycle))
     assert "DEPENDENCY_CYCLE" in codes_of(wrap('"/a": {type: int, computed: {macro: copy, args: ["/a"]}}'))
-    deferred = '"/a": {type: int, deferred: {hook: "h@1", depends: ["/b"]}}, "/b": {type: int, deferred: {hook: "h@1", depends: ["/a"]}}'
+    deferred = '"/a": {type: int, deferred: {hook: "h@1", depends: ["/b"], refresh: once, invalidate_by: [admin]}}, "/b": {type: int, deferred: {hook: "h@1", depends: ["/a"], refresh: once, invalidate_by: [admin]}}'
     assert "DEPENDENCY_CYCLE" in codes_of(wrap(deferred))
 
 

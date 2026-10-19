@@ -42,3 +42,34 @@ The harness counts the calls of each hook. Steps added to the case format:
 
 Cases: `computed-fields` (`FIELD_NOT_WRITABLE` on computed paths), `computed-on-missing` (`on_missing` and its model error) and
 `impure-computes` (hook outcomes, failure modes, `recompute`, a rebuild with zero calls).
+
+## Feature 003: deferred fields
+
+Fixture sources added for deferred fields. Each port provides them under the same names; the harness counts calls:
+
+| Name | Semantics |
+|---|---|
+| `fx.score@1` | answers the integer `712` |
+| `fx.rate@1` | answers the decimal `0.92` |
+| `fx.rate2@1` | answers `0.92` the first time for an input and `0.93` on later calls (to see a refetch) |
+| `fx.limit@1` | answers `score * 10` for the input `{ "/creditScore": score }` (a deferred-to-deferred chain) |
+| `fx.batch@1` | a batch source (`batch_max` 50): answers `"band-" + country` per item; records the size of each batch |
+| `fx.pair@1` | the same as `fx.batch@1` with a batch maximum of 2, for cases that stay short |
+| `fx.paced@1` | a batch source with a batch maximum of 1 and a rate limit of one call a second, for cases that meet the limit |
+| `fx.down@1` | always fails |
+| `fx.flaky@1` | fails the first call for an input and succeeds after (as in feature 002) |
+| `fx.slow@1` | does not answer in time; cases that use it give the stage a deadline of milliseconds |
+
+The harness uses one manual clock for wall time and monotonic time. Steps added to the case format:
+
+- A case may carry `options: { fetch_deadline: "100ms", scheduler_budget: "1500ms" }`: the fetch deadline of a read and the time a scheduler run may take.
+- `{ clock: { advance: "10m" } }` or `{ clock: { set: "2026-01-01T00:00:00Z" } }`.
+- `get` may carry `consistency: fresh` and `include: [pending]`; its expectation may carry `deferred: { "/creditScore": { status: ok, value: 712 } }` (and `waiting_for`, `reason`), and `document` may contain `deferred::` values.
+- `{ source_calls: "fx.score@1", expect: { count: N, batches: [..] } }`: calls made so far and batch sizes.
+- `{ invalidate: { doc, field, contributor }, expect: { marked: N } }`, or `expect: { rejected: { code: NOT_AUTHORIZED } }`.
+- `{ notify: { topic, docs: [..] }, expect: { marked: N } }`.
+- `{ scheduler_run: { hook, contributor }, expect: { attempted: N, succeeded: N, calls: N } }`.
+
+Cases: `deferred-policies` (`once`, `per_fetch`, `scheduled`), `deferred-notifications` (`notification`, a field with combined policies, a rate limit and the run's time budget; the case option `scheduler_budget` sets the budget), `deferred-failures` (the three
+`on_failure` modes, retries, the circuit breaker, a write never rejected), `deferred-promises` (chains, pending, stale accepted),
+and the extended `worked-example-16-1` (`creditScore` and `fxRate`) and `schema-load-failures`.

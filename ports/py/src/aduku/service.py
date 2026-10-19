@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 from aduku.audit import AuditRecord, RejectionAudit
 from aduku.behaviors.registry import BehaviorRegistry
@@ -31,11 +32,13 @@ from aduku.engine.project import project
 from aduku.engine.request_hash import request_hash
 from aduku.engine.validate import ValidatorFault
 from aduku.errors import ComputeFault, ErrorCode, Reason, RejectedError, SchemaError, StorageError
+from aduku.fetch import DeferredStage
 from aduku.hooks import HookRunner
 from aduku.ion_codec import ABSENT, TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical
 from aduku.log import emit
 from aduku.model import (
     AppendResult,
+    DeferredInfo,
     DocumentResult,
     EffectInfo,
     EffectRecord,
@@ -46,9 +49,11 @@ from aduku.model import (
     ModelError,
     RebuildReport,
     RecomputeReport,
+    SchedulerReport,
 )
 from aduku.paths import PathError, parse_path
-from aduku.schema.model import Schema, conforms
+from aduku.scheduler import DEFAULT_BUDGET, Scheduler
+from aduku.schema.model import FieldSpec, Schema, conforms
 from aduku.schema.registry import SchemaRegistry
 from aduku.storage.base import Clock, ConstraintError, IdSource, RequestRecord, Storage, Tx, ViewRow
 
@@ -146,6 +151,10 @@ class Aduku:
         behaviors: BehaviorRegistry | None = None,
         state_cache_size: int = 256,
         hook_runner: HookRunner | None = None,
+        fetch_deadline: float = 5.0,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        scheduler_budget: float = DEFAULT_BUDGET,
     ) -> None:
         self.storage = storage
         self.schemas = schemas
@@ -158,6 +167,22 @@ class Aduku:
         self._states: OrderedDict[str, DerivationState] = OrderedDict()
         self._views: OrderedDict[str, ViewRow] = OrderedDict()  # views derived by reads, which never write to storage
         self._hooks = hook_runner or HookRunner()
+        if not 0.0 < fetch_deadline <= 60.0:
+            raise ValueError("fetch_deadline is above zero and at most 60 seconds")
+        self._deferred = DeferredStage(
+            storage, self.behaviors, self._hooks, self.clock, monotonic or time.monotonic, fetch_deadline
+        )
+        self._scheduler = Scheduler(
+            storage,
+            self._deferred,
+            self.clock,
+            self.ids,
+            monotonic or time.monotonic,
+            sleep or time.sleep,
+            scheduler_budget,
+            self.doc_ids,
+            self._core_of,
+        )
         self._flights: dict[
             tuple[str, str, str, str], _Flight
         ] = {}  # calls in progress, by (doc, field, fingerprint, hook)
@@ -210,7 +235,7 @@ class Aduku:
         if folded is None:  # a retry: nothing was written, so say what the original did and serve the latest view
             return self._with_view(doc, self._with_effects(schema, doc, result))
         self._remember(doc, folded)  # only now that the request is committed
-        return result
+        return self._with_stored_deferred(schema, doc, result)
 
     def _retried(
         self, doc: str, contributor: Identity, request_key: str | None, digest: str | None
@@ -496,17 +521,41 @@ class Aduku:
 
     def _with_view(self, doc: str, result: AppendResult) -> AppendResult:
         """Attach the latest view of the document. A retry wrote nothing, so a failed read is reported, not hidden."""
-        return replace(result, view=self.get(doc))
+        schema = self.schemas.version_for(doc)
+        return self._with_stored_deferred(schema, doc, replace(result, view=self._core(doc, schema)))
+
+    def _with_stored_deferred(self, schema: Schema, doc: str, result: AppendResult) -> AppendResult:
+        """Show the deferred values already in the store in a write's view. A write never calls a source."""
+        if result.view is None or not DeferredStage.has_deferred(schema):
+            return result
+        return replace(result, view=self._deferred.stored(schema, doc, result.view))
 
     # -- read ----------------------------------------------------------------------------------------------------
 
-    def get(self, doc: str) -> DocumentResult:
+    def get(
+        self,
+        doc: str,
+        *,
+        consistency: Literal["cached", "fresh"] = "cached",
+        include: Sequence[str] = (),
+    ) -> DocumentResult:
         """The merged document: a pure function of the ledger and the schema version the document is read under.
 
         A read never takes the write lock: a view it has to derive is kept in memory only. The stored view is written
-        by `append` and `rebuild`.
+        by `append` and `rebuild`. Deferred fields (feature 003) are overlaid after that: sources that are due are
+        called within the fetch deadline, and a failing source only changes a field's status. `consistency="fresh"`
+        ignores the `ttl` of `per_fetch` fields; `include=("pending",)` says what each pending field waits for.
         """
+        if consistency not in ("cached", "fresh"):
+            raise ValueError("consistency is cached or fresh")
         schema = self.schemas.version_for(doc)
+        core = self._core(doc, schema)
+        if not DeferredStage.has_deferred(schema):
+            return core
+        return self._deferred.read(schema, doc, core, consistency=consistency, detail="pending" in include)
+
+    def _core(self, doc: str, schema: Schema) -> DocumentResult:
+        """P1 to P6 and the projection: everything that does not depend on the derived store."""
         ready = self._engine(schema)
         with self.storage.read() as tx:
             last = tx.last_seq(doc)
@@ -542,6 +591,9 @@ class Aduku:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"invalid path: {error}") from error
         if schema.field_for(parsed) is None:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message="the schema does not declare this path")
+        derived = schema.derived_field_at_or_above(parsed)
+        if derived is not None and derived.derived == "deferred":
+            return self._deferred.explain(schema, doc, self._core(doc, schema), derived.pattern, path)
         ready = self._engine(schema)
         if ready.has_impure:
             self.get(doc)  # makes sure every impure field has an outcome for its current inputs
@@ -732,7 +784,7 @@ class Aduku:
         assert impure is not None
         behavior = self.behaviors.get(impure.hook, impure.version)
         assert behavior is not None and behavior.kind == "hook"  # checked when the schema was loaded
-        result = self._hooks.run(behavior.impl, impure, dict(call.inputs))
+        result = self._hooks.run(behavior.impl, impure.policy, dict(call.inputs))
         value, error = result.value, result.error
         if result.outcome == "value" and spec.type is not None and not conforms(spec.type, value):
             value, error = None, "bad_value"  # the hook answered with a value of the wrong type
@@ -900,6 +952,73 @@ class Aduku:
     def last_seq(self, doc: str) -> int:
         with self.storage.read() as tx:
             return tx.last_seq(doc)
+
+    # -- deferred fields (feature 003) ---------------------------------------------------------------------------
+
+    def doc_ids(self) -> list[str]:
+        with self.storage.read() as tx:
+            return tx.doc_ids()
+
+    def _core_of(self, doc: str) -> tuple[Schema, DocumentResult]:
+        schema = self.schemas.version_for(doc)
+        return schema, self._core(doc, schema)
+
+    def invalidate(self, doc: str | None, field: str, *, caller: Identity) -> int:
+        """Mark the stored value of a deferred field out of date, for one document or (`doc=None`) for every document
+        that holds one. Nothing is called: the next fetch under the field's policy recomputes it, and a successful call
+        clears the mark. Only the tiers and roles the field lists in `invalidate_by` may; others get NOT_AUTHORIZED."""
+        schema = self.schemas.version_for(doc) if doc is not None else self.schemas.active()
+        spec = next((s for s in schema.fields if s.pattern == field and s.deferred is not None), None)
+        if spec is None or spec.deferred is None:
+            raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"{field} is not a deferred field of the schema")
+        if not ({*caller.tiers, *caller.roles} & set(spec.deferred.invalidate_by)):
+            raise RejectedError(ErrorCode.NOT_AUTHORIZED, message=f"{caller.id} may not invalidate {field}")
+        with self.storage.transaction() as tx:
+            marked = tx.mark_invalidated([field], [doc] if doc is not None else None)
+        emit("invalidate", caller=caller.id, doc=doc, field=field, marked=marked)
+        return marked
+
+    def list_deferred(self, doc: str) -> list[DeferredInfo]:
+        """The stored state of each deferred field of a document: metadata only, never a value."""
+        with self.storage.read() as tx:
+            records = tx.get_derived(doc)
+        return [DeferredInfo(r.field, r.status, r.as_of, r.attempts, r.invalidated) for r in records]
+
+    def notify(self, topic: str, docs: Sequence[str] | None = None) -> int:
+        """Mark out of date the stored values of the fields linked to `topic`, for the named documents or, with none
+        named, for every document that holds one. No source is called: the next `scheduler_run` recomputes them. Safe to
+        repeat; returns how many stored values match. Delivering events is the deployment's job, so this is not gated."""
+        fields = [
+            spec.pattern
+            for spec in self.schemas.active().fields
+            if spec.deferred is not None
+            and any(p.kind == "notification" and p.topic == topic for p in spec.deferred.refresh)
+        ]
+        if not fields or (docs is not None and not docs):
+            return 0
+        with self.storage.transaction() as tx:
+            marked = tx.mark_invalidated(fields, list(docs) if docs is not None else None)
+        emit("notification", topic=topic, documents=len(docs) if docs is not None else None, marked=marked)
+        return marked
+
+    def scheduler_run(self, hook: str, *, caller: Identity) -> SchedulerReport:
+        """Refresh what is due for a source (`"name@version"`), across all documents, in batches, within its rate limit.
+
+        Only the fields the caller may invalidate (`invalidate_by`) are refreshed: a caller who may refresh none is
+        refused (NOT_AUTHORIZED), and a source that no deferred field of the active schema uses is UNKNOWN_PATH. A run
+        that finds another run of the same source going reports `reason="lease held"` and calls nothing.
+        """
+        held = {*caller.tiers, *caller.roles}
+
+        def permitted(spec: FieldSpec) -> bool:
+            return spec.deferred is not None and bool(held & set(spec.deferred.invalidate_by))
+
+        serving = [s for s in self.schemas.active().fields if s.deferred is not None and s.deferred.source == hook]
+        if not serving:
+            raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"no deferred field uses the source {hook}")
+        if not any(permitted(spec) for spec in serving):
+            raise RejectedError(ErrorCode.NOT_AUTHORIZED, message=f"{caller.id} may not refresh the source {hook}")
+        return self._scheduler.run(hook, permitted)
 
     # -- effect log admin ----------------------------------------------------------------------------------------
 

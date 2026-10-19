@@ -12,7 +12,7 @@ from typing import Any, Protocol, cast
 
 from ulid import ULID
 
-from aduku.model import EffectRecord, Entry
+from aduku.model import DerivedRecord, EffectRecord, Entry, SchedulerRun
 
 __all__ = [
     "AuditBackend",
@@ -184,6 +184,37 @@ class Tx(Protocol):
         The outcome in force is never removed, so no derivation changes."""
 
     def drop_view(self, doc: str) -> None: ...
+
+    # -- the derived store of deferred fields (feature 003): the latest result per document and field -----------------
+
+    def get_derived(self, doc: str) -> list[DerivedRecord]:
+        """The records of a document, in field order."""
+
+    def put_derived(self, records: Sequence[DerivedRecord]) -> None:
+        """Insert or replace the record of each (document, field)."""
+
+    def list_derived(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> list[DerivedRecord]:
+        """The records of the given fields, of every document or only of `docs`, in (document, field) order."""
+
+    def mark_invalidated(self, fields: Sequence[str], docs: Sequence[str] | None = None) -> int:
+        """Set `invalidated` on the matching records (repeatable); returns how many records match."""
+
+    def delete_derived(self, docs: Sequence[str] | None = None, fields: Sequence[str] | None = None) -> int:
+        """Remove the matching records (all when neither is given); returns how many. The core never reads them."""
+
+    def append_run(self, run: SchedulerRun) -> None: ...
+
+    def list_runs(self, hook: str, limit: int | None = None) -> list[SchedulerRun]:
+        """The runs of a source, oldest first; `limit` keeps the newest N."""
+
+    def take_lease(self, hook: str, owner: str, expires: datetime, now: datetime) -> bool:
+        """Take the run lease of a source if it is free, expired (at `now`) or already `owner`'s."""
+
+    def renew_lease(self, hook: str, owner: str, expires: datetime) -> bool:
+        """Extend the lease if `owner` holds it."""
+
+    def release_lease(self, hook: str, owner: str) -> None:
+        """Free the lease if `owner` holds it."""
 
 
 class Storage(Protocol):

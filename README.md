@@ -16,14 +16,16 @@ Language ports are named `aduku-<lang>`: `aduku-py`, `aduku-java`, `aduku-rs`, `
 | `ports/py/` | `aduku-py`, the Python port (see its README) |
 | `specs/001-core-ledger-merge-engine/` | Feature 001: spec, plan, tasks, contracts, quickstart, checklists |
 | `specs/002-computed-fields/` | Feature 002: computed fields and non-writability, same set of documents |
+| `specs/003-deferred-fields/` | Feature 003: deferred computed fields (IO hooks with refresh policies), same set of documents |
 | `.specify/` | [Spec Kit](https://github.com/github/spec-kit) scaffolding; `memory/constitution.md` is the project constitution |
 | `.claude/skills/` | Spec Kit skills for Claude Code (`/speckit-*`) |
 
 ## Where things stand
 
-Constitution ratified. Features 001 (core ledger and merge engine) and 002 (computed fields, impure computes, the effect
-log) are implemented in `ports/py/`: all tests pass against the shared vectors. Features 3 to 6 are still to be specified,
-in the order in `docs/prompts/specify-features.md`.
+Constitution ratified. Features 001 (core ledger and merge engine), 002 (computed fields, impure computes, the effect
+log) and 003 (deferred fields: fetch policies, scheduler, notifications, failure handling) are implemented in
+`ports/py/`: all tests pass against the shared vectors. Features 4 to 6 are still to be specified, in the order in
+`docs/prompts/specify-features.md`.
 
 To try it: `cd ports/py && uv sync && uv run pytest`, then the walkthrough in
 `specs/001-core-ledger-merge-engine/quickstart.md`.

@@ -11,6 +11,9 @@ from aduku.ion_codec import Value
 
 __all__ = [
     "AppendResult",
+    "DeferredInfo",
+    "DeferredStatus",
+    "DerivedRecord",
     "DocumentResult",
     "EffectInfo",
     "EffectRecord",
@@ -21,6 +24,8 @@ __all__ = [
     "ModelError",
     "RebuildReport",
     "RecomputeReport",
+    "SchedulerReport",
+    "SchedulerRun",
     "Violation",
 ]
 
@@ -103,6 +108,8 @@ class DocumentResult:
     skipped: tuple[int, ...] = ()
     # Paths whose value was left out because it could not be merged with another tier's or had no place in the document.
     conflicts: tuple[str, ...] = ()
+    # The status of every deferred field (feature 003), in path order; the stored values are in `document`.
+    deferred: tuple[DeferredStatus, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,9 @@ class Explanation:
     # For a computed path: the (path, value) pairs it was computed from, and the effect-log record for an impure one.
     dependencies: tuple[tuple[str, Value], ...] = ()
     effect_seq: int | None = None
+    # For a deferred path (feature 003): its status in the derived store and when the value shown is from.
+    status: str | None = None
+    as_of: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -192,3 +202,87 @@ class RecomputeReport:
     skipped: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()
     effect_seqs: tuple[tuple[str, int], ...] = ()
+
+
+DeferredState = Literal["ok", "stale", "pending", "error"]
+
+
+@dataclass(frozen=True)
+class DerivedRecord:
+    """The latest result of a deferred field for a document, as kept in the derived store (data-model.md).
+
+    Mutable by design (one row per document and field, replaced by the next fetch) and never part of rebuild equality.
+    `status` is what the last fetch left (`ok`, `stale` or `error`); `pending` is worked out on every read.
+    """
+
+    doc: str
+    field: str
+    value: str | None  # canonical Ion text of the last good value
+    has_value: bool
+    as_of: datetime | None
+    input_fingerprint: str
+    hook: str  # name@version
+    shape: str  # digest of hook, depends and type
+    schema_version: int
+    status: Literal["ok", "stale", "error"]
+    error: str | None = None  # kind of the last failure; never a message or a value
+    attempts: int = 1
+    last_attempt: datetime | None = None
+    invalidated: bool = False
+
+
+@dataclass(frozen=True)
+class DeferredStatus:
+    """What a read says about one deferred field."""
+
+    path: str
+    status: DeferredState
+    as_of: datetime | None = None
+    error: str | None = None
+    attempts: int | None = None
+    waiting_for: tuple[str, ...] = ()  # filled with include=("pending",)
+    reason: str | None = None  # inputs_missing, upstream, not_fetched (with include=("pending",))
+
+
+@dataclass(frozen=True)
+class DeferredInfo:
+    """Metadata of a stored deferred result (never the value)."""
+
+    field: str
+    status: str
+    as_of: datetime | None
+    attempts: int
+    invalidated: bool
+
+
+@dataclass(frozen=True)
+class SchedulerRun:
+    """The record of one scheduler run."""
+
+    run_id: str
+    hook: str
+    started: datetime
+    finished: datetime
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    calls: int = 0
+    reason: str | None = None  # why the run stopped early: lease held, breaker open, time limit
+
+
+@dataclass(frozen=True)
+class SchedulerReport:
+    """The answer to `scheduler_run`: the run record and, per (document, field), what happened."""
+
+    run_id: str
+    hook: str
+    started: datetime
+    finished: datetime
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    calls: int = 0
+    reason: str | None = None
+    items: tuple[tuple[str, str, str], ...] = ()  # (doc, field, ok|failed|skipped)

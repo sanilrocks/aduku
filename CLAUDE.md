@@ -9,13 +9,13 @@ contributions merged into documents by a central annotated schema. Language port
 1. `docs/notes.md`: decisions with reasons, prior art, pending items. Start here for context.
 2. `docs/SPEC.md`: the authoritative specification. Do not contradict it without updating it.
 3. `.specify/memory/constitution.md`: governing principles; plans and tasks must comply.
-4. `specs/002-computed-fields/spec.md`: the current feature (feature 001, `specs/001-core-ledger-merge-engine/`, is implemented).
+4. `specs/003-deferred-fields/spec.md`: the current feature (features 001, `specs/001-core-ledger-merge-engine/`, and 002, `specs/002-computed-fields/`, are implemented).
 
 ## Workflow
 
 Spec Kit (hyphenated commands: `/speckit-constitution`, `-specify`, `-clarify`, `-plan`, `-tasks`, `-analyze`,
 `-implement`, `-converge`). Run Claude Code from this folder. Prompts for the features still to be specified are in `docs/prompts/specify-features.md`.
-Current step: feature 002 (computed fields) is implemented, analyzed and converged (tasks T001 to T078 done, including the code-review fixes of Phase 13); next, commit it. Feature 001 is implemented. Features 3 to 6 are still to be specified (`docs/prompts/specify-features.md`).
+Current step: feature 003 (deferred fields) is implemented (tasks T001 to T071 done); next `/speckit-analyze` and `/speckit-converge`. Features 001 and 002 are implemented and committed. Features 4 to 6 are still to be specified (`docs/prompts/specify-features.md`).
 
 ## Rules
 

@@ -66,6 +66,8 @@ rebuild that makes no calls.
 
 ## Feature 3: Deferred computed fields
 
+*Done: specified, planned and implemented in `specs/003-deferred-fields/` (2026-10-19).*
+
 Add fields populated through IO hooks with refresh policies. Read SPEC 9.5, 13 (hooks).
 
 **Why:** Some values need external calls (scores, rates). They must not make the core merge impure or slow.
