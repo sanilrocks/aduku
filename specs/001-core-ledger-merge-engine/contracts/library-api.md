@@ -55,12 +55,12 @@ schema version that decides a document, so the same version number with other ru
 ## Schema
 
 ```python
-registry.load(path_or_text) -> Schema     # fail closed with SchemaError listing every problem
+registry.load(path_or_text) -> Schema     # fail closed with SchemaError listing every problem; returns the schema, does not register it
 registry.put(schema) / registry.activate(version) / registry.pin(doc, version | None)
 # activate raises SchemaError (code TIER_IN_USE) when the version drops or renames a tier used by an existing entry;
 # pin(doc, v) checks the same for that document's entries. Reading under an unregistered or inactive version: SCHEMA_INACTIVE
 behaviors.register_merge(name, version, combine, laws=Laws(associative=True, ...))
-behaviors.register_validate(name, version, check)
+behaviors.register_validate(name, version, check)   # a field rule is given only its value; a document rule gets the document
 ```
 
 `register_merge` without `associative=True` succeeds, but any schema referencing the behavior is refused at load (FR-011).

@@ -20,6 +20,10 @@ from aduku.schema.model import BehaviorRef, Schema
 __all__ = ["ValidatorFault", "validate_document"]
 
 
+# A field rule is given its value and nothing else (Constitution VIII); only a document rule sees the document.
+NO_DOCUMENT = FrozenStruct()
+
+
 class ValidatorFault(AdukuError):
     """A validator failed to run (as opposed to reporting a violation)."""
 
@@ -36,7 +40,7 @@ def validate_document(schema: Schema, behaviors: BehaviorRegistry, document: Fro
         if field is None:
             continue
         for ref in field.validate:
-            for violation in _run(behaviors, ref, Subject(document, format_path(path), value, ref.args)):
+            for violation in _run(behaviors, ref, Subject(NO_DOCUMENT, format_path(path), value, ref.args)):
                 found.setdefault((violation.rule_id, violation.path_scope), violation)
     for ref in schema.document_validate:
         for violation in _run(behaviors, ref, Subject(document, None, document, ref.args)):

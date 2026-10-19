@@ -108,10 +108,12 @@ conformance/                      # language-neutral vectors shared by all ports
 ports/py/                         # aduku-py; split into its own repo once stable
 ├── pyproject.toml                # uv, ruff, mypy, pytest config
 ├── src/aduku/
+│   ├── __init__.py               # lazy exports of the public API (contracts/library-api.md)
 │   ├── model.py                  # Entry, Request, Tier, ModelError, Reason, ... (frozen dataclasses)
 │   ├── paths.py                  # path parsing and normalization (SPEC 3.2)
 │   ├── ion_codec.py              # Ion <-> internal values, tombstone, canonical serialization
 │   ├── errors.py                 # error codes (SPEC 12.5), RejectedError, StorageError
+│   ├── files.py                  # reads schema files: the one filesystem touch of the schema code, kept out of schema/
 │   ├── log.py                    # structured log events (admission decisions, rebuilds)
 │   ├── schema/
 │   │   ├── loader.py             # parse Ion schema, fail closed (SPEC 5.1, FR-009/011/021/028)

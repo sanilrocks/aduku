@@ -329,3 +329,11 @@ T028 rejection audit tests   T029 atomicity property       T030 conformance vect
 ## Out of scope for this feature (deferred, see spec Assumptions)
 
 Computed fields (including impure ones), deferred fields, dynamic defaults, per-field authority beyond the parsed `authority` check, snapshots, compaction, time-travel reads, redaction, the sandbox or CEL spike, and detailed schema evolution.
+
+---
+
+## Phase 12: Convergence
+
+- [X] T087 CRITICAL: Pass a field validator only the value at its path, not the whole document: in `ports/py/src/aduku/engine/validate.py` build the field-rule `Subject` with an empty `document` (document rules keep the full document, which is their declared scope); add a test in `ports/py/tests/unit/test_validators.py` that a registered field validator cannot read a sibling field per Constitution VIII (contradicts)
+- [X] T088 Export the public API from `ports/py/src/aduku/__init__.py` (`Aduku`, `SqliteStorage`, `MemoryStorage`, `Clock`, `IdSource`, `SchemaRegistry`, `load_schema`, and the model types the contract names) so `from aduku import Aduku, SqliteStorage, Clock, IdSource` works; add a test that runs that exact import, and use it in `ports/py/README.md` per contracts/library-api.md (missing)
+- [X] T089 Add `SchemaRegistry.load(path_or_text, behaviors=None) -> Schema` in `ports/py/src/aduku/schema/registry.py`: accept a file path or schema text, fail closed with `SchemaError` listing every problem, return the schema without registering it; add a unit test in `ports/py/tests/unit/test_schema_registry.py` per contracts/library-api.md (missing)

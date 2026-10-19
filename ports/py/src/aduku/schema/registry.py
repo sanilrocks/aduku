@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import fields, is_dataclass
+from pathlib import PurePath
 from typing import Any
 
+from aduku.behaviors.registry import BehaviorRegistry
 from aduku.errors import ErrorCode, RejectedError, SchemaError
 from aduku.ion_codec import FrozenStruct, to_canonical
+from aduku.schema.loader import load_schema
 from aduku.schema.model import Schema
 
 __all__ = ["SchemaRegistry"]
@@ -35,6 +38,17 @@ class SchemaRegistry:
         self._active: int | None = None
         self._pins: dict[str, int] = {}
         self._usage: Callable[[str | None], set[str]] | None = None
+
+    def load(self, path_or_text: str | PurePath, behaviors: BehaviorRegistry | None = None) -> Schema:
+        """Parse and validate a schema from schema text or a file path, failing closed with every problem found.
+
+        The schema is returned, not registered: `put` it to make it a version of this registry.
+        """
+        if isinstance(path_or_text, PurePath) or "schema::" not in path_or_text:  # a path, not schema text
+            from aduku.files import read_schema_text  # the filesystem is reached outside the pure schema package
+
+            return load_schema(read_schema_text(path_or_text), behaviors)
+        return load_schema(path_or_text, behaviors)
 
     def put(self, schema: Schema) -> None:
         """Register a version. Re-registering identical content is a no-op; changed content is refused."""

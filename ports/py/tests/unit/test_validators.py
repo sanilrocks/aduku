@@ -143,3 +143,40 @@ def test_a_validator_on_a_keyed_path_runs_on_the_keyed_value() -> None:
     )
     found = validate_document(schema, BEHAVIORS, FrozenStruct({"items[a]": 1, "m": 1}))
     assert [(v.rule_id, v.path_scope) for v in found] == [("range", "/items[a]")]
+
+
+def test_a_field_validator_sees_only_its_own_value_not_the_rest_of_the_document() -> None:
+    """Constitution VIII: a pure behavior sees only its declared dependencies."""
+    seen: list[object] = []
+
+    def spy(subject: Subject) -> list[Violation]:
+        seen.append((subject.path, dict(subject.document)))
+        return []
+
+    behaviors = BehaviorRegistry.with_builtins()
+    behaviors.register_validate("acme.spy", 1, spy)
+    schema = load_schema(
+        schema_text(fields='"/a": {type: int, merge: lww, validate: ["acme.spy@1"]}, "/b": {type: int, merge: lww}'),
+        behaviors,
+    )
+    validate_document(schema, behaviors, FrozenStruct({"a": 1, "b": 2}))
+    assert seen == [("/a", {})]  # the spy was called once, for /a, and the document it got was empty
+
+
+def test_a_document_rule_still_sees_the_whole_document() -> None:
+    seen: list[object] = []
+
+    def spy(subject: Subject) -> list[Violation]:
+        seen.append(dict(subject.document))
+        return []
+
+    behaviors = BehaviorRegistry.with_builtins()
+    behaviors.register_validate("acme.docspy", 1, spy)
+    schema = load_schema(
+        schema_text(fields='"/a": {type: int, merge: lww}').replace(
+            "fields:", 'document_validate: ["acme.docspy@1"], fields:'
+        ),
+        behaviors,
+    )
+    validate_document(schema, behaviors, FrozenStruct({"a": 1}))
+    assert seen == [{"a": 1}]

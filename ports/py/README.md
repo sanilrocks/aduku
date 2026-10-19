@@ -16,15 +16,10 @@ uv sync          # amazon.ion, python-ulid, and the dev tools (pytest, hypothesi
 ## Use
 
 ```python
-from aduku.behaviors.registry import BehaviorRegistry
-from aduku.model import EntryInput, Identity
-from aduku.schema.loader import load_schema
-from aduku.schema.registry import SchemaRegistry
-from aduku.service import Aduku
-from aduku.storage.sqlite import SqliteStorage
+from aduku import Aduku, EntryInput, Identity, SchemaRegistry, SqliteStorage
 
 registry = SchemaRegistry()
-registry.put(load_schema(open("../../conformance/customer.schema.ion").read()))
+registry.put(registry.load("../../conformance/customer.schema.ion"))
 registry.activate(7)
 db = Aduku(SqliteStorage("demo.db"), registry)
 

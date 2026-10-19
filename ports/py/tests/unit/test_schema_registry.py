@@ -97,3 +97,38 @@ def test_re_registering_identical_content_keeps_the_original_object() -> None:
     registry.put(first)  # type: ignore[arg-type]
     registry.put(schema(1))  # type: ignore[arg-type]
     assert registry.get(1) is first
+
+
+SCHEMA_TEXT = 'schema::{id:"customer",version:3,tiers:[a,b],fields:{"/f":{type:string,merge:lww}}}'
+
+
+def test_load_reads_schema_text_without_registering_it() -> None:
+    registry = SchemaRegistry()
+    loaded = registry.load(SCHEMA_TEXT)
+    assert (loaded.id, loaded.version) == ("customer", 3) and registry.versions() == ()
+
+
+def test_load_reads_a_file_by_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    file = tmp_path / "customer.schema.ion"
+    file.write_text(SCHEMA_TEXT)
+    registry = SchemaRegistry()
+    assert registry.load(file).version == 3 and registry.load(str(file)).version == 3
+
+
+def test_load_fails_closed_listing_every_problem() -> None:
+    bad = 'schema::{id:"t",version:1,tiers:[a,a],fields:{"/x":{type:int,merge:telepathy}}}'
+    with pytest.raises(SchemaError) as caught:
+        SchemaRegistry().load(bad)
+    assert {"DUPLICATE_TIER", "UNKNOWN_BEHAVIOR"} <= set(caught.value.codes)
+
+
+def test_load_of_a_missing_file_is_a_schema_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(SchemaError):
+        SchemaRegistry().load(tmp_path / "nope.ion")
+
+
+def test_a_loaded_schema_can_then_be_registered() -> None:
+    registry = SchemaRegistry()
+    registry.put(registry.load(SCHEMA_TEXT))
+    registry.activate(3)
+    assert registry.active().version == 3
