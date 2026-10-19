@@ -113,9 +113,11 @@ def test_type_parsing_and_conformance() -> None:
 def test_ops_redact_and_failure_mode_are_kept() -> None:
     text = (
         'schema::{id:"x",version:1,tiers:[a],fields:{"/ssn":{type:string,ops:[set],redact:true},'
-        '"/n":{type:string,computed:{impure:{hook:"h"}},failure_mode:model_error_on_failure}}}'
+        '"/n":{type:string,computed:{impure:{hook:"h",depends:["/ssn"],reason:"r",timeout:"1s",retry:{max:1,backoff:"10ms"},deadline:"3s",recompute_by:[a]}},failure_mode:model_error_on_failure}}}'
     )
-    schema = load_schema(text)
+    behaviors = BehaviorRegistry.with_builtins()
+    behaviors.register_hook("h", 1, lambda inputs, timeout: "x")
+    schema = load_schema(text, behaviors)
     ssn = schema.field_for(parse_path("/ssn"))
     assert ssn is not None and ssn.ops == ("set",) and ssn.redact is True
     other = schema.field_for(parse_path("/n"))

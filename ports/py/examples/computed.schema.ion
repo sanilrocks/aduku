@@ -1,0 +1,23 @@
+// A schema for trying computed fields from the command line: aduku --behaviors demo_hooks --schema examples/computed.schema.ion
+schema::{
+  id: "customer", version: 1,
+  tiers: [backfill, user, admin],
+  lenient: { allowed: [backfill] },
+
+  fields: {
+    "/name":    { type: string, merge: lww },
+    "/address": { type: struct, merge: struct },
+    "/address/city": { type: string, merge: lww },
+    "/country": { type: string, merge: lww },
+
+    // pure computed fields: a preset macro, and a custom one registered by demo_hooks
+    "/displayName": { type: string, computed: { macro: upper, args: ["/name"] } },
+    "/label":       { type: string, computed: { macro: "acme.label@1", args: ["/name", "/address/city"] }, on_missing: absent },
+
+    // an impure compute: the hook is called once per distinct country, and only admins may call it again
+    "/taxId": { type: string, on_missing: absent,
+                computed: { impure: { hook: "fx.echo@1", depends: ["/country"], reason: "tax id issued by the registry",
+                                      timeout: "2s", retry: { max: 2, backoff: "100ms" }, deadline: "6s",
+                                      recompute_by: [admin], failure_mode: model_error_on_failure } } }
+  }
+}

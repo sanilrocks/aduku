@@ -9,6 +9,7 @@ FORBIDDEN = (
     "aduku.audit",
     "aduku.log",
     "aduku.service",
+    "aduku.hooks",  # the one module that calls out: nothing pure may import it
     "sqlite3",
     "time",
     "datetime",
@@ -50,3 +51,8 @@ def test_schema_is_pure() -> None:
 
 def test_behaviors_are_pure() -> None:
     assert _violations("behaviors") == []
+
+
+def test_expr_is_pure() -> None:
+    """The sandboxed expression language has nothing to reach the outside world with (a package that may not exist yet)."""
+    assert _violations("expr") == []

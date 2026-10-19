@@ -67,7 +67,14 @@ def test_a_duplicate_is_not_validated_again(backend: Storage) -> None:
     service = make_service(backend, audit=AUDIT)
     service.append("d1", [put("/name", "x")], contributor=ALICE, request_key="K")
     # schema 2 makes /name derived, so the same request would now be rejected if it were validated
-    service.schemas.put(load_schema(schema_text(version=2, fields='"/name": {type: string, computed: {macro: upper}}')))
+    service.schemas.put(
+        load_schema(
+            schema_text(
+                version=2,
+                fields='"/name": {type: string, computed: {macro: upper, args: ["/other"]}}, "/other": {type: string, merge: lww}',
+            )
+        )
+    )
     service.schemas.activate(2)
     again = service.append("d1", [put("/name", "x")], contributor=ALICE, request_key="K")
     assert again.duplicate and service.list_rejections("d1") == []

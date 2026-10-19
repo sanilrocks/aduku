@@ -34,7 +34,7 @@ class Case:
     clock: FrozenStruct | None = None  # `{start: <timestamp>, step_seconds: n}`: what the harness clock reads
 
 
-STEP_KINDS = ("append", "get", "explain", "activate_schema", "rebuild", "load_schema")
+STEP_KINDS = ("append", "get", "explain", "activate_schema", "rebuild", "load_schema", "hook_calls", "recompute")
 
 
 def load_case(text: str) -> Case:
@@ -88,6 +88,16 @@ def run_case(case: Case, service: Any) -> None:
             service.schemas.activate(int(step.arg))
         elif step.kind == "load_schema":
             _load_schema(step, service, label)
+        elif step.kind == "hook_calls":
+            name, _, version = str(step.arg).partition("@")
+            behavior = service.behaviors.get(name, int(version or 1))
+            assert behavior is not None, f"{label}: no hook {step.arg}"
+            wanted = int(step.expect["count"])
+            assert behavior.impl.calls == wanted, (
+                f"{label}: {step.arg} was called {behavior.impl.calls} times, not {wanted}"
+            )
+        elif step.kind == "recompute":
+            _recompute(step, service, label)
         elif step.kind == "rebuild":
             report = service.rebuild(step.arg)
             assert report.identical == step.expect.get("identical", True), f"{label}: rebuild differs"
@@ -108,6 +118,30 @@ def _load_schema(step: Step, service: Any, label: str) -> None:
     assert step.expect.get("ok") is True, (
         f"{label}: the schema loaded but problems {step.expect.get('problems')} were expected"
     )
+
+
+def _recompute(step: Step, service: Any, label: str) -> None:
+    spec: FrozenStruct = step.arg
+    who = spec["contributor"]
+    caller = Identity(
+        str(who["id"]), tuple(str(t) for t in who.get("tiers", ())), tuple(str(r) for r in who.get("roles", ()))
+    )
+    try:
+        report = service.recompute(str(spec["doc"]), spec.get("field"), caller=caller)
+    except RejectedError as error:
+        wanted = step.expect.get("rejected")
+        assert wanted is not None, f"{label}: unexpected rejection {error}"
+        assert error.code.value == str(wanted["code"]), f"{label}: code {error.code.value} != {wanted['code']}"
+        return
+    assert step.expect.get("rejected") is None, f"{label}: expected a rejection but the recompute went through"
+    if "recomputed" in step.expect:
+        assert list(report.recomputed) == [str(f) for f in step.expect["recomputed"]], (
+            f"{label}: recomputed {report.recomputed}"
+        )
+    if "failed" in step.expect:
+        assert [f for f, _ in report.failed] == [str(f) for f in step.expect["failed"]], (
+            f"{label}: failed {report.failed}"
+        )
 
 
 def _append(step: Step, service: Any, label: str) -> None:

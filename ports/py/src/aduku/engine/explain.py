@@ -13,24 +13,16 @@ from collections.abc import Sequence
 from typing import Any
 
 from aduku.behaviors.registry import BehaviorRegistry
+from aduku.engine.compute import compute_fields
 from aduku.engine.derive import Prepared, build_document, derive, fold_entries, merge_tiers
-from aduku.ion_codec import ABSENT, FrozenStruct, to_canonical
+from aduku.engine.document import value_at
+from aduku.engine.effects import EffectView
+from aduku.ion_codec import ABSENT, Annotated, FrozenStruct, to_canonical
 from aduku.model import Entry, Explanation, ModelError
-from aduku.paths import Path, PathError, Segment, format_path, parse_path
-from aduku.schema.model import Schema
+from aduku.paths import Path, PathError, format_path, parse_path
+from aduku.schema.model import FieldSpec, Schema
 
-__all__ = ["explain", "value_at"]
-
-
-def value_at(document: FrozenStruct, path: Sequence[Segment]) -> Any:
-    """The value at a concrete path of an assembled document, or ABSENT."""
-    node: Any = document
-    for segment in path:
-        key = segment.name if segment.key is None else f"{segment.name}[{segment.key}]"
-        if not isinstance(node, FrozenStruct) or key not in node:
-            return ABSENT
-        node = node[key]
-    return node
+__all__ = ["explain"]
 
 
 def _touches(entry_path: Path, path: Path) -> bool:
@@ -52,11 +44,14 @@ def explain(
     entries: Sequence[Entry],
     path_text: str,
     model_errors: Sequence[ModelError],
+    effects: EffectView | None = None,
 ) -> Explanation:
     """`path_text` has been checked: it parses and the schema declares it."""
     path = parse_path(path_text)
     field = schema.field_for(path)
     derived = schema.derived_field_at_or_above(path)
+    if derived is not None and derived.derived == "computed":
+        return _explain_computed(schema, behaviors, prepared, entries, path_text, path, derived, model_errors, effects)
     if derived is not None:
         spec = derived.derived_spec
         name = spec.get("macro") or spec.get("hook") if isinstance(spec, FrozenStruct) else None
@@ -116,6 +111,41 @@ def explain(
         tuple(entry.id for entry in inputs),
         tuple(entry.id for entry in shadowed),
         errors,
+    )
+
+
+def _explain_computed(
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    prepared: Prepared,
+    entries: Sequence[Entry],
+    path_text: str,
+    path: Path,
+    derived: FieldSpec,
+    model_errors: Sequence[ModelError],
+    effects: EffectView | None = None,
+) -> Explanation:
+    """A computed path: the macro or hook, the values it was computed from, and the entries the field now shadows."""
+    full = derive(schema, behaviors, entries, prepared)
+    computed = compute_fields(schema, behaviors, full.document, prepared.computed, effects)
+    result = computed.results.get(derived.pattern)
+    skipped = set(full.state.skipped)
+    owner = parse_path(derived.pattern)
+    shadowed = tuple(entry.id for entry in entries if entry.seq in skipped and _touches(parse_path(entry.path), owner))
+    value = value_at(computed.document, path)
+    plain = value.value if isinstance(value, Annotated) else value
+    errors = tuple(e for e in model_errors if _covers(e.path_scope, path))
+    return Explanation(
+        path_text,
+        None if plain is ABSENT else plain,
+        "computed",
+        None,
+        result.source if result is not None else None,
+        (),
+        shadowed,
+        errors,
+        dependencies=result.dependencies if result is not None else (),
+        effect_seq=result.effect_seq if result is not None else None,
     )
 
 

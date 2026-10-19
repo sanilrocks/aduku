@@ -14,13 +14,14 @@ from aduku.behaviors.merge import MergeTypeError, SchemaMergeContext
 from aduku.behaviors.registry import BehaviorRegistry
 from aduku.engine.defaults import defaults_layer, delete_fallbacks
 from aduku.engine.document import assemble
+from aduku.engine.graph import order
 from aduku.engine.merge_layers import apply_layer, overlay
 from aduku.engine.squash import Layer, entry_layer
 from aduku.engine.tombstones import apply_tombstones
 from aduku.ion_codec import FrozenStruct
 from aduku.model import Entry, ModelError
 from aduku.paths import Path, PathError, format_path, parse_path
-from aduku.schema.model import Schema
+from aduku.schema.model import FieldSpec, Schema
 
 __all__ = [
     "DerivationState",
@@ -41,11 +42,16 @@ class Prepared:
     ctx: SchemaMergeContext
     defaults: Layer
     fallbacks: dict[Path, Any]
+    computed: tuple[FieldSpec, ...] = ()  # the computed fields in evaluation order (P4)
+
+    @property
+    def has_impure(self) -> bool:
+        return any(spec.impure is not None for spec in self.computed)
 
 
 def prepare(schema: Schema, behaviors: BehaviorRegistry) -> Prepared:
     ctx = SchemaMergeContext(schema, behaviors)
-    return Prepared(ctx, defaults_layer(ctx), delete_fallbacks(ctx))
+    return Prepared(ctx, defaults_layer(ctx), delete_fallbacks(ctx), order(schema))
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,8 @@ class DerivationState:
     # The model errors of the document this state stands for (who introduced each), and the paths left out of it.
     errors: tuple[ModelError, ...] = ()
     conflicts: tuple[str, ...] = ()
+    # The effect-log sequence number this state's errors were computed with (feature 002); a newer log makes it stale.
+    effects_seq: int = 0
 
 
 @dataclass(frozen=True)

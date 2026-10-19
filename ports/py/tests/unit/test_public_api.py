@@ -23,3 +23,11 @@ def test_an_unknown_name_is_an_attribute_error() -> None:
 
     with pytest.raises(AttributeError):
         aduku.NoSuchThing  # noqa: B018
+
+
+def test_every_type_the_computed_fields_contract_names_is_importable() -> None:
+    """contracts/library-api.md (feature 002): the report and info types, the fault, and the hook runner."""
+    import aduku
+    from aduku import ComputeFault, EffectInfo, HookRunner, RecomputeReport  # noqa: F401
+
+    assert {"ComputeFault", "EffectInfo", "HookRunner", "RecomputeReport"} <= set(aduku.__all__)

@@ -159,7 +159,7 @@ def test_the_story_end_to_end_and_the_same_document_when_derived_from_scratch(ba
     )
     service.append("d1", [put("/address/zip", "2", tier="backfill")], contributor=JOB)
     warm = service.get("d1")
-    assert to_canonical(warm.document) == '{address:{city:"Paris"},phone:"777"}'
+    assert to_canonical(warm.document) == '{address:{city:"Paris"},displayName:computed::null,phone:"777"}'
     with backend.transaction() as tx:
         tx.drop_view("d1")
     fresh = make_service(backend, schema=schema_text(fields=PHONE_FIELDS)).get("d1")  # derived from the ledger alone

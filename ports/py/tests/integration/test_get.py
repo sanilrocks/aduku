@@ -3,7 +3,7 @@
 import pytest
 
 from aduku.errors import RejectedError
-from aduku.ion_codec import FrozenStruct, to_canonical
+from aduku.ion_codec import Annotated, FrozenStruct, to_canonical
 from aduku.model import DocumentResult
 from aduku.storage.base import Storage
 from aduku.storage.memory import MemoryStorage
@@ -12,16 +12,19 @@ from tests.service_helpers import ALICE, BOB, JOB, ROOT, delete, make_service, p
 
 def test_an_unknown_document_is_empty(backend: Storage) -> None:
     result = make_service(backend).get("nobody")
-    assert result == DocumentResult(document=FrozenStruct(), model_errors=(), status="ok")
+    # nothing is set: no value, but the computed field is present as null (feature 002, on_missing: null)
+    assert result == DocumentResult(
+        document=FrozenStruct({"displayName": Annotated(("computed",), None)}), model_errors=(), status="ok"
+    )
 
 
 def test_get_reflects_every_accepted_request(backend: Storage) -> None:
     service = make_service(backend)
     service.append("d1", [put("/name", "A. Smith", tier="backfill"), put("/age", 30, tier="backfill")], contributor=JOB)
     service.append("d1", [put("/name", "Alice S."), put("/age", 28)], contributor=ALICE)
-    assert to_canonical(service.get("d1").document) == '{age:30,name:"Alice S."}'
+    assert to_canonical(service.get("d1").document) == '{age:30,displayName:computed::"ALICE S.",name:"Alice S."}'
     service.append("d1", [delete("/name", tier="admin")], contributor=ROOT)
-    assert to_canonical(service.get("d1").document) == "{age:30}"
+    assert to_canonical(service.get("d1").document) == "{age:30,displayName:computed::null}"
 
 
 def test_a_rejected_request_changes_nothing_that_get_returns(backend: Storage) -> None:
@@ -59,7 +62,11 @@ def test_a_new_service_reads_the_same_bytes_from_the_stored_ledger(backend: Stor
     service.append("d1", [put("/tags", ("b", "c"))], contributor=BOB)
     warm = to_canonical(service.get("d1").document)
     fresh = make_service(backend)  # nothing cached in memory
-    assert to_canonical(fresh.get("d1").document) == warm == '{age:3,name:"x",tags:["a","b","c"]}'
+    assert (
+        to_canonical(fresh.get("d1").document)
+        == warm
+        == '{age:3,displayName:computed::"X",name:"x",tags:["a","b","c"]}'
+    )
 
 
 def test_incremental_and_full_derivation_agree_across_many_appends(backend: Storage) -> None:
@@ -79,7 +86,9 @@ def test_the_view_is_stored_and_dropped_by_an_append(backend: Storage) -> None:
     service.get("d1")
     with backend.read() as tx:
         view = tx.get_view("d1")
-    assert view is not None and view.watermark_seq == 1 and view.document == '{name:"Alice"}'
+    assert (
+        view is not None and view.watermark_seq == 1 and view.document == '{displayName:computed::"ALICE",name:"Alice"}'
+    )
     service.append("d1", [put("/age", 1)], contributor=ALICE)  # also computes the new view for its result
     with backend.read() as tx:
         assert tx.get_view("d1").watermark_seq == 2  # type: ignore[union-attr]

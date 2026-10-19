@@ -12,12 +12,15 @@ from aduku.ion_codec import Value
 __all__ = [
     "AppendResult",
     "DocumentResult",
+    "EffectInfo",
+    "EffectRecord",
     "Entry",
     "EntryInput",
     "Explanation",
     "Identity",
     "ModelError",
     "RebuildReport",
+    "RecomputeReport",
     "Violation",
 ]
 
@@ -146,3 +149,46 @@ class Explanation:
     inputs: tuple[str, ...] = ()
     shadowed: tuple[str, ...] = ()
     model_errors: tuple[ModelError, ...] = ()
+    # For a computed path: the (path, value) pairs it was computed from, and the effect-log record for an impure one.
+    dependencies: tuple[tuple[str, Value], ...] = ()
+    effect_seq: int | None = None
+
+
+@dataclass(frozen=True)
+class EffectRecord:
+    """One outcome of an impure compute, as stored in the effect log (data-model.md). Holds no contributions."""
+
+    doc: str
+    field: str
+    fingerprint: str
+    hook: str  # "name@version"
+    outcome: str  # "value" or "failure"
+    value: str | None  # canonical Ion text, for a value
+    error: str | None  # the kind of failure, never a field value
+    attempts: int
+    recorded_at: datetime  # informational: never used to derive a document
+    effect_seq: int | None = None  # assigned on append
+
+
+@dataclass(frozen=True)
+class EffectInfo:
+    """What `list_effects` shows of an effect-log record: when and what, never a value or an error text (FR-027)."""
+
+    effect_seq: int
+    doc: str
+    field: str
+    hook: str
+    outcome: str  # "value" or "failure"
+    attempts: int
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class RecomputeReport:
+    """What `recompute` did. `skipped` are fields the caller may not recompute (only when no field was named); `failed`
+    are (field, kind) for a hook that failed again or an input that is missing; `effect_seqs` the new log records."""
+
+    recomputed: tuple[str, ...]
+    skipped: tuple[str, ...] = ()
+    failed: tuple[tuple[str, str], ...] = ()
+    effect_seqs: tuple[tuple[str, int], ...] = ()

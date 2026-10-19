@@ -1,0 +1,41 @@
+// Feature 002, US5: what a computed field does when an input has no value (`on_missing`), and that the model error of
+// `on_missing: error` counts like any other new model error. `coalesce` accepts missing inputs and always runs.
+case::{
+  name: "computed-on-missing",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user],
+    lenient: { allowed: [backfill] },
+    fields: {
+      "/name": {type: string, merge: lww},
+      "/nickname": {type: string, merge: lww},
+      "/seat": {type: string, merge: lww, default: "none"},
+      "/shoutNull":   {type: string, on_missing: null,   computed: {macro: upper, args: ["/name"]}},
+      "/shoutAbsent": {type: string, on_missing: absent, computed: {macro: upper, args: ["/name"]}},
+      "/shoutError":  {type: string, on_missing: error,  computed: {macro: upper, args: ["/name"]}},
+      "/who":         {type: string, on_missing: error,  computed: {macro: coalesce, args: ["/nickname", "/name"]}},
+      "/seatUp":      {type: string, computed: {macro: upper, args: ["/seat"]}}
+    }
+  },
+  steps: [
+    // nothing set: null, absent, absent plus an error; coalesce runs with both inputs missing; a default counts as a value
+    { get: "d1", expect: { document: '{seat:"none",seatUp:computed::"NONE",shoutNull:computed::null,who:computed::null}',
+                           model_errors: [{rule: "computed:/shoutError", path: "/shoutError"}] } },
+
+    // setting the input gives every field its value and clears the error
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", value: "pat"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { get: "d1", expect: { document: '{name:"pat",seat:"none",seatUp:computed::"NONE",shoutAbsent:computed::"PAT",shoutError:computed::"PAT",shoutNull:computed::"PAT",who:computed::"pat"}',
+                           model_errors: [] } },
+
+    // a request that makes the input missing again would add the error: rejected
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", op: delete}] },
+      expect: { rejected: { code: VALIDATION_FAILED } } },
+
+    // a permitted writer may send it with the flag: accepted, and the error is recorded
+    { append: { doc: "d2", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/name", value: "bo"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d2", contributor: {id: "job", tiers: [backfill]}, lenient: true, entries: [{tier: backfill, path: "/name", op: delete}] },
+      expect: { accepted: [{seq: 2}] } },
+    { get: "d2", expect: { model_errors: [{rule: "computed:/shoutError", path: "/shoutError"}] } }
+  ]
+}

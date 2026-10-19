@@ -11,8 +11,18 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aduku.behaviors.registry import BehaviorRegistry
-    from aduku.errors import AdukuError, RejectedError, SchemaError, StorageError
-    from aduku.model import AppendResult, DocumentResult, EntryInput, Explanation, Identity, RebuildReport
+    from aduku.errors import AdukuError, ComputeFault, RejectedError, SchemaError, StorageError
+    from aduku.hooks import HookRunner
+    from aduku.model import (
+        AppendResult,
+        DocumentResult,
+        EffectInfo,
+        EntryInput,
+        Explanation,
+        Identity,
+        RebuildReport,
+        RecomputeReport,
+    )
     from aduku.schema.loader import load_schema
     from aduku.schema.registry import SchemaRegistry
     from aduku.service import Aduku
@@ -26,13 +36,17 @@ _EXPORTS = {
     "AppendResult": "aduku.model",
     "BehaviorRegistry": "aduku.behaviors.registry",
     "Clock": "aduku.storage.base",
+    "ComputeFault": "aduku.errors",
     "DocumentResult": "aduku.model",
+    "EffectInfo": "aduku.model",
     "EntryInput": "aduku.model",
     "Explanation": "aduku.model",
+    "HookRunner": "aduku.hooks",
     "IdSource": "aduku.storage.base",
     "Identity": "aduku.model",
     "MemoryStorage": "aduku.storage.memory",
     "RebuildReport": "aduku.model",
+    "RecomputeReport": "aduku.model",
     "RejectedError": "aduku.errors",
     "SchemaError": "aduku.errors",
     "SchemaRegistry": "aduku.schema.registry",
@@ -47,13 +61,17 @@ __all__ = [
     "AppendResult",
     "BehaviorRegistry",
     "Clock",
+    "ComputeFault",
     "DocumentResult",
+    "EffectInfo",
     "EntryInput",
     "Explanation",
+    "HookRunner",
     "IdSource",
     "Identity",
     "MemoryStorage",
     "RebuildReport",
+    "RecomputeReport",
     "RejectedError",
     "SchemaError",
     "SchemaRegistry",

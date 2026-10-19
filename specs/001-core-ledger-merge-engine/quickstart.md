@@ -38,7 +38,8 @@ uv run aduku append d1 --contributor alice --tier user --set /name='"Alice S."' 
 uv run aduku get d1
 ```
 
-Expected: `name` is `"Alice S."` (user beats backfill), `age` is `30` (max rule), `plan` is `"free"` (default).
+Expected: `name` is `"Alice S."` (user beats backfill), `age` is `30` (max rule), `plan` is `"free"` (default), and
+`displayName` is `computed::"ALICE S."` (feature 002).
 
 ```bash
 uv run aduku append d1 --contributor root --tier admin --set /displayName='"HACKED"'    # exit 1: FIELD_NOT_WRITABLE

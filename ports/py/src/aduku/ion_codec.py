@@ -33,6 +33,7 @@ __all__ = [
     "normalize",
     "or_placeholder",
     "timestamp_representable",
+    "to_utc",
     "timestamp_sort_key",
     "parse",
     "to_canonical",
@@ -256,6 +257,11 @@ def _to_utc(stamp: Timestamp) -> datetime:
         return utc
     except OverflowError as error:
         raise IonError("the timestamp is outside the years 1 to 9999 in UTC") from error
+
+
+def to_utc(stamp: Timestamp) -> datetime:
+    """The naive UTC time of a timestamp (raises IonError outside the years 1 to 9999 in UTC)."""
+    return _to_utc(stamp)
 
 
 def timestamp_representable(stamp: Timestamp) -> bool:

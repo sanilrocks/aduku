@@ -1,8 +1,9 @@
-// SPEC 16.1 through P3: thirteen requests in seq order, the merged document, and a rejected write to a derived field.
-// Derived fields are parsed and unwritable in this feature, so `displayName` is absent from the document.
+// SPEC 16.1 through P4: thirteen requests in seq order, the merged document with its computed values, and a rejected
+// write to a computed field. `displayName` is a preset macro; `label` is the custom macro `acme.label@1`.
 // The audit on/off behaviour for the rejection is checked in tests/golden/test_worked_example.py.
 case::{
   name: "worked-example-16-1",
+  fixtures: ["acme.label@1"],
   schema:
   schema::{
     id: "customer", version: 7,
@@ -23,6 +24,7 @@ case::{
       "/plan":         { type: string, merge: lww, default: "free", authority: [admin] },
 
       "/displayName":  { type: string, computed: { macro: upper, args: ["/name"] } },
+      "/label":        { type: string, computed: { macro: "acme.label@1", args: ["/name", "/address/city"] } },
 
       "/*":            { merge: lww }
     }
@@ -55,17 +57,19 @@ case::{
     { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/currency", value: "EUR"}] },
       expect: { accepted: [{seq: 13}] } },
 
-    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",name:"Alice S.",plan:"free",tags:["x","y","z"]}',
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",displayName:computed::"ALICE S.",label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}',
                            model_errors: [] } },
 
     // an admin may not write a derived field; the request is rejected, is not a ledger entry and consumes no seq
     { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName", value: "HACKED"}] },
       expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/displayName"}] } } },
-    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",name:"Alice S.",plan:"free",tags:["x","y","z"]}' } },
+    { get: "d1", expect: { document: '{address:{city:"Paris",zip:"78701"},age:30,currency:"EUR",displayName:computed::"ALICE S.",label:computed::"Alice S. (Paris)",name:"Alice S.",plan:"free",tags:["x","y","z"]}' } },
     { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice S."}] },
       expect: { accepted: [{seq: 14}] } },
 
     { explain: { doc: "d1", path: "/age" }, expect: { rule: "max@1", winner_seq: 3 } },
+    { explain: { doc: "d1", path: "/displayName" }, expect: { winner: "computed", rule: "upper@1" } },
+    { explain: { doc: "d1", path: "/label" }, expect: { winner: "computed", rule: "acme.label@1" } },
     { explain: { doc: "d1", path: "/plan" }, expect: { winner: "default" } },
     { rebuild: "d1", expect: { identical: true } }
   ]

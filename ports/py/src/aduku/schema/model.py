@@ -24,7 +24,18 @@ from aduku.ion_codec import (
 )
 from aduku.paths import Path, most_specific, parse_pattern
 
-__all__ = ["AuditSettings", "BehaviorRef", "FieldSpec", "MISSING", "Schema", "conforms", "parse_type"]
+__all__ = [
+    "AuditSettings",
+    "BehaviorRef",
+    "ComputedSpec",
+    "FieldSpec",
+    "ImpureSpec",
+    "MISSING",
+    "MacroArg",
+    "Schema",
+    "conforms",
+    "parse_type",
+]
 
 
 class _Missing:
@@ -134,6 +145,53 @@ class BehaviorRef:
     custom: bool = False
 
 
+# Platform bounds on an impure compute (feature 002, research R-8): a schema asking for more is refused at load.
+MAX_HOOK_TIMEOUT = 30.0
+MAX_HOOK_RETRIES = 5
+MAX_HOOK_DEADLINE = 60.0
+
+
+@dataclass(frozen=True)
+class MacroArg:
+    """One argument of a computed field: the path of a value in the document, or a literal."""
+
+    path: str | None = None
+    literal: Any = MISSING
+
+    @property
+    def is_literal(self) -> bool:
+        return self.literal is not MISSING
+
+
+@dataclass(frozen=True)
+class ComputedSpec:
+    """A pure computed field: a macro (preset or registered) over ordered arguments."""
+
+    macro: str
+    version: int = 1
+    args: tuple[MacroArg, ...] = ()
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(arg.path for arg in self.args if arg.path is not None)
+
+
+@dataclass(frozen=True)
+class ImpureSpec:
+    """An impure computed field: a registered hook called with its declared dependencies (SPEC 9.3.1)."""
+
+    hook: str
+    version: int
+    depends: tuple[str, ...]
+    reason: str
+    timeout: float
+    retry_max: int
+    backoff: float
+    deadline: float
+    recompute_by: tuple[str, ...]
+    failure_mode: str | None = None  # None: the field's own, then the schema's impure_failure_mode
+
+
 @dataclass(frozen=True)
 class FieldSpec:
     pattern: str
@@ -148,6 +206,9 @@ class FieldSpec:
     derived: Literal["computed", "deferred"] | None = None
     derived_spec: Any = None
     failure_mode: str | None = None
+    computed: ComputedSpec | None = None
+    impure: ImpureSpec | None = None
+    on_missing: Literal["null", "absent", "error"] = "null"  # what a computed field does when an input is missing
 
     @property
     def effective_on_delete(self) -> str:

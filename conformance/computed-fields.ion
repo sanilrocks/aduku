@@ -1,0 +1,50 @@
+// Feature 002: computed fields. Part 1 (US2): no contribution can set or delete a computed field, or anything beneath it.
+// The request is rejected whole, is not a ledger entry and consumes no seq (SPEC 9.2). More cases are added by later stories.
+case::{
+  name: "computed-fields",
+  fixtures: ["fx.echo@1"],
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    lenient: { allowed: [backfill] },
+    fields: {
+      "/name": {type: string, merge: lww},
+      "/country": {type: string, merge: lww},
+      "/displayName": {type: string, computed: {macro: upper, args: ["/name"]}},
+      "/taxId": {type: string, computed: {impure: {hook: "fx.echo@1", depends: ["/country"], reason: "registry",
+                                                    timeout: "1s", retry: {max: 1, backoff: "10ms"}, deadline: "3s",
+                                                    recompute_by: [admin]}}}
+    }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Alice"}] },
+      expect: { accepted: [{seq: 1}] } },
+
+    // a set on a pure computed path
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName", value: "HACKED"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/displayName"}] } } },
+
+    // a delete, and a path beneath it
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName", op: delete}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE } } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/displayName/inner", value: 1}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE } } },
+
+    // an impure computed path
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/taxId", value: "x"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/taxId"}] } } },
+
+    // the non-rejection flag does not bypass it
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, lenient: true,
+                entries: [{tier: backfill, path: "/displayName", value: "HACKED"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE } } },
+
+    // a valid entry in the same request is not recorded either
+    { append: { doc: "d1", contributor: {id: "root", tiers: [user, admin]},
+                entries: [{tier: user, path: "/country", value: "US"}, {tier: admin, path: "/displayName", value: "HACKED"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE } } },
+
+    // none of the rejections consumed a seq
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 2}] } }
+  ]
+}

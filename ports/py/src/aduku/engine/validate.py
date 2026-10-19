@@ -11,6 +11,7 @@ from typing import Any
 
 from aduku.behaviors.registry import BehaviorRegistry
 from aduku.behaviors.validate import Subject
+from aduku.engine.document import strip_computed
 from aduku.errors import AdukuError, SchemaError
 from aduku.ion_codec import FrozenStruct
 from aduku.model import Violation
@@ -35,6 +36,7 @@ class ValidatorFault(AdukuError):
 def validate_document(schema: Schema, behaviors: BehaviorRegistry, document: FrozenStruct) -> list[Violation]:
     """Every violation, once each, sorted by (rule, path scope)."""
     found: dict[tuple[str, str], Violation] = {}
+    document = strip_computed(document)  # a rule sees the value of a computed field, not its annotation
     for path, value in _nodes(document, ()):
         field = schema.field_for(path)
         if field is None:

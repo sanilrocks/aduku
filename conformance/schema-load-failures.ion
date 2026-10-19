@@ -2,7 +2,7 @@
 // Ports compare codes, not message text.
 case::{
   name: "schema-load-failures",
-  fixtures: ["acme.subtract@1", "acme.longest@1"],
+  fixtures: ["acme.subtract@1", "acme.longest@1", "acme.label@1", "fx.echo@1"],
   steps: [
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a, b],
         fields: {"/age": {type: int, merge: max}, "/tags": {type: "list<string>", merge: union},
@@ -60,6 +60,47 @@ case::{
     // validator arguments are checked when the schema loads, not when the first write fails
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/n": {type: int, merge: lww, validate: [range::{min: "x"}]}}}''',
       expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+
+    // feature 002: computed fields. A dependency must be declared by the schema
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/x": {type: string, computed: {macro: upper, args: ["/nope"]}}}}''',
+      expect: { problems: [UNKNOWN_DEPENDENCY] } },
+
+    // a loop of any length is refused, with the loop listed
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {
+          "/a": {type: string, computed: {macro: upper, args: ["/b"]}},
+          "/b": {type: string, computed: {macro: upper, args: ["/c"]}},
+          "/c": {type: string, computed: {macro: upper, args: ["/a"]}}}}''',
+      expect: { problems: [DEPENDENCY_CYCLE] } },
+
+    // a macro must get the arguments it takes
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/x": {type: string, computed: {macro: upper, args: ["/name", "/name"]}}}}''',
+      expect: { problems: [BAD_MACRO_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/x": {type: string, computed: {macro: "acme.label@1", args: ["/name"]}}}}''',
+      expect: { problems: [BAD_MACRO_ARGS] } },
+
+    // a macro that is not registered
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: string, merge: lww},
+          "/x": {type: string, computed: {macro: "acme.nope@1", args: ["/name"]}}}}''',
+      expect: { problems: [UNKNOWN_BEHAVIOR] } },
+
+    // a custom macro does not take floats or timestamps
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/name": {type: float, merge: lww},
+          "/city": {type: string, merge: lww},
+          "/x": {type: string, computed: {macro: "acme.label@1", args: ["/name", "/city"]}}}}''',
+      expect: { problems: [MACRO_INPUT_UNSUPPORTED] } },
+
+    // an impure compute states why, how long, how often and who may recompute it
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/country": {type: string, merge: lww},
+          "/taxId": {type: string, computed: {impure: {hook: "fx.echo@1", depends: ["/country"], timeout: "1s",
+                     retry: {max: 1}, deadline: "3s", recompute_by: [a]}}}}}''',
+      expect: { problems: [IMPURE_DECLARATION_INCOMPLETE] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/country": {type: string, merge: lww},
+          "/taxId": {type: string, computed: {impure: {hook: "fx.echo@1", depends: ["/country"], reason: "registry",
+                     timeout: "1s", retry: {max: 1, backoff: "10ms"}, deadline: "3s", recompute_by: [a]}}}}}''',
+      expect: { ok: true } },
 
     // several problems at once are all reported
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a, a], rejection_audit: {enabled: true},

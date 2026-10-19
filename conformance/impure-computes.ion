@@ -1,0 +1,59 @@
+// Feature 002, US6: an impure field's hook is called once for its inputs; the outcome is recorded, and reads, a rebuild
+// and a retry make no further call. A changed input is a new call; the same input again is not.
+case::{
+  name: "impure-computes",
+  fixtures: ["fx.echo@1", "fx.fail@1"],
+  schema: schema::{
+    id: "t", version: 1, tiers: [user, admin],
+    fields: {
+      "/country": {type: string, merge: lww},
+      "/taxId": {type: string, computed: {impure: {hook: "fx.echo@1", depends: ["/country"], reason: "registry",
+                                                    timeout: "1s", retry: {max: 1, backoff: "10ms"}, deadline: "3s",
+                                                    recompute_by: [admin]}}},
+      "/audit": {type: string, on_missing: absent,
+                 computed: {impure: {hook: "fx.fail@1", depends: ["/country"], reason: "an unreliable registry",
+                                     timeout: "1s", retry: {max: 0}, deadline: "3s", recompute_by: [admin],
+                                     failure_mode: model_error_on_failure}}}
+    }
+  },
+  steps: [
+    { hook_calls: "fx.echo@1", expect: { count: 0 } },
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { hook_calls: "fx.echo@1", expect: { count: 1 } },
+    { get: "d1", expect: { document: '{country:"US",taxId:computed::"tax-US"}', model_errors: [{rule: "impure:/audit", path: "/audit"}] } },
+
+    // reads and a rebuild use the recorded outcome
+    { get: "d1", expect: { document: '{country:"US",taxId:computed::"tax-US"}' } },
+    { rebuild: "d1", expect: { identical: true } },
+    { hook_calls: "fx.echo@1", expect: { count: 1 } },
+
+    // a new input is a new call; going back to an input already seen is not
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, request_key: "K", entries: [{tier: user, path: "/country", value: "CA"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { hook_calls: "fx.echo@1", expect: { count: 2 } },
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { accepted: [{seq: 3}] } },
+    { hook_calls: "fx.echo@1", expect: { count: 2 } },
+    { get: "d1", expect: { document: '{country:"US",taxId:computed::"tax-US"}' } },
+
+    // a retry of an accepted request is answered without a call
+    { append: { doc: "d1", contributor: {id: "pat", tiers: [user]}, request_key: "K", entries: [{tier: user, path: "/country", value: "CA"}] },
+      expect: { duplicate: true } },
+    { hook_calls: "fx.echo@1", expect: { count: 2 } },
+
+    // reject_on_failure (the default) would reject; /audit says model_error_on_failure, so it is accepted and recorded
+    { get: "d1", expect: { model_errors: [{rule: "impure:/audit", path: "/audit"}] } },
+
+    // only the callers named by recompute_by may recompute
+    { recompute: { doc: "d1", field: "/audit", contributor: {id: "pat", tiers: [user]} },
+      expect: { rejected: { code: NOT_AUTHORIZED } } },
+    { recompute: { doc: "d1", field: "/audit", contributor: {id: "root", tiers: [admin]} },
+      expect: { failed: ["/audit"] } },
+    { recompute: { doc: "d1", field: "/taxId", contributor: {id: "root", tiers: [admin]} },
+      expect: { recomputed: ["/taxId"] } },
+    { hook_calls: "fx.echo@1", expect: { count: 3 } },
+    { recompute: { doc: "d1", contributor: {id: "root", tiers: [admin]} },
+      expect: { recomputed: ["/taxId"], failed: ["/audit"] } }
+  ]
+}

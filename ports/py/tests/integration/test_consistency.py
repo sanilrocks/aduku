@@ -26,7 +26,7 @@ def test_a_fresh_view_and_a_cached_view_are_the_same_bytes(backend: Storage) -> 
     derived = make_service(backend, schema=STAMPED).get("d1")  # nothing cached anywhere
     assert appended is not None
     texts = {to_canonical(r.document) for r in (appended, cached, derived)}
-    assert texts == {"{t:2026-01-01T05:00:00Z}"}
+    assert texts == {"{displayName:computed::null,t:2026-01-01T05:00:00Z}"}
     assert all(r.document["t"].utcoffset() == timedelta(0) for r in (appended, cached, derived))
 
 

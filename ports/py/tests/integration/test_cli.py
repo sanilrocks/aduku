@@ -210,3 +210,108 @@ def test_explain_names_the_winner_and_the_rule(env: list[str], capsys: pytest.Ca
     assert len(out["shadowed"]) == 2 and out["inputs"] == [out["winner"]]
     code, _, err = run(capsys, *env, "explain", "d1", "/nope")
     assert code == 2 and "does not declare" in err  # not a rejected request: a usage error
+
+
+# -- feature 002: computed fields, impure computes, effects ---------------------------------------------------------
+
+DEMO = str(pathlib.Path(__file__).resolve().parents[2] / "examples")
+IMPURE_SCHEMA = """schema::{id: "t", version: 1, tiers: [backfill, user, admin],
+  fields: {
+    "/country": {type: string, merge: lww}, "/name": {type: string, merge: lww}, "/city": {type: string, merge: lww},
+    "/label": {type: string, computed: {macro: "acme.label@1", args: ["/name", "/city"]}},
+    "/taxId": {type: string, computed: {impure: {hook: "fx.echo@1", depends: ["/country"], reason: "tax id from the registry",
+              timeout: "1s", retry: {max: 1, backoff: "10ms"}, deadline: "3s", recompute_by: [admin]}}}}}"""
+
+
+@pytest.fixture
+def impure_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    monkeypatch.syspath_prepend(DEMO)
+    schema = tmp_path / "impure.schema.ion"
+    schema.write_text(IMPURE_SCHEMA)
+    return ["--db", str(tmp_path / "cli.db"), "--schema", str(schema), "--behaviors", "demo_hooks"]
+
+
+def test_schema_check_reports_the_computed_fields_and_the_impure_inventory(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _ = run(capsys, *impure_env, "schema", "check", impure_env[3])
+    assert code == 0 and out["ok"] is True
+    assert [c["field"] for c in out["computed"]] == ["/label"] and out["computed"][0]["macro"] == "acme.label@1"
+    (inventory,) = out["impure"]
+    assert inventory["field"] == "/taxId" and inventory["hook"] == "fx.echo@1"
+    assert inventory["reason"] == "tax id from the registry" and inventory["recompute_by"] == ["admin"]
+    assert (inventory["timeout"], inventory["retry"], inventory["deadline"]) == ("1s", 1, "3s") or inventory[
+        "timeout"
+    ] == 1.0
+
+
+def test_a_schema_that_needs_behaviors_is_refused_without_them(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    without = [impure_env[0], impure_env[1], impure_env[2], impure_env[3]]
+    code, _, err = run(capsys, *without, "get", "d1")
+    assert code == 2 and "UNKNOWN_BEHAVIOR" in err
+
+
+def test_a_behaviors_module_that_cannot_be_imported_is_a_usage_error(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = [*impure_env[:4], "--behaviors", "no_such_module_anywhere"]
+    code, _, err = run(capsys, *broken, "get", "d1")
+    assert code == 2 and "no_such_module_anywhere" in err
+
+
+def test_computed_values_the_hook_call_the_effect_log_and_explain(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _ = run(
+        capsys, *impure_env, "append", "d1", "--contributor", "pat", "--tier", "user",
+        "--set", '/country="US"', "--set", '/name="Alice S."', "--set", '/city="Paris"',
+    )  # fmt: skip
+    assert code == 0
+    code, out, _ = run(capsys, *impure_env, "get", "d1")
+    assert 'label:computed::"Alice S. (Paris)"' in out["document"] and 'taxId:computed::"tax-US"' in out["document"]
+    code, out, _ = run(capsys, *impure_env, "effects", "list", "d1")
+    (record,) = out["effects"]
+    assert (record["field"], record["hook"], record["outcome"], record["attempts"]) == (
+        "/taxId",
+        "fx.echo@1",
+        "value",
+        1,
+    )
+    assert "value" not in record and "error" not in record  # metadata only
+    code, out, _ = run(capsys, *impure_env, "explain", "d1", "/taxId")
+    assert out["winner"] == "computed" and out["rule"] == "fx.echo@1" and out["effect_seq"] == record["effect_seq"]
+    assert out["dependencies"] == [{"path": "/country", "value": '"US"'}]
+    code, out, _ = run(capsys, *impure_env, "effects", "prune", "d1")
+    assert code == 0 and out["pruned"] == 0
+    code, out, _ = run(capsys, *impure_env, "rebuild", "d1")
+    assert code == 0 and out["identical"] is True
+    code, out, _ = run(capsys, *impure_env, "effects", "list", "d1")
+    assert len(out["effects"]) == 1  # reading and rebuilding made no further call
+
+
+def test_recompute_through_the_cli(impure_env: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    run(capsys, *impure_env, "append", "d1", "--contributor", "pat", "--tier", "user", "--set", '/country="US"')
+    code, out, _ = run(capsys, *impure_env, "recompute", "d1", "/taxId", "--contributor", "root", "--tier", "admin")
+    assert code == 0 and out["recomputed"] == ["/taxId"] and out["failed"] == [] and out["skipped"] == []
+    assert [s["field"] for s in out["effect_seqs"]] == ["/taxId"] and out["effect_seqs"][0]["effect_seq"] == 2
+    code, out, _ = run(capsys, *impure_env, "effects", "list", "d1")
+    assert [e["outcome"] for e in out["effects"]] == ["value", "value"]  # the recompute added a record
+
+
+def test_recompute_by_someone_the_schema_does_not_list_exits_1(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(capsys, *impure_env, "append", "d1", "--contributor", "pat", "--tier", "user", "--set", '/country="US"')
+    code, out, err = run(capsys, *impure_env, "recompute", "d1", "/taxId", "--contributor", "pat", "--tier", "user")
+    assert code == 1 and out["rejected"]["code"] == "NOT_AUTHORIZED" and "NOT_AUTHORIZED" in err
+    code, out, _ = run(capsys, *impure_env, "effects", "list", "d1")
+    assert len(out["effects"]) == 1
+
+
+def test_recompute_of_a_field_that_cannot_be_called_exits_1(
+    impure_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _ = run(capsys, *impure_env, "recompute", "d1", "/taxId", "--contributor", "root", "--tier", "admin")
+    assert code == 1 and out["failed"] == [{"field": "/taxId", "kind": "missing_input"}]

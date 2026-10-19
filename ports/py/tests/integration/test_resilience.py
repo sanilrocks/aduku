@@ -8,7 +8,7 @@ from aduku.behaviors.registry import BehaviorRegistry
 from aduku.engine.admission import check_request
 from aduku.engine.derive import derive
 from aduku.errors import ErrorCode, RejectedError, SchemaError
-from aduku.ion_codec import FrozenStruct, to_canonical
+from aduku.ion_codec import Annotated, FrozenStruct, to_canonical
 from aduku.schema.loader import load_schema
 from aduku.storage.base import RequestRecord, Storage
 from tests.engine_helpers import FIELDS
@@ -206,5 +206,5 @@ def test_a_failure_after_deriving_leaves_no_trace_in_the_cache_or_the_ledger(bac
         service.append("d1", [put("/name", "ghost")], contributor=ALICE)
     assert service.list_entries("d1") == [] and "d1" not in service._states
     service.append("d1", [put("/name", "real")], contributor=ALICE)
-    assert service.get("d1").document == FrozenStruct({"name": "real"})
+    assert service.get("d1").document == FrozenStruct({"name": "real", "displayName": Annotated(("computed",), "REAL")})
     assert ROOT  # keep the shared import used

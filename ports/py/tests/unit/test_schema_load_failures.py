@@ -238,3 +238,58 @@ def test_valid_validator_arguments_load() -> None:
         wrap('"/a": {type: int, merge: max, validate: [range::{min: 0}, range::{max: 1.5}, non_empty]}'), BEHAVIORS
     )
     load_schema(wrap('"/b": {type: string, merge: lww, validate: [max_len::{n: 0}]}'), BEHAVIORS)
+
+
+# -- feature 002, US4: impossible dependencies are refused when the schema loads --------------------------------------
+
+NAME = '"/name": {type: string, merge: lww}'
+IMPURE_ON = (
+    '{type: string, computed: {impure: {hook: "fx.echo@1", depends: ["%s"], reason: "r", timeout: "1s",'
+    ' retry: {max: 1, backoff: "10ms"}, deadline: "3s", recompute_by: [admin]}}}'
+)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        NAME + ', "/x": {type: string, computed: {macro: upper, args: ["/nope"]}}',
+        NAME + ', "/x": {type: string, computed: {macro: concat, args: ["/name", "/a/b/c"]}}',
+        NAME + ', "/x": ' + IMPURE_ON % "/nope",
+    ],
+)
+def test_a_dependency_on_a_path_no_field_declares_is_refused(fields: str) -> None:
+    found = codes_of(wrap(fields))
+    assert "UNKNOWN_DEPENDENCY" in found
+
+
+def test_a_dependency_the_schema_does_declare_is_accepted() -> None:
+    declared = (
+        NAME
+        + ', "/address": {type: struct, merge: struct}, "/address/city": {type: string, merge: lww}'
+        + ', "/a": {type: string, computed: {macro: upper, args: ["/address/city"]}}'
+        + ', "/b": {type: string, computed: {macro: upper, args: ["/a"]}}'
+        + ', "/open/*": {merge: lww}, "/c": {type: string, computed: {macro: upper, args: ["/open/anything"]}}'
+    )
+    load_schema(wrap(declared), BEHAVIORS)
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 5])
+def test_a_cycle_of_any_length_is_refused_and_the_loop_is_listed(size: int) -> None:
+    names = [f"/c{n}" for n in range(size)]
+    fields = [
+        f'"{path}": {{type: string, computed: {{macro: upper, args: ["{names[(n + 1) % size]}"]}}}}'
+        for n, path in enumerate(names)
+    ]
+    with pytest.raises(SchemaError) as caught:
+        load_schema(wrap(", ".join(fields)), BEHAVIORS)
+    loops = [p for p in caught.value.problems if p.startswith("DEPENDENCY_CYCLE")]
+    assert loops and all(path in loops[0] for path in names)
+
+
+def test_computed_problems_are_reported_together_with_the_others() -> None:
+    bad = (
+        '"/a": {type: string, computed: {macro: upper, args: ["/nope"]}},'
+        ' "/b": {type: string, merge: lww, computed: {macro: upper, args: ["/name"]}}, ' + NAME
+    )
+    found = codes_of(wrap(bad))
+    assert {"UNKNOWN_DEPENDENCY", "DERIVED_HAS_MERGE_OR_DEFAULT"} <= found

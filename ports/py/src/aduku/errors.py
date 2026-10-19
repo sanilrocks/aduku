@@ -16,6 +16,7 @@ class ErrorCode(StrEnum):
     OP_NOT_ALLOWED = "OP_NOT_ALLOWED"
     VALIDATION_FAILED = "VALIDATION_FAILED"
     MODEL_ERROR_INTRODUCED = "MODEL_ERROR_INTRODUCED"
+    COMPUTE_FAULT = "COMPUTE_FAULT"
     IMPURE_COMPUTE_FAILED = "IMPURE_COMPUTE_FAILED"
     LENIENT_NOT_PERMITTED = "LENIENT_NOT_PERMITTED"
     DUPLICATE_IDEM_KEY = "DUPLICATE_IDEM_KEY"
@@ -70,3 +71,18 @@ class StorageError(AdukuError):
     """Storage failed. Not a rejection: no entry of the request is visible."""
 
     code = ErrorCode.STORAGE_ERROR
+
+
+class ComputeFault(AdukuError):
+    """A pure macro errored, exceeded a limit or returned the wrong type: an engine fault, never a data problem.
+
+    The message names the macro and the reason (the limit's name, never a value). At admission it becomes a rejection
+    with `ErrorCode.COMPUTE_FAULT`; on a read it propagates.
+    """
+
+    code = ErrorCode.COMPUTE_FAULT
+
+    def __init__(self, macro: str, reason: str) -> None:
+        self.macro = macro
+        self.reason = reason
+        super().__init__(f"macro {macro} faulted: {reason}")

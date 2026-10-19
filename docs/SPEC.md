@@ -1,6 +1,6 @@
 # aduku — Specification
 
-Status: Draft 0.7 · Audience: implementers and reviewers
+Status: Draft 0.9 · Audience: implementers and reviewers
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** are used as in RFC 2119.
 
@@ -293,6 +293,7 @@ schema::{
                       computed: { impure: { hook: "tax.lookup@2", depends: ["/country", "/name"],
                                             reason: "issued by the registry; needed before checkout",
                                             timeout: "2s", retry: { max: 3, backoff: "200ms" }, deadline: "6s",
+                                            recompute_by: [admin],
                                             failure_mode: reject_on_failure } } },
 
     "/creditScore": { type: int,
@@ -322,6 +323,8 @@ schema::{
 | `computed` | P4 | Pure macro over declared dependencies (section 9), or an `impure` hook with retries and recorded outcomes (section 9.3.1). |
 | `failure_mode` | P4 | Field-level, impure computes only: `reject_on_failure` (default) or `model_error_on_failure` (section 9.3.1). |
 | `impure_failure_mode` | P4 | Schema-level default for `failure_mode` (section 9.3.1). |
+| `on_missing` | P4 | Computed and impure fields: `null` (default), `absent` or `error`, what the field does when an input has no value (section 9.4). |
+| `recompute_by` | P4 | Impure computes: the tiers or roles allowed to call `recompute` (section 9.3.1). |
 | `deferred` | P5 | IO hook with refresh policy and persistence (section 9.5). |
 | `redact` | P7 | Read-time projection rule (e.g. role-based masking). |
 | `lenient` | P0 | Schema-level: tiers/contributors allowed to use the non-rejection flag (section 10.2). |
@@ -532,7 +535,8 @@ If a field **becomes** derived in a later schema version, historic accepted entr
   access to fields outside `depends`. The one exception is a declared impure compute (9.3.1).
 - **Presets** (initial set; all pure): `upper`, `lower`, `trim`, `concat`, `coalesce`, `len`, `sum`, `min`,
   `max`, `round`, `format_ts`, `hash`, `join`, `if`, `eq`. Preset names are reserved.
-- **Custom macros** use a sandboxed expression or module language (CEL or WASM recommended) with resource limits.
+- **Custom macros** use a sandboxed expression or module language (CEL or WASM recommended) with resource limits. In `aduku-py` they are
+  expressions in a small CEL-syntax subset with deterministic step and size limits (feature 002, `contracts/expression-language.md`).
 - Results are **never written to the ledger**. They MAY be memoized keyed by
   `(doc, input fingerprint, behavior version)`.
 - Computed values are presented with the annotation `computed::` (projection MAY strip it).
@@ -548,6 +552,7 @@ it runs inside request handling, and its value, or its failure, is part of the s
             computed: { impure: { hook: "tax.lookup@2", depends: ["/country", "/name"],
                                   reason: "tax id issued by the registry; required before checkout",
                                   timeout: "2s", retry: { max: 3, backoff: "200ms" }, deadline: "6s",
+                                  recompute_by: [admin],
                                   failure_mode: reject_on_failure } } }   // or model_error_on_failure
 ```
 
@@ -573,10 +578,10 @@ it runs inside request handling, and its value, or its failure, is part of the s
    | `model_error_on_failure` | The request is accepted. A model error `(impure:<path>, <path>)` is recorded, attributed to the request. The field follows `on_missing`. Dependent computes follow `on_missing`; validators that depend on the missing value are not evaluated and add no further error, so the failure is the one error. This error is exempt from the no-new-errors rule (10.3); every other new error still counts. |
 
 6. **Recovery.** Fix the cause (correct the input data with a new contribution, or restore the dependent system) and
-   recompute: `recompute(doc, field?)` calls the hook again with the current inputs and appends a new outcome that
+   recompute: `recompute(doc, field?)`, permitted to the tiers and roles in the field's `recompute_by` (without a field it covers only the fields the caller may recompute), calls the hook again with the current inputs and appends a new outcome that
    supersedes the earlier one. A successful outcome removes the model error on the next derivation. A changed input
    fingerprint triggers a new call on its own.
-7. **Use sparingly.** The schema MUST give each impure compute a `reason`, `timeout`, `retry` and `deadline`. `schema
+7. **Use sparingly.** The schema MUST give each impure compute a `reason`, `timeout`, `retry`, `deadline` and `recompute_by` (the tiers or roles allowed to call `recompute`, the same vocabulary as `authority`; any other caller gets `NOT_AUTHORIZED`). `schema
    check` reports the inventory of impure computes. Prefer a pure compute or a deferred field.
 8. **Retention and access (proposed defaults).** The latest outcome per `(doc, field, input_fingerprint, hook_version)` is kept
    as long as the ledger entries it derives from exist, because replay needs it. Superseded outcomes are kept for audit,
@@ -590,6 +595,17 @@ it runs inside request handling, and its value, or its failure, is part of the s
 
 `on_missing` (per computed, impure or deferred field): `null` (default) | `absent` | `error`. Because computed fields cannot
 depend on deferred fields, a pending dependency matters only to deferred fields (section 9.5).
+
+For a computed or impure field, an input is *missing* when its path has no value (never set and no default, or deleted
+without a default fallback), or its value is null, which includes the null result of another computed field. A macro that does
+not accept missing inputs is then not run and `on_missing` decides: `null` puts `computed::null` in the document, `absent`
+leaves the field out, `error` leaves it out and adds the model error `computed:<path>`, which counts against a request like
+any other new model error. `coalesce`, `if`, `eq` and `join` accept missing inputs: they run, receive null, and their result is
+the value. An impure field whose inputs are missing does not call its hook. A failed impure call is the model error
+`impure:<path>`; the field then follows `on_missing` (`error` adds no second error).
+
+A pure macro that errors, exceeds a limit or returns a value of the wrong type is a fault, never a null: a request that would
+cause it is rejected with `COMPUTE_FAULT`, and a read raises it.
 
 ### 9.5 Deferred fields
 
@@ -795,7 +811,7 @@ difference); a document that cannot be derived is reported and does not stop the
 ### 12.5 Error codes (non-exhaustive)
 
 `FIELD_NOT_WRITABLE`, `NOT_AUTHORIZED`, `TIER_NOT_PERMITTED`, `UNKNOWN_PATH`, `TYPE_MISMATCH`,
-`OP_NOT_ALLOWED`, `VALIDATION_FAILED`, `MODEL_ERROR_INTRODUCED`, `IMPURE_COMPUTE_FAILED`, `LENIENT_NOT_PERMITTED`, `DUPLICATE_IDEM_KEY`, `REQUEST_KEY_REUSED`, `IDEM_KEY_REQUIRED`, `SEQ_CONFLICT`, `SCHEMA_INACTIVE`, `STORAGE_ERROR` (an error, not a rejection).
+`OP_NOT_ALLOWED`, `VALIDATION_FAILED`, `MODEL_ERROR_INTRODUCED`, `COMPUTE_FAULT`, `IMPURE_COMPUTE_FAILED`, `LENIENT_NOT_PERMITTED`, `DUPLICATE_IDEM_KEY`, `REQUEST_KEY_REUSED`, `IDEM_KEY_REQUIRED`, `SEQ_CONFLICT`, `SCHEMA_INACTIVE`, `STORAGE_ERROR` (an error, not a rejection).
 
 ---
 
@@ -1024,6 +1040,8 @@ Every question below was decided on 2026-10-18. The Decision line says what is i
 
 ## Appendix A. Changelog
 
+- **0.9**: Computed fields as built in feature 002: null counts as a missing input, `on_missing: error` model errors count against a request, `COMPUTE_FAULT`, `on_missing` and `recompute_by` in the annotation table (5.3, 9.4, 12.5).
+- **0.8**: Impure computes declare `recompute_by` (who may call `recompute`), decided while clarifying feature 002 (9.3.1).
 - **0.7**: Matched the spec to the first implementation: admission checks struct children, child authority on delete and values with no canonical Ion form (6.5); tier drop refused also at pin and at service start (4.4); built-in validator arguments checked at load (5.1); `explain` shape and winner definition (12.3); `rebuild` semantics (12.4). Example 16.2 step 7 uses `max_len 2`, since "Pat" has 3 characters.
 - **0.6**: Decided all section 17 questions (see their Decision lines). Tiers are user-defined with optional presets, and one
   tier order applies per schema (4.4, 6.2). Dynamic defaults as pure macros (8.7). Most specific authority rule wins (11).

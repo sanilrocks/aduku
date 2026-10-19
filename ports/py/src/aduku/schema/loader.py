@@ -9,7 +9,21 @@ from aduku.behaviors.registry import BehaviorRegistry
 from aduku.errors import SchemaError
 from aduku.ion_codec import Annotated, FrozenStruct, IonError, Symbol, parse
 from aduku.paths import PathError, parse_path, parse_pattern
-from aduku.schema.model import MISSING, AuditSettings, BehaviorRef, FieldSpec, Schema, conforms, parse_type
+from aduku.schema.model import (
+    MAX_HOOK_DEADLINE,
+    MAX_HOOK_RETRIES,
+    MAX_HOOK_TIMEOUT,
+    MISSING,
+    AuditSettings,
+    BehaviorRef,
+    ComputedSpec,
+    FieldSpec,
+    ImpureSpec,
+    MacroArg,
+    Schema,
+    conforms,
+    parse_type,
+)
 
 __all__ = ["load_schema"]
 
@@ -38,11 +52,17 @@ FIELD_KEYS = {
     "ops",
     "doc",
     "failure_mode",
+    "on_missing",
 }
+COMPUTED_KEYS = {"macro", "args", "impure", "doc"}
+IMPURE_REQUIRED = ("hook", "depends", "reason", "timeout", "retry", "deadline", "recompute_by")
+IMPURE_KEYS = {*IMPURE_REQUIRED, "failure_mode"}
+ON_MISSING = ("null", "absent", "error")
 FAILURE_MODES = {"reject_on_failure", "model_error_on_failure"}
 CORE_OPS = {"set", "delete"}
 EXTENSION_OPS = {"increment", "append", "reset"}  # SPEC 4.3: arrive in v1.1
 _DURATION = re.compile(r"(\d+)([smhdw])\Z")
+_SHORT_DURATION = re.compile(r"(\d+)(ms|s|m|h)\Z")  # hook timings: 200ms, 2s, 1m
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
@@ -150,6 +170,7 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
         document_validate=document_validate,
         impure_failure_mode=str(mode),
     )
+    _check_computed(schema, behaviors, problems)
     _semantic(schema, problems)  # runs even after structural problems, so that everything is reported together
     return None if problems else schema
 
@@ -265,6 +286,17 @@ def _field(
             )
     derived = kinds[0] if kinds else None
     derived_spec = raw.get(kinds[0]) if kinds else None
+    computed_spec: ComputedSpec | None = None
+    impure_spec: ImpureSpec | None = None
+    if "computed" in raw:
+        computed_spec, impure_spec = _computed(raw["computed"], where, names, problems)
+    # the setting named `null` reads as the Ion null value when written bare
+    on_missing = ("null" if raw["on_missing"] is None else str(raw["on_missing"])) if "on_missing" in raw else "null"
+    if on_missing not in ON_MISSING:
+        problems.append(f"{where}: on_missing must be one of {list(ON_MISSING)}, not {on_missing!r}")
+        on_missing = "null"
+    elif "on_missing" in raw and "computed" not in raw:
+        problems.append(f"{where}: on_missing applies only to computed fields")
     return FieldSpec(
         pattern=pattern,
         type=type_text,
@@ -278,6 +310,194 @@ def _field(
         failure_mode=failure_mode,
         ops=ops,
         redact=raw.get("redact"),
+        computed=computed_spec,
+        impure=impure_spec,
+        on_missing=on_missing,  # type: ignore[arg-type]
+    )
+
+
+def _check_computed(schema: Schema, behaviors: BehaviorRegistry, problems: list[str]) -> None:
+    """Resolve each computed field's macro: it must exist, take these arguments, and fit the declared type."""
+    from aduku.behaviors.compute import (
+        PRESETS,
+    )  # imported late: the presets are the engine's, the loader only reads them
+
+    for spec in schema.fields:
+        if spec.impure is not None:
+            hook = behaviors.get(spec.impure.hook, spec.impure.version)
+            if hook is None or hook.kind != "hook":
+                problems.append(
+                    f"UNKNOWN_BEHAVIOR: field {spec.pattern}: no hook {spec.impure.hook}@{spec.impure.version} is registered"
+                )
+        computed = spec.computed
+        if computed is None:
+            continue
+        where = f"field {spec.pattern}"
+        name = f"{computed.macro}@{computed.version}"
+        preset = PRESETS.get(computed.macro) if computed.version == 1 else None
+        if preset is not None:
+            count = len(computed.args)
+            if count < preset.fewest_args or (preset.most_args is not None and count > preset.most_args):
+                problems.append(f"BAD_MACRO_ARGS: {where}: {name} was given {count} argument(s)")
+            elif preset.result_type and spec.type and spec.type not in (preset.result_type, "any"):
+                problems.append(
+                    f"BAD_MACRO_ARGS: {where}: {name} gives a {preset.result_type}, but the field is declared {spec.type}"
+                )
+            continue
+        behavior = behaviors.get(computed.macro, computed.version)
+        if behavior is None or behavior.kind != "macro":
+            problems.append(f"UNKNOWN_BEHAVIOR: {where}: no macro {name} is registered")
+            continue
+        params = getattr(behavior.impl, "params", ())
+        if len(computed.args) != len(params):
+            problems.append(
+                f"BAD_MACRO_ARGS: {where}: {name} takes {len(params)} argument(s) ({', '.join(params)}),"
+                f" got {len(computed.args)}"
+            )
+        for arg in computed.args:
+            if arg.path is None:
+                continue
+            target = schema.field_for(parse_path(arg.path))
+            if target is not None and target.type is not None and _unsupported_input(target.type):
+                problems.append(
+                    f"MACRO_INPUT_UNSUPPORTED: {where}: custom macro {name} cannot take {arg.path}, a {target.type}"
+                    " (floats and timestamps are not supported in macro expressions)"
+                )
+
+
+def _unsupported_input(type_text: str) -> bool:
+    try:
+        kind, element = parse_type(type_text)
+    except ValueError:
+        return False
+    return kind in ("float", "timestamp") or element in ("float", "timestamp")
+
+
+def _seconds(raw: Any, where: str, problems: list[str]) -> float | None:
+    match = _SHORT_DURATION.match(str(raw))
+    if not match:
+        problems.append(f"{where} {raw!r} is not a duration such as 200ms, 2s, 1m")
+        return None
+    unit = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[match.group(2)]
+    return int(match.group(1)) * unit
+
+
+def _computed(
+    raw: Any, where: str, names: tuple[str, ...], problems: list[str]
+) -> tuple[ComputedSpec | None, ImpureSpec | None]:
+    """`computed: { macro, args }` (pure) or `computed: { impure: {...} }` (SPEC 9.3, 9.3.1)."""
+    if not isinstance(raw, FrozenStruct):
+        problems.append(f"{where}: computed must be a struct")
+        return None, None
+    for key in raw:
+        if key not in COMPUTED_KEYS:
+            problems.append(f'{where}: unknown key "computed.{key}"')
+    has_macro, has_impure = "macro" in raw, "impure" in raw
+    if has_macro and has_impure:
+        problems.append(f"{where}: computed declares both a macro and an impure hook; choose one")
+        return None, None
+    if not has_macro and not has_impure:
+        problems.append(f"{where}: computed needs a macro or an impure hook")
+        return None, None
+    if has_impure:
+        return None, _impure(raw["impure"], where, names, problems)
+    ref = _ref(raw["macro"], f"{where}: computed.macro", problems)
+    args = _macro_args(raw.get("args", ()), where, problems)
+    if ref is None:
+        return None, None
+    return ComputedSpec(macro=ref.name, version=ref.version, args=args), None
+
+
+def _macro_args(raw: Any, where: str, problems: list[str]) -> tuple[MacroArg, ...]:
+    if not isinstance(raw, tuple):
+        problems.append(f"BAD_MACRO_ARGS: {where}: computed.args must be a list")
+        return ()
+    found: list[MacroArg] = []
+    for item in raw:
+        if isinstance(item, Annotated) and item.annotations == ("lit",):
+            found.append(MacroArg(literal=item.value))
+        elif isinstance(item, str) and item.startswith("/"):
+            try:
+                parse_path(str(item))
+            except PathError as error:
+                problems.append(f"BAD_MACRO_ARGS: {where}: argument {item!r} is not a valid path ({error})")
+                continue
+            found.append(MacroArg(path=str(item)))
+        else:
+            problems.append(
+                f"BAD_MACRO_ARGS: {where}: argument {item!r} must be a path (a string starting with /) or lit::<value>"
+            )
+    return tuple(found)
+
+
+def _impure(raw: Any, where: str, names: tuple[str, ...], problems: list[str]) -> ImpureSpec | None:
+    if not isinstance(raw, FrozenStruct):
+        problems.append(f"{where}: computed.impure must be a struct")
+        return None
+    before = len(problems)
+    for key in raw:
+        if key not in IMPURE_KEYS:
+            problems.append(f'{where}: unknown key "computed.impure.{key}"')
+    for key in IMPURE_REQUIRED:
+        if key not in raw:
+            problems.append(f"IMPURE_DECLARATION_INCOMPLETE: {where}: an impure compute needs {key}")
+    if len(problems) > before:
+        return None
+    ref = _ref(raw["hook"], f"{where}: impure.hook", problems)
+    depends = _names(raw["depends"], f"{where}: impure.depends", problems)
+    for path_text in depends:
+        try:
+            parse_path(path_text)
+        except PathError as error:
+            problems.append(f"BAD_MACRO_ARGS: {where}: dependency {path_text!r} is not a valid path ({error})")
+    if not depends:
+        problems.append(f"IMPURE_DECLARATION_INCOMPLETE: {where}: an impure compute needs at least one dependency")
+    reason = raw["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        problems.append(f"IMPURE_DECLARATION_INCOMPLETE: {where}: reason must be non-empty text")
+    timeout = _seconds(raw["timeout"], f"{where}: impure.timeout", problems)
+    deadline = _seconds(raw["deadline"], f"{where}: impure.deadline", problems)
+    retry = raw["retry"]
+    retry_max, backoff = 0, 0.0
+    if not isinstance(retry, FrozenStruct) or "max" not in retry:
+        problems.append(f"IMPURE_DECLARATION_INCOMPLETE: {where}: retry needs max (and optionally backoff)")
+    else:
+        value = retry["max"]
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= MAX_HOOK_RETRIES:
+            problems.append(f"{where}: impure.retry.max must be a whole number from 0 to {MAX_HOOK_RETRIES}")
+        else:
+            retry_max = value
+        if "backoff" in retry:
+            backoff = _seconds(retry["backoff"], f"{where}: impure.retry.backoff", problems) or 0.0
+    if timeout is not None and not 0 < timeout <= MAX_HOOK_TIMEOUT:
+        problems.append(f"{where}: impure.timeout must be above zero and at most {MAX_HOOK_TIMEOUT:g}s")
+    if deadline is not None and (deadline > MAX_HOOK_DEADLINE or (timeout is not None and deadline < timeout)):
+        problems.append(f"{where}: impure.deadline must be at least the timeout and at most {MAX_HOOK_DEADLINE:g}s")
+    recompute_by = _names(raw["recompute_by"], f"{where}: impure.recompute_by", problems)
+    if not recompute_by:
+        problems.append(f"IMPURE_DECLARATION_INCOMPLETE: {where}: recompute_by must list at least one tier or role")
+    for name in recompute_by:
+        if name not in names:
+            problems.append(
+                f"UNKNOWN_TIER: {where}: recompute_by names {name!r}, which is neither a tier nor a declared role"
+            )
+    failure_mode = str(raw["failure_mode"]) if "failure_mode" in raw else None
+    if failure_mode is not None and failure_mode not in FAILURE_MODES:
+        problems.append(f"{where}: impure.failure_mode must be one of {sorted(FAILURE_MODES)}, not {failure_mode!r}")
+        failure_mode = None
+    if ref is None or timeout is None or deadline is None or len(problems) > before:
+        return None
+    return ImpureSpec(
+        hook=ref.name,
+        version=ref.version,
+        depends=depends,
+        reason=str(reason),
+        timeout=timeout,
+        retry_max=retry_max,
+        backoff=backoff,
+        deadline=deadline,
+        recompute_by=recompute_by,
+        failure_mode=failure_mode,
     )
 
 
@@ -402,6 +622,21 @@ def _semantic(schema: Schema, problems: list[str]) -> None:
         )
 
     for spec in schema.fields:
+        for path_text in (
+            *(spec.computed.paths if spec.computed else ()),
+            *(spec.impure.depends if spec.impure else ()),
+        ):
+            try:
+                path = parse_path(path_text)
+                # declared directly, or beneath a derived field (its computed value may be a struct)
+                declared = schema.field_for(path) is not None or schema.derived_field_at_or_above(path) is not None
+            except PathError:
+                continue  # reported where the declaration was parsed
+            if not declared:
+                problems.append(
+                    f"UNKNOWN_DEPENDENCY: computed field {spec.pattern} depends on {path_text},"
+                    " which no field of the schema declares"
+                )
         if spec.derived == "deferred" and spec.validate:
             problems.append(f"DEPENDS_ON_DEFERRED: deferred field {spec.pattern} cannot be validated")
         if spec.derived == "computed":
@@ -429,33 +664,7 @@ def _semantic(schema: Schema, problems: list[str]) -> None:
 
 def _cycles(schema: Schema, problems: list[str]) -> None:
     """Derived fields may not depend on each other in a loop."""
-    derived = {spec.pattern: spec for spec in schema.fields if spec.derived}
-    edges: dict[str, list[str]] = {name: [] for name in derived}
-    for name, spec in derived.items():
-        for path_text in _paths_in(spec.derived_spec):
-            try:
-                target = schema.derived_field_at_or_above(parse_path(path_text))
-            except PathError:
-                continue
-            if target is not None and target.pattern in derived:
-                edges[name].append(target.pattern)
-    reported: set[frozenset[str]] = set()
-    state: dict[str, int] = {}  # 1 = on the current path, 2 = finished
+    from aduku.engine.graph import find_cycles  # the graph lives with the engine; imported late to keep layers acyclic
 
-    def visit(name: str, trail: list[str]) -> None:
-        state[name] = 1
-        for nxt in edges[name]:
-            if state.get(nxt) == 1:
-                loop = [*trail[trail.index(nxt) :], nxt] if nxt in trail else [name, nxt]
-                if frozenset(loop) not in reported:
-                    reported.add(frozenset(loop))
-                    problems.append(
-                        "DEPENDENCY_CYCLE: derived fields depend on each other in a loop: " + " -> ".join(loop)
-                    )
-            elif state.get(nxt) is None:
-                visit(nxt, [*trail, nxt])
-        state[name] = 2
-
-    for name in edges:
-        if state.get(name) is None:
-            visit(name, [name])
+    for loop in find_cycles(schema):
+        problems.append("DEPENDENCY_CYCLE: derived fields depend on each other in a loop: " + " -> ".join(loop))

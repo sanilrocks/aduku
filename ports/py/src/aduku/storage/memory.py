@@ -9,11 +9,19 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 
 from aduku.model import Entry
-from aduku.storage.base import AuditRow, ConstraintError, RequestRecord, ViewRow, live
+from aduku.storage.base import (
+    AuditRow,
+    ConstraintError,
+    EffectRecord,
+    RequestRecord,
+    ViewRow,
+    effects_to_prune,
+    live,
+)
 
 
 @dataclass
@@ -24,6 +32,8 @@ class _State:
     request_keys: dict[tuple[str, str, str], str] = field(default_factory=dict)
     idem_keys: set[tuple[str, str]] = field(default_factory=set)
     views: dict[str, ViewRow] = field(default_factory=dict)
+    effects: list[EffectRecord] = field(default_factory=list)
+    effect_counter: int = 0
 
 
 class _MemoryTx:
@@ -126,6 +136,54 @@ class _MemoryTx:
         previous = self._s.views.pop(doc, None)
         self._undo.append(lambda: self._restore_view(doc, previous))
 
+    @live
+    def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
+        state = self._s
+        before_len, before_counter = len(state.effects), state.effect_counter
+        assigned: list[int] = []
+        for record in records:
+            state.effect_counter += 1
+            assigned.append(state.effect_counter)
+            state.effects.append(replace(record, effect_seq=state.effect_counter))
+
+        def undo() -> None:
+            del state.effects[before_len:]
+            state.effect_counter = before_counter
+
+        self._undo.append(undo)
+        return assigned
+
+    @live
+    def latest_effects(self, doc: str) -> list[EffectRecord]:
+        latest: dict[tuple[str, str, str], EffectRecord] = {}
+        for record in self._s.effects:
+            if record.doc == doc:
+                latest[(record.field, record.fingerprint, record.hook)] = record  # appended in sequence order
+        return sorted(latest.values(), key=lambda r: r.effect_seq or 0)
+
+    @live
+    def effects_seq(self, doc: str) -> int:
+        return max((r.effect_seq or 0 for r in self._s.effects if r.doc == doc), default=0)
+
+    @live
+    def list_effects(self, doc: str, field: str | None = None, limit: int | None = None) -> list[EffectRecord]:
+        found = [r for r in self._s.effects if r.doc == doc and (field is None or r.field == field)]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
+    @live
+    def prune_effects(
+        self, doc: str | None, now: datetime, keep: int = 5, max_age: timedelta = timedelta(days=90)
+    ) -> int:
+        state = self._s
+        scope = [r for r in state.effects if doc is None or r.doc == doc]
+        doomed = set(effects_to_prune(scope, now, keep, max_age))
+        if not doomed:
+            return 0
+        before = list(state.effects)
+        state.effects[:] = [r for r in state.effects if r.effect_seq not in doomed]
+        self._undo.append(lambda: state.effects.__setitem__(slice(None), before))
+        return len(doomed)
+
     def _restore_view(self, doc: str, previous: ViewRow | None) -> None:
         if previous is None:
             self._s.views.pop(doc, None)
@@ -138,6 +196,14 @@ class _MemoryReadTx(_MemoryTx):
         raise RuntimeError("read-only transaction")
 
     def put_view(self, view: ViewRow) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
+        raise RuntimeError("read-only transaction")
+
+    def prune_effects(
+        self, doc: str | None, now: datetime, keep: int = 5, max_age: timedelta = timedelta(days=90)
+    ) -> int:
         raise RuntimeError("read-only transaction")
 
     def drop_view(self, doc: str) -> None:

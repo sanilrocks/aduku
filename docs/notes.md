@@ -73,23 +73,26 @@ Individual pieces exist; I found nothing combining all of them under one schema-
 - Constitution **v1.4.0** (11 principles) ratified 2026-10-18.
 - Feature `001-core-ledger-merge-engine`: specified and clarified (FR-001 to FR-033, SC-001 to SC-013), planned, tasked (86 tasks), analyzed and implemented in
   `ports/py/` (T001 to T086 done). Both checklists are ticked. One recorded deviation from Principle X (plan.md, Complexity Tracking).
-- `docs/SPEC.md` is Draft 0.7.
+- Feature `002-computed-fields`: specified, clarified (5 questions), planned, tasked (70 tasks) and implemented in `ports/py/`
+  (T001 to T070 done). Decisions with reasons are in its `research.md` (custom macros are sandboxed expressions in a CEL
+  subset with deterministic limits; impure hooks run outside the write lock; outcomes go to an append-only effect log).
+- `docs/SPEC.md` is Draft 0.9.
 - The earlier Manim explainer animation and its voice assets are in `../archive/` and are not needed.
 
 ## 6. Pending
 
 - [x] Run `/speckit-plan` for feature 001 (done 2026-10-18; artifacts in `specs/001-core-ledger-merge-engine/`).
-- [ ] Feature 001 forward-compat: the view cache key (research R-12) must gain an effect-log watermark when impure
-      computes arrive (Feature 2); no change needed now.
+- [x] Feature 001 forward-compat: the view cache key gained an effect-log watermark (`effects_seq`) with feature 002.
 - [x] `/speckit-tasks` and `/speckit-analyze` done (2026-10-18; third analysis pass had no critical or medium findings).
       Decided before tasks: request keys for retries (R-10), rejection reasons reported in stages (schema errors first),
       metadata-only audit scenario (US1 scenario 7, SC-013).
-- [ ] Next: review `specs/001-core-ledger-merge-engine/checklists/core-engine.md`, then `/speckit-implement`.
+- [x] Feature 001 checklists reviewed and implemented.
+- [ ] Feature 002: run `/speckit-analyze` and `/speckit-converge` on the implementation.
 - [x] **Where the first Python port's code lives**: `ports/py/` here until stable, then its own `aduku-py` repo
       (taken as the default in the plan; change freely). Conformance vectors stay in root `conformance/`.
 - [x] `docs/prompts/specify-features.md` Features 2, 3 and 4 prompts updated for model errors and the stand-alone
       deferred stage (2026-10-18).
-- [ ] Features 2 to 6 still to be specified, in the order in `docs/prompts/specify-features.md`.
+- [ ] Features 3 to 6 still to be specified, in the order in `docs/prompts/specify-features.md`.
 - [x] `aduku/` is its own git repository (`git init -b main`, 2026-10-18); nothing is committed yet.
 - [x] Open questions in `docs/SPEC.md` section 17: all 12 decided on 2026-10-18 (see the Decision lines there).
 - [ ] Check the name "Document Oriented Design" for collisions before using it publicly.

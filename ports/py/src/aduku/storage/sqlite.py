@@ -7,12 +7,20 @@ import threading
 import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from aduku.errors import StorageError
 from aduku.ion_codec import parse, to_canonical
 from aduku.model import Entry
-from aduku.storage.base import AuditRow, ConstraintError, RequestRecord, ViewRow, live
+from aduku.storage.base import (
+    AuditRow,
+    ConstraintError,
+    EffectRecord,
+    RequestRecord,
+    ViewRow,
+    effects_to_prune,
+    live,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
@@ -60,8 +68,31 @@ CREATE TABLE IF NOT EXISTS views (
     rules_fingerprint TEXT NOT NULL,
     document TEXT NOT NULL,
     model_errors TEXT NOT NULL,
-    provenance TEXT NOT NULL
+    provenance TEXT NOT NULL,
+    effects_seq INTEGER NOT NULL DEFAULT 0
 );
+
+-- Outcomes of impure computes (feature 002). Separate from the ledger; append-only except through prune_effects.
+CREATE TABLE IF NOT EXISTS effects (
+    effect_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc TEXT NOT NULL,
+    field TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    hook TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    value TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS effects_key ON effects (doc, field, fingerprint, hook);
+CREATE TABLE IF NOT EXISTS effects_pruning (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL);
+INSERT OR IGNORE INTO effects_pruning (id, active) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS effects_no_update BEFORE UPDATE ON effects
+BEGIN SELECT RAISE(ABORT, 'effects are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS effects_no_delete BEFORE DELETE ON effects
+WHEN (SELECT active FROM effects_pruning WHERE id = 1) = 0
+BEGIN SELECT RAISE(ABORT, 'effects are append-only'); END;
 
 -- Audit-only data: never read by derivation (SPEC 4.5).
 CREATE TABLE IF NOT EXISTS rejection_audit (
@@ -90,6 +121,21 @@ def _stamp(moment: datetime) -> str:
 
 def _unstamp(text: str) -> datetime:
     return datetime.strptime(text, TIME_FORMAT).replace(tzinfo=UTC)
+
+
+def _effect(row: sqlite3.Row) -> EffectRecord:
+    return EffectRecord(
+        doc=row["doc"],
+        field=row["field"],
+        fingerprint=row["fingerprint"],
+        hook=row["hook"],
+        outcome=row["outcome"],
+        value=row["value"],
+        error=row["error"],
+        attempts=row["attempts"],
+        recorded_at=_unstamp(row["recorded_at"]),
+        effect_seq=row["effect_seq"],
+    )
 
 
 def _entry(row: sqlite3.Row) -> Entry:
@@ -234,15 +280,17 @@ class _SqliteTx:
             row["document"],
             row["model_errors"],
             row["provenance"],
+            row["effects_seq"],
         )
 
     @live
     def put_view(self, view: ViewRow) -> None:
         self._c.execute(
-            "INSERT INTO views (doc, watermark_seq, schema_version, rules_fingerprint, document, model_errors, provenance)"
-            " VALUES (?,?,?,?,?,?,?) ON CONFLICT (doc) DO UPDATE SET watermark_seq = excluded.watermark_seq,"
+            "INSERT INTO views (doc, watermark_seq, schema_version, rules_fingerprint, document, model_errors, provenance,"
+            " effects_seq) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (doc) DO UPDATE SET watermark_seq = excluded.watermark_seq,"
             " schema_version = excluded.schema_version, rules_fingerprint = excluded.rules_fingerprint,"
-            " document = excluded.document, model_errors = excluded.model_errors, provenance = excluded.provenance",
+            " document = excluded.document, model_errors = excluded.model_errors, provenance = excluded.provenance,"
+            " effects_seq = excluded.effects_seq",
             (
                 view.doc,
                 view.watermark_seq,
@@ -251,12 +299,77 @@ class _SqliteTx:
                 view.document,
                 view.model_errors,
                 view.provenance,
+                view.effects_seq,
             ),
         )
 
     @live
     def drop_view(self, doc: str) -> None:
         self._c.execute("DELETE FROM views WHERE doc = ?", (doc,))
+
+    @live
+    def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
+        assigned: list[int] = []
+        for record in records:
+            cursor = self._c.execute(
+                "INSERT INTO effects (doc, field, fingerprint, hook, outcome, value, error, attempts, recorded_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    record.doc,
+                    record.field,
+                    record.fingerprint,
+                    record.hook,
+                    record.outcome,
+                    record.value,
+                    record.error,
+                    record.attempts,
+                    _stamp(record.recorded_at),
+                ),
+            )
+            assigned.append(int(cursor.lastrowid or 0))
+        return assigned
+
+    @live
+    def latest_effects(self, doc: str) -> list[EffectRecord]:
+        rows = self._c.execute(
+            "SELECT e.* FROM effects e WHERE e.doc = ? AND e.effect_seq = (SELECT MAX(effect_seq) FROM effects x"
+            " WHERE x.doc = e.doc AND x.field = e.field AND x.fingerprint = e.fingerprint AND x.hook = e.hook)"
+            " ORDER BY e.effect_seq",
+            (doc,),
+        )
+        return [_effect(row) for row in rows]
+
+    @live
+    def effects_seq(self, doc: str) -> int:
+        row = self._c.execute("SELECT MAX(effect_seq) FROM effects WHERE doc = ?", (doc,)).fetchone()
+        return int(row[0] or 0)
+
+    @live
+    def list_effects(self, doc: str, field: str | None = None, limit: int | None = None) -> list[EffectRecord]:
+        rows = self._c.execute(
+            "SELECT * FROM effects WHERE doc = ? AND (? IS NULL OR field = ?) ORDER BY effect_seq", (doc, field, field)
+        ).fetchall()
+        found = [_effect(row) for row in rows]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
+    @live
+    def prune_effects(
+        self, doc: str | None, now: datetime, keep: int = 5, max_age: timedelta = timedelta(days=90)
+    ) -> int:
+        rows = self._c.execute(
+            "SELECT * FROM effects WHERE (? IS NULL OR doc = ?) ORDER BY effect_seq", (doc, doc)
+        ).fetchall()
+        doomed = effects_to_prune([_effect(row) for row in rows], now, keep, max_age)
+        if not doomed:
+            return 0
+        self._c.execute("UPDATE effects_pruning SET active = 1 WHERE id = 1")
+        try:
+            for start in range(0, len(doomed), 500):
+                chunk = doomed[start : start + 500]
+                self._c.execute(f"DELETE FROM effects WHERE effect_seq IN ({','.join('?' * len(chunk))})", chunk)
+        finally:
+            self._c.execute("UPDATE effects_pruning SET active = 0 WHERE id = 1")
+        return len(doomed)
 
 
 class _SqliteReadTx(_SqliteTx):
@@ -412,6 +525,9 @@ class SqliteStorage:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(SCHEMA)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(views)")}
+            if "effects_seq" not in columns:  # a database made before feature 002
+                connection.execute("ALTER TABLE views ADD COLUMN effects_seq INTEGER NOT NULL DEFAULT 0")
         except sqlite3.Error as error:
             if connection is not None:
                 connection.close()  # do not leak the handle (and its locks) of a database that cannot be used

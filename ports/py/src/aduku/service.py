@@ -4,44 +4,51 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 from aduku.audit import AuditRecord, RejectionAudit
 from aduku.behaviors.registry import BehaviorRegistry
 from aduku.engine.admission import check_request
+from aduku.engine.compute import compute_fields, failure_mode_of
 from aduku.engine.derive import DerivationState, Prepared, prepare
+from aduku.engine.effects import EffectView, PendingCall, fingerprint, view_from_records
 from aduku.engine.explain import explain as explain_path
 from aduku.engine.model_errors import (
     Extension,
     Origin,
     Replay,
     advance,
+    can_have_errors,
     catch_up,
     extend,
-    has_validators,
     replay,
 )
 from aduku.engine.project import project
 from aduku.engine.request_hash import request_hash
 from aduku.engine.validate import ValidatorFault
-from aduku.errors import ErrorCode, Reason, RejectedError, SchemaError, StorageError
-from aduku.ion_codec import TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical
+from aduku.errors import ComputeFault, ErrorCode, Reason, RejectedError, SchemaError, StorageError
+from aduku.hooks import HookRunner
+from aduku.ion_codec import ABSENT, TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical
 from aduku.log import emit
 from aduku.model import (
     AppendResult,
     DocumentResult,
+    EffectInfo,
+    EffectRecord,
     Entry,
     EntryInput,
     Explanation,
     Identity,
     ModelError,
     RebuildReport,
+    RecomputeReport,
 )
 from aduku.paths import PathError, parse_path
-from aduku.schema.model import Schema
+from aduku.schema.model import Schema, conforms
 from aduku.schema.registry import SchemaRegistry
 from aduku.storage.base import Clock, ConstraintError, IdSource, RequestRecord, Storage, Tx, ViewRow
 
@@ -76,13 +83,14 @@ def _decode_errors(text: str) -> tuple[ModelError, ...]:
     )
 
 
-def _fits(view: ViewRow | None, last: int, schema: Schema) -> bool:
-    """A cached view serves a read only if it is of the latest entry and of this very version and rules."""
+def _fits(view: ViewRow | None, last: int, schema: Schema, effects_seq: int = 0) -> bool:
+    """A cached view serves a read only if it is of the latest entry and effect, and of this very version and rules."""
     return (
         view is not None
         and view.watermark_seq == last
         and view.schema_version == schema.version
         and view.rules_fingerprint == schema.rules_fingerprint
+        and view.effects_seq == effects_seq
     )
 
 
@@ -112,6 +120,18 @@ class _Cold(Exception):
     """The kept state is too far behind the ledger to catch up inside the write lock (internal)."""
 
 
+class _Flight:
+    """One hook call in progress, shared by everyone who needs the same outcome at the same moment."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.record: EffectRecord | None = None
+
+
+class _Pending(Exception):
+    """The document changed while its hooks ran, so some inputs have no outcome yet: call again outside the lock."""
+
+
 class Aduku:
     WARM_ATTEMPTS = 3
     CATCH_UP_LIMIT = 64  # entries another process may have appended since the fold, folded inside the lock
@@ -125,6 +145,7 @@ class Aduku:
         ids: IdSource | None = None,
         behaviors: BehaviorRegistry | None = None,
         state_cache_size: int = 256,
+        hook_runner: HookRunner | None = None,
     ) -> None:
         self.storage = storage
         self.schemas = schemas
@@ -136,9 +157,13 @@ class Aduku:
         # losing it only costs a derivation from the ledger.
         self._states: OrderedDict[str, DerivationState] = OrderedDict()
         self._views: OrderedDict[str, ViewRow] = OrderedDict()  # views derived by reads, which never write to storage
-        self._effects: OrderedDict[tuple[str, str, int, str], tuple[tuple[ModelError, ...], tuple[ModelError, ...]]] = (
-            OrderedDict()
-        )
+        self._hooks = hook_runner or HookRunner()
+        self._flights: dict[
+            tuple[str, str, str, str], _Flight
+        ] = {}  # calls in progress, by (doc, field, fingerprint, hook)
+        self._retried_effects: OrderedDict[
+            tuple[str, str, int, str], tuple[tuple[ModelError, ...], tuple[ModelError, ...]]
+        ] = OrderedDict()
         self._states_lock = threading.Lock()
         self._prepared: dict[
             tuple[str, int], Prepared
@@ -216,6 +241,7 @@ class Aduku:
         """
         for attempt in range(self.WARM_ATTEMPTS):
             self._warm(doc, schema, refresh=attempt > 0)
+            fresh = self._outcomes_for(schema, doc, entries, contributor, lenient)  # hooks run here, outside every lock
             try:
                 with self.storage.transaction() as tx:
                     return self._admit(
@@ -229,10 +255,13 @@ class Aduku:
                         request_key,
                         digest,
                         inline=attempt == self.WARM_ATTEMPTS - 1,
+                        fresh=fresh,
                     )
-            except _Cold:
+            except (_Cold, _Pending):
                 continue
-        raise AssertionError("the last attempt folds inline")
+        raise RejectedError(
+            ErrorCode.SEQ_CONFLICT, message="the document kept changing while its hooks ran; submit the request again"
+        )
 
     def _admit(
         self,
@@ -246,6 +275,7 @@ class Aduku:
         request_key: str | None,
         digest: str | None,
         inline: bool = True,
+        fresh: Sequence[EffectRecord] = (),
     ) -> tuple[AppendResult, DerivationState | None]:
         ready = self._engine(schema)
         if request_key is not None:
@@ -285,27 +315,36 @@ class Aduku:
                 ErrorCode.TYPE_MISMATCH, message=f"a value has no canonical Ion form: {error}"
             ) from error
         # Dry run: fold the request onto the document as it stands and validate the result, once for the whole request.
-        state, pending = self._load(tx, schema, doc, last)
-        if not inline and (len(pending) > self.CATCH_UP_LIMIT or (state is None and pending)):
+        effects = self._effect_view(tx, ready, doc)
+        stored_view = effects
+        if effects is not None and fresh:  # outcomes of hooks called for this request, not stored until it is accepted
+            effects = effects.with_outcomes(view_from_records(fresh))
+        state, behind = self._load(tx, schema, doc, last, effects.seq if effects else 0)
+        if not inline and (len(behind) > self.CATCH_UP_LIMIT or (state is None and behind)):
             raise _Cold  # nothing is written yet: fold outside the lock and come back
         try:
-            base = self._catch_up(schema, state, pending)
+            base = self._catch_up(schema, state, behind, effects)
             ext = extend(
-                schema, self.behaviors, ready, base, stored_entries, Origin(request_id=request_id), base.errors
+                schema, self.behaviors, ready, base, stored_entries, Origin(request_id=request_id), base.errors, effects
             )
         except ValidatorFault as fault:
             raise RejectedError(ErrorCode.VALIDATION_FAILED, message=str(fault)) from fault
+        except ComputeFault as fault:
+            raise RejectedError(ErrorCode.COMPUTE_FAULT, message=str(fault)) from fault
+        if ext.pending:
+            raise _Pending  # the document is not what the hooks were called for: nothing is written yet
         self.derivations += 1
         self._refuse_unusable(entries, stored_entries, base, ext)
-        if (
-            ext.added and not lenient
-        ):  # the flag, if given, was checked in check_request: only a permitted writer has it
+        self._refuse_failed_hooks(schema, fresh, ext)
+        # An impure failure under model_error_on_failure is recorded and does not count against the request (FR-024).
+        counted = [e for e in ext.added if not e.rule_id.startswith("impure:")]
+        if counted and not lenient:  # the flag, if given, was checked in check_request: only a permitted writer has it
             code = ErrorCode.MODEL_ERROR_INTRODUCED if base.errors else ErrorCode.VALIDATION_FAILED
             raise RejectedError(
                 code,
                 [
                     Reason(code, f"{e.rule_id} fails at {e.path_scope}: {e.message}", rule=e.rule_id, path=e.path_scope)
-                    for e in ext.added
+                    for e in counted
                 ],
             )
 
@@ -313,8 +352,15 @@ class Aduku:
             tx.append_request(RequestRecord(request_id, doc, contributor.id, request_key, digest), stored_entries)
         except ConstraintError as error:
             raise StorageError(f"ledger constraint violated: {error}") from error
+        state_now = ext.state
+        to_store = [
+            r for r in fresh if stored_view is not None and stored_view.lookup(r.field, r.fingerprint, r.hook) is None
+        ]
+        if to_store:  # the request is accepted: its outcomes become part of the log, in the same transaction
+            tx.append_effects(to_store)
+            state_now = replace(state_now, effects_seq=tx.effects_seq(doc))
         document, text = self._settle(ext.document)
-        tx.put_view(self._view_row(doc, last + len(stored_entries), schema, text, ext.state))
+        tx.put_view(self._view_row(doc, last + len(stored_entries), schema, text, state_now))
         result = AppendResult(
             entries=tuple((e.id, e.seq) for e in stored_entries),
             request_id=request_id,
@@ -322,7 +368,7 @@ class Aduku:
             model_errors_resolved=ext.resolved,
             view=project(document, ext.errors, ext.state.skipped, ext.conflicts),
         )
-        return result, ext.state
+        return result, state_now
 
     def _stored(
         self,
@@ -359,6 +405,31 @@ class Aduku:
             for offset, entry in enumerate(entries)
         ]
 
+    @staticmethod
+    def _refuse_failed_hooks(schema: Schema, fresh: Sequence[EffectRecord], ext: Extension) -> None:
+        """Under reject_on_failure, a hook that failed for this request rejects it; nothing, outcomes included, is kept."""
+        modes = {spec.pattern: failure_mode_of(schema, spec) for spec in schema.fields if spec.impure is not None}
+        failed = [
+            record
+            for record in fresh
+            if record.outcome == "failure"
+            and modes.get(record.field) == "reject_on_failure"
+            and any(error.rule_id == f"impure:{record.field}" for error in ext.errors)
+        ]
+        if failed:
+            raise RejectedError(
+                ErrorCode.IMPURE_COMPUTE_FAILED,
+                [
+                    Reason(
+                        ErrorCode.IMPURE_COMPUTE_FAILED,
+                        f"{record.hook} failed for {record.field} ({record.error}) after {record.attempts} attempt(s)",
+                        rule=f"impure:{record.field}",
+                        path=record.field,
+                    )
+                    for record in failed
+                ],
+            )
+
     def _refuse_unusable(
         self, entries: list[EntryInput], stored: list[Entry], base: DerivationState, ext: Extension
     ) -> None:
@@ -386,15 +457,16 @@ class Aduku:
 
     def _with_effects(self, schema: Schema, doc: str, result: AppendResult) -> AppendResult:
         """What an earlier request did to the model errors, found by replaying the ledger (to answer a retry)."""
-        if not has_validators(schema):
+        if not can_have_errors(schema):
             return result
         key = (doc, result.request_id, schema.version, schema.rules_fingerprint)
         with self._states_lock:
-            memo = self._effects.get(key)
+            memo = self._retried_effects.get(key)
         if memo is None:  # the ledger never changes, so what a request did never changes: work it out once
             with self.storage.read() as tx:
                 entries = tx.entries(doc, 0)
-            replayed = self._replay(schema, entries, capture=result.request_id)
+                effects = self._effect_view(tx, self._engine(schema), doc)
+            replayed = self._replay(schema, entries, capture=result.request_id, effects=effects)
             before = {e.identity for e in replayed.before}
             after = {e.identity for e in replayed.after}
             memo = (
@@ -402,9 +474,9 @@ class Aduku:
                 tuple(e for e in replayed.before if e.identity not in after),
             )
             with self._states_lock:
-                self._effects[key] = memo
-                while len(self._effects) > self.state_cache_size:
-                    self._effects.popitem(last=False)
+                self._retried_effects[key] = memo
+                while len(self._retried_effects) > self.state_cache_size:
+                    self._retried_effects.popitem(last=False)
         return replace(result, model_errors_added=memo[0], model_errors_resolved=memo[1])
 
     def _record_rejection(
@@ -435,15 +507,22 @@ class Aduku:
         by `append` and `rebuild`.
         """
         schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
         with self.storage.read() as tx:
             last = tx.last_seq(doc)
+            effects = self._effect_view(tx, ready, doc)
+            seen = effects.seq if effects else 0
             view = tx.get_view(doc)
-            if not _fits(view, last, schema):
+            if not _fits(view, last, schema, seen):
                 view = self._kept_view(doc)
-            if view is not None and _fits(view, last, schema):
+            if view is not None and _fits(view, last, schema, seen):
                 return _decode_view(view)
-            state, entries = self._load(tx, schema, doc, last)
-        ext = self._rebuild(schema, state, entries)  # outside the read transaction
+            state, entries = self._load(tx, schema, doc, last, seen)
+        ext = self._rebuild(schema, state, entries, effects)  # outside the read transaction
+        if ext.pending:  # impure fields with no outcome for their inputs: call the hooks, record, and derive again
+            ext, effects = self._fill(
+                schema, doc, ext, effects or EffectView(), lambda view: self._rebuild(schema, state, entries, view)
+            )
         self.derivations += 1
         self._remember(doc, ext.state)
         document, text = self._settle(ext.document)
@@ -463,10 +542,14 @@ class Aduku:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"invalid path: {error}") from error
         if schema.field_for(parsed) is None:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message="the schema does not declare this path")
+        ready = self._engine(schema)
+        if ready.has_impure:
+            self.get(doc)  # makes sure every impure field has an outcome for its current inputs
         with self.storage.read() as tx:
             entries = tx.entries(doc, 0)
-        errors = self._replay(schema, entries).final.errors  # of the same entries, so one snapshot
-        return explain_path(schema, self.behaviors, self._engine(schema), entries, path, errors)
+            effects = self._effect_view(tx, ready, doc)
+        errors = self._replay(schema, entries, effects=effects).final.errors  # of the same entries, so one snapshot
+        return explain_path(schema, self.behaviors, ready, entries, path, errors, effects)
 
     def _kept_view(self, doc: str) -> ViewRow | None:
         with self._states_lock:
@@ -501,7 +584,12 @@ class Aduku:
         for name in names:
             try:
                 outcome = self._rebuild_one(name)
-            except (ValidatorFault, RejectedError, SchemaError) as error:  # this document only: go on with the rest
+            except (
+                ValidatorFault,
+                ComputeFault,
+                RejectedError,
+                SchemaError,
+            ) as error:  # this document only: go on with the rest
                 failed.append(
                     (name, f"{getattr(getattr(error, 'code', None), 'value', type(error).__name__)}: {error}")
                 )
@@ -516,13 +604,23 @@ class Aduku:
 
     def _rebuild_one(self, doc: str) -> str:
         schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
         with self.storage.read() as tx:
             last = tx.last_seq(doc)
             cached = tx.get_view(doc)
             entries = tx.entries(doc, 0)
+            effects = self._effect_view(tx, ready, doc)
         if last == 0:  # no entries: nothing to derive, cache or compare
             return "same"
-        ext = self._replay(schema, entries).final  # from the ledger alone: no kept state is trusted
+        ext = self._replay(schema, entries, effects=effects).final  # from the ledger alone: no kept state is trusted
+        if ext.pending:
+            ext, effects = self._fill(
+                schema,
+                doc,
+                ext,
+                effects or EffectView(),
+                lambda view: self._replay(schema, entries, effects=view).final,
+            )
         self.derivations += 1
         _, text = self._settle(ext.document)
         fresh = self._view_row(doc, last, schema, text, ext.state)
@@ -532,7 +630,7 @@ class Aduku:
         with self.storage.transaction() as tx:  # repair, unless something was appended in the meantime
             if tx.last_seq(doc) == last:
                 tx.put_view(fresh)
-        return "differs" if _fits(cached, last, schema) else "refreshed"
+        return "differs" if _fits(cached, last, schema, fresh.effects_seq) else "refreshed"
 
     def _engine(self, schema: Schema) -> Prepared:
         with self._states_lock:
@@ -541,12 +639,18 @@ class Aduku:
                 ready = self._prepared[(schema.id, schema.version)] = prepare(schema, self.behaviors)
             return ready
 
-    def _load(self, tx: Tx, schema: Schema, doc: str, last: int) -> tuple[DerivationState | None, list[Entry]]:
-        """The kept state if it fits this schema, and the entries it has not folded in yet."""
+    def _load(
+        self, tx: Tx, schema: Schema, doc: str, last: int, effects_seq: int = 0
+    ) -> tuple[DerivationState | None, list[Entry]]:
+        """The kept state if it fits this schema and this effect log, and the entries it has not folded in yet."""
         with self._states_lock:
             state = self._states.get(doc)
-        if state is not None and (state.schema_ref is not schema or state.watermark > last):
-            state = None  # built under other rules (or ahead of the ledger): start again from the ledger
+        if state is not None and (
+            state.schema_ref is not schema or state.watermark > last or state.effects_seq != effects_seq
+        ):
+            state = (
+                None  # built under other rules or an older log (or ahead of the ledger): start again from the ledger
+            )
         entries = tx.entries(doc, state.watermark if state else 0)
         if state is not None and any(e.schema_version != schema.version for e in entries):
             state, entries = (
@@ -555,19 +659,191 @@ class Aduku:
             )  # written under other rules: attribute as a replay of the ledger does
         return state, entries
 
-    def _replay(self, schema: Schema, entries: list[Entry], capture: str | None = None) -> Replay:
-        return replay(schema, self.schemas.get, self.behaviors, self._engine, entries, capture)
+    def _replay(
+        self, schema: Schema, entries: list[Entry], capture: str | None = None, effects: EffectView | None = None
+    ) -> Replay:
+        return replay(schema, self.schemas.get, self.behaviors, self._engine, entries, capture, effects)
 
-    def _rebuild(self, schema: Schema, state: DerivationState | None, entries: list[Entry]) -> Extension:
+    def _rebuild(
+        self, schema: Schema, state: DerivationState | None, entries: list[Entry], effects: EffectView | None = None
+    ) -> Extension:
         """The document, with its errors, from a kept state plus new entries, or from the whole ledger."""
         if state is None:
-            return self._replay(schema, entries).final
-        return advance(schema, self.behaviors, self._engine(schema), state, entries)
+            return self._replay(schema, entries, effects=effects).final
+        return advance(schema, self.behaviors, self._engine(schema), state, entries, effects)
 
-    def _catch_up(self, schema: Schema, state: DerivationState | None, entries: list[Entry]) -> DerivationState:
+    def _catch_up(
+        self,
+        schema: Schema,
+        state: DerivationState | None,
+        entries: list[Entry],
+        effects: EffectView | None = None,
+    ) -> DerivationState:
         if state is None:
-            return self._replay(schema, entries).final.state
-        return catch_up(schema, self.behaviors, self._engine(schema), state, entries)
+            return self._replay(schema, entries, effects=effects).final.state
+        return catch_up(schema, self.behaviors, self._engine(schema), state, entries, effects)
+
+    # -- impure computes: the effect log and the hooks -------------------------------------------------------------
+
+    @staticmethod
+    def _effect_view(tx: Tx, ready: Prepared, doc: str) -> EffectView | None:
+        """The outcomes in force for a document, or None when its schema has no impure fields."""
+        return view_from_records(tx.latest_effects(doc)) if ready.has_impure else None
+
+    def _call_hooks(
+        self, schema: Schema, doc: str, calls: Sequence[PendingCall], shared: bool = True
+    ) -> list[EffectRecord]:
+        """Call the hooks a derivation needs. Each result, a value or a failure, becomes a record; nothing is stored here.
+
+        Callers that need the same outcome at the same moment share one call (`shared`); a `recompute` never does.
+        """
+        fields = {spec.pattern: spec for spec in schema.fields if spec.impure is not None}
+        records: list[EffectRecord] = []
+        for call in calls:
+            if shared:
+                records.append(self._one_flight(doc, call, partial(self._call_one, schema, fields, doc, call)))
+            else:
+                records.append(self._call_one(schema, fields, doc, call))
+        return records
+
+    def _one_flight(self, doc: str, call: PendingCall, produce: Callable[[], EffectRecord]) -> EffectRecord:
+        key = (doc, call.field, call.fingerprint, call.hook)
+        with self._states_lock:
+            flight = self._flights.get(key)
+            leading = flight is None
+            if flight is None:
+                flight = self._flights[key] = _Flight()
+        if not leading:
+            flight.done.wait()
+            if flight.record is not None:
+                return flight.record
+            return produce()  # the leader failed to produce a record: do it ourselves
+        try:
+            flight.record = produce()
+            return flight.record
+        finally:
+            flight.done.set()
+            with self._states_lock:
+                self._flights.pop(key, None)
+
+    def _call_one(self, schema: Schema, fields: dict[str, Any], doc: str, call: PendingCall) -> EffectRecord:
+        spec = fields[call.field]
+        impure = spec.impure
+        assert impure is not None
+        behavior = self.behaviors.get(impure.hook, impure.version)
+        assert behavior is not None and behavior.kind == "hook"  # checked when the schema was loaded
+        result = self._hooks.run(behavior.impl, impure, dict(call.inputs))
+        value, error = result.value, result.error
+        if result.outcome == "value" and spec.type is not None and not conforms(spec.type, value):
+            value, error = None, "bad_value"  # the hook answered with a value of the wrong type
+        succeeded = error is None and result.outcome == "value"
+        emit(
+            "hook_call",
+            doc=doc,
+            field=call.field,
+            hook=call.hook,
+            attempts=result.attempts,
+            result="value" if succeeded else "failure",
+        )
+        return EffectRecord(
+            doc=doc,
+            field=call.field,
+            fingerprint=call.fingerprint,
+            hook=call.hook,
+            outcome="value" if succeeded else "failure",
+            value=to_canonical(normalize(value)) if succeeded else None,
+            error=error,
+            attempts=result.attempts,
+            recorded_at=self.clock.now(),
+        )
+
+    def _fill(
+        self,
+        schema: Schema,
+        doc: str,
+        ext: Extension,
+        effects: EffectView,
+        derive: Callable[[EffectView], Extension],
+    ) -> tuple[Extension, EffectView]:
+        """For a read: call the hooks a derivation still needs, record their outcomes, and derive again until none is.
+
+        The calls happen outside every transaction; the outcomes are stored in a short write transaction of their own.
+        """
+        for _ in range(sum(1 for spec in schema.fields if spec.impure is not None) + 1):
+            if not ext.pending:
+                break
+            records = self._call_hooks(schema, doc, ext.pending)
+            with self.storage.transaction() as tx:
+                known = view_from_records(tx.latest_effects(doc))  # a caller that shared the call may have stored it
+                new = [r for r in records if known.lookup(r.field, r.fingerprint, r.hook) is None]
+                numbers = tx.append_effects(new)
+            stored = [replace(record, effect_seq=number) for record, number in zip(new, numbers, strict=True)]
+            effects = effects.with_outcomes(known).with_outcomes(view_from_records(stored))
+            ext = derive(effects)
+        return ext, effects
+
+    def _outcomes_for(
+        self, schema: Schema, doc: str, entries: list[EntryInput], contributor: Identity, lenient: bool
+    ) -> list[EffectRecord]:
+        """Before the write lock is taken: derive what the request would produce and call the hooks it needs.
+
+        Returns the outcomes (stored only if the request is accepted). A request that fails the schema checks calls no
+        hook. Any problem here is left for the transaction to report, with the outcomes found so far.
+        """
+        ready = self._engine(schema)
+        if not ready.has_impure:
+            return []
+        fresh: list[EffectRecord] = []
+        try:
+            with self.storage.read() as tx:
+                last = tx.last_seq(doc)
+                effects = self._effect_view(tx, ready, doc) or EffectView()
+                state, behind = self._load(tx, schema, doc, last, effects.seq)
+            if check_request(schema, entries, contributor, lenient, self.behaviors, ctx=ready.ctx):
+                return []
+            now = self.clock.now()
+            provisional = [
+                Entry(
+                    id=f"provisional-{offset}",
+                    doc=doc,
+                    seq=last + 1 + offset,
+                    request_id="provisional",
+                    tier=entry.tier,
+                    path=entry.path,
+                    op=entry.op,
+                    value=TOMBSTONE if entry.op == "delete" else normalize(entry.value),
+                    contributor=contributor.id,
+                    tx_time=now,
+                    schema_version=schema.version,
+                    lenient=lenient,
+                )
+                for offset, entry in enumerate(entries)
+            ]
+            base = self._catch_up(schema, state, behind, effects)
+            ext = extend(
+                schema, self.behaviors, ready, base, provisional, Origin(request_id="provisional"), base.errors, effects
+            )
+            for _ in range(sum(1 for spec in schema.fields if spec.impure is not None) + 1):
+                if not ext.pending:
+                    break
+                new = self._call_hooks(schema, doc, ext.pending)
+                fresh.extend(new)
+                effects = effects.with_outcomes(view_from_records(new))
+                ext = extend(
+                    schema,
+                    self.behaviors,
+                    ready,
+                    base,
+                    provisional,
+                    Origin(request_id="provisional"),
+                    base.errors,
+                    effects,
+                )
+            return fresh
+        except (ValidatorFault, ComputeFault, RejectedError, IonError):
+            # Derive again in the transaction with what the hooks answered so far: it meets the same fault and rejects
+            # with its own code. Dropping the answers would leave the request waiting for hooks it can never settle.
+            return fresh
 
     def _warm(self, doc: str, schema: Schema, refresh: bool = False) -> None:
         """Make sure an in-memory state exists (and, if `refresh`, is current), folding outside every write transaction.
@@ -582,10 +858,11 @@ class Aduku:
         try:
             with self.storage.read() as tx:
                 last = tx.last_seq(doc)
-                state, entries = self._load(tx, schema, doc, last)
+                effects = self._effect_view(tx, self._engine(schema), doc)
+                state, entries = self._load(tx, schema, doc, last, effects.seq if effects else 0)
             if entries:
-                self._remember(doc, self._catch_up(schema, state, entries))
-        except (ValidatorFault, RejectedError):
+                self._remember(doc, self._catch_up(schema, state, entries, effects))
+        except (ValidatorFault, ComputeFault, RejectedError):
             return
 
     @staticmethod
@@ -597,7 +874,14 @@ class Aduku:
     def _view_row(self, doc: str, last: int, schema: Schema, text: str, state: DerivationState) -> ViewRow:
         notes = FrozenStruct({"skipped": tuple(state.skipped), "conflicts": state.conflicts})
         return ViewRow(
-            doc, last, schema.version, schema.rules_fingerprint, text, _encode_errors(state.errors), to_canonical(notes)
+            doc,
+            last,
+            schema.version,
+            schema.rules_fingerprint,
+            text,
+            _encode_errors(state.errors),
+            to_canonical(notes),
+            state.effects_seq,
         )
 
     def _remember(self, doc: str, folded: DerivationState) -> None:
@@ -616,6 +900,81 @@ class Aduku:
     def last_seq(self, doc: str) -> int:
         with self.storage.read() as tx:
             return tx.last_seq(doc)
+
+    # -- effect log admin ----------------------------------------------------------------------------------------
+
+    def list_effects(self, doc: str, field: str | None = None, *, limit: int | None = None) -> list[EffectInfo]:
+        """The outcomes of impure computes recorded for a document, oldest first. Metadata only: no value, no error text."""
+        with self.storage.read() as tx:
+            records = tx.list_effects(doc, field, limit)
+        return [
+            EffectInfo(r.effect_seq or 0, r.doc, r.field, r.hook, r.outcome, r.attempts, r.recorded_at) for r in records
+        ]
+
+    def recompute(self, doc: str, field: str | None = None, *, caller: Identity) -> RecomputeReport:
+        """Call impure hooks again with the current inputs and record the outcomes, which supersede the earlier ones.
+
+        Only the tiers and roles a field lists in `recompute_by` may recompute it: naming a field the caller may not
+        recompute is refused (NOT_AUTHORIZED); without a field, only the permitted ones are recomputed and the rest are
+        reported as skipped. A successful outcome removes the failure's model error on the next derivation.
+        """
+        schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
+        impure_fields = [spec for spec in ready.computed if spec.impure is not None]
+        if field is not None:
+            chosen = [spec for spec in impure_fields if spec.pattern == field]
+            if not chosen:
+                raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"{field} is not an impure computed field")
+        else:
+            chosen = impure_fields
+        held = {*caller.tiers, *caller.roles}
+        permitted = [spec for spec in chosen if held & set(spec.impure.recompute_by if spec.impure else ())]
+        if field is not None and not permitted:
+            raise RejectedError(ErrorCode.NOT_AUTHORIZED, message=f"{caller.id} may not recompute {field}")
+        skipped = tuple(sorted(spec.pattern for spec in chosen if spec not in permitted))
+        with self.storage.read() as tx:
+            entries = tx.entries(doc, 0)
+            effects = self._effect_view(tx, ready, doc)
+        document = self._replay(schema, entries, effects=effects).final.document
+        results = compute_fields(schema, self.behaviors, document, ready.computed, effects).results
+        failed: list[tuple[str, str]] = []
+        calls: list[PendingCall] = []
+        for spec in sorted(permitted, key=lambda s: s.pattern):
+            current = results.get(spec.pattern)
+            if current is None or any(v is ABSENT or v is None for _, v in current.dependencies):
+                failed.append((spec.pattern, "missing_input"))
+            else:
+                hook = current.source
+                calls.append(
+                    PendingCall(spec.pattern, hook, current.dependencies, fingerprint(hook, current.dependencies))
+                )
+        records = self._call_hooks(schema, doc, calls, shared=False)  # an explicit new call, never a shared one
+        numbers: list[int] = []
+        if records:
+            with self.storage.transaction() as tx:
+                numbers = tx.append_effects(records)
+        recomputed: list[str] = []
+        effect_seqs: list[tuple[str, int]] = []
+        for record, number in zip(records, numbers, strict=True):
+            if record.outcome == "value":
+                recomputed.append(record.field)
+                effect_seqs.append((record.field, number))
+            else:
+                failed.append((record.field, record.error or "error"))
+        emit(
+            "recompute",
+            doc=doc,
+            caller=caller.id,
+            recomputed=recomputed,
+            failed=[name for name, _ in sorted(failed)],
+            skipped=list(skipped),
+        )
+        return RecomputeReport(tuple(recomputed), skipped, tuple(sorted(failed)), tuple(effect_seqs))
+
+    def prune_effects(self, doc: str | None = None) -> int:
+        """Remove superseded outcomes beyond the newest 5 per key and those older than 90 days. Nothing derived changes."""
+        with self.storage.transaction() as tx:
+            return tx.prune_effects(doc, self.clock.now())
 
     # -- rejection audit admin -----------------------------------------------------------------------------------
 

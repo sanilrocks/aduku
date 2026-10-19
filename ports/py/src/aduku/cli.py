@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -11,10 +12,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from aduku.audit import AuditRecord
+from aduku.behaviors.registry import BehaviorRegistry
 from aduku.errors import AdukuError, RejectedError, SchemaError
-from aduku.ion_codec import FrozenStruct, IonError, parse, to_canonical
+from aduku.ion_codec import ABSENT, FrozenStruct, IonError, parse, to_canonical
 from aduku.model import Entry, EntryInput, Identity, ModelError
 from aduku.schema.loader import load_schema
+from aduku.schema.model import Schema
 from aduku.schema.registry import SchemaRegistry
 from aduku.service import Aduku
 from aduku.storage.sqlite import SqliteStorage
@@ -40,6 +43,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=os.environ.get("ADUKU_DB", "aduku.db"))
     parser.add_argument("--schema", default=os.environ.get("ADUKU_SCHEMA"))
     parser.add_argument("--format", choices=("json", "ion"), default="json")
+    parser.add_argument(
+        "--behaviors",
+        default=os.environ.get("ADUKU_BEHAVIORS"),
+        metavar="MODULE",
+        help="a module with a register(behaviors) function that registers custom macros and hooks",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     append = sub.add_parser("append", help="submit one atomic request")
@@ -58,6 +67,20 @@ def _parser() -> argparse.ArgumentParser:
 
     rebuild = sub.add_parser("rebuild", help="re-derive from the ledger and compare with the cached views")
     rebuild.add_argument("doc", nargs="?")
+
+    recompute = sub.add_parser("recompute", help="call impure hooks again with the current inputs")
+    recompute.add_argument("doc")
+    recompute.add_argument("field", nargs="?")
+    recompute.add_argument("--contributor", required=True)
+    recompute.add_argument("--tier", required=True)
+    recompute.add_argument("--role", action="append", default=[], help="a role the caller holds (repeatable)")
+
+    effects = sub.add_parser("effects", help="the outcomes of impure computes")
+    effects_sub = effects.add_subparsers(dest="effects_command", required=True)
+    effects_list = effects_sub.add_parser("list")
+    effects_list.add_argument("doc")
+    effects_list.add_argument("field", nargs="?")
+    effects_sub.add_parser("prune").add_argument("doc", nargs="?")
 
     explain = sub.add_parser("explain", help="why a field has its value")
     explain.add_argument("doc")
@@ -103,6 +126,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
 
+def _behaviors(args: argparse.Namespace) -> BehaviorRegistry:
+    """The built-in behaviors, plus those registered by the module named with --behaviors."""
+    registry = BehaviorRegistry.with_builtins()
+    if args.behaviors:
+        try:
+            module = importlib.import_module(args.behaviors)
+        except ImportError as error:
+            raise _UsageError(f"cannot import the behaviors module {args.behaviors!r}: {error}") from error
+        register = getattr(module, "register", None)
+        if not callable(register):
+            raise _UsageError(f"the behaviors module {args.behaviors!r} has no register(behaviors) function")
+        register(registry)
+    return registry
+
+
+def _inventory(schema: Schema) -> dict[str, Any]:
+    """What `schema check` says about computed fields and, above all, about impure computes (SPEC 9.3.1 item 7)."""
+    computed = [
+        {
+            "field": spec.pattern,
+            "macro": f"{spec.computed.macro}@{spec.computed.version}",
+            "args": [arg.path if arg.path is not None else to_canonical(arg.literal) for arg in spec.computed.args],
+            "on_missing": spec.on_missing,
+        }
+        for spec in schema.fields
+        if spec.computed is not None
+    ]
+    impure = [
+        {
+            "field": spec.pattern,
+            "hook": f"{spec.impure.hook}@{spec.impure.version}",
+            "depends": list(spec.impure.depends),
+            "reason": spec.impure.reason,
+            "timeout": spec.impure.timeout,
+            "retry": {"max": spec.impure.retry_max, "backoff": spec.impure.backoff},
+            "deadline": spec.impure.deadline,
+            "recompute_by": list(spec.impure.recompute_by),
+            "failure_mode": spec.impure.failure_mode or spec.failure_mode or schema.impure_failure_mode,
+        }
+        for spec in schema.fields
+        if spec.impure is not None
+    ]
+    return {"computed": computed, "impure": impure}
+
+
 def _check_schema(args: argparse.Namespace) -> int:
     """Exit 0 with a summary if the schema loads; exit 2 with every problem (and its stable code) if not."""
     try:
@@ -111,7 +179,7 @@ def _check_schema(args: argparse.Namespace) -> int:
     except OSError as error:
         raise _UsageError(f"cannot read schema: {error}") from error
     try:
-        schema = load_schema(text)
+        schema = load_schema(text, _behaviors(args))
     except SchemaError as error:
         _emit(args, {"ok": False, "problems": list(error.problems), "codes": list(error.codes)})
         for problem in error.problems:
@@ -131,6 +199,7 @@ def _check_schema(args: argparse.Namespace) -> int:
             "fields": len(schema.fields),
             "merge_rules": rules,
             "derived": [spec.pattern for spec in schema.fields if spec.derived],
+            **_inventory(schema),
         },
     )
     return 0
@@ -139,15 +208,16 @@ def _check_schema(args: argparse.Namespace) -> int:
 def _service(args: argparse.Namespace) -> Aduku:
     if not args.schema:
         raise _UsageError("no schema: pass --schema PATH or set ADUKU_SCHEMA")
+    behaviors = _behaviors(args)
     try:
         with open(args.schema, encoding="utf-8") as handle:
-            schema = load_schema(handle.read())
+            schema = load_schema(handle.read(), behaviors)
     except OSError as error:
         raise _UsageError(f"cannot read schema: {error}") from error
     registry = SchemaRegistry()
     registry.put(schema)
     registry.activate(schema.version)
-    return Aduku(SqliteStorage(args.db), registry)
+    return Aduku(SqliteStorage(args.db), registry, behaviors=behaviors)
 
 
 def _run(args: argparse.Namespace, service: Aduku) -> int:
@@ -167,6 +237,30 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                 },
             )
             return 0
+        if args.command == "recompute":
+            return _recompute(args, service)
+        if args.command == "effects":
+            if args.effects_command == "list":
+                found = service.list_effects(args.doc, args.field)
+                _emit(
+                    args,
+                    {
+                        "effects": [
+                            {
+                                "effect_seq": e.effect_seq,
+                                "field": e.field,
+                                "hook": e.hook,
+                                "outcome": e.outcome,
+                                "attempts": e.attempts,
+                                "recorded_at": e.recorded_at.isoformat(),
+                            }
+                            for e in found
+                        ]
+                    },
+                )
+            else:
+                _emit(args, {"pruned": service.prune_effects(args.doc)})
+            return 0
         if args.command == "explain":
             why = service.explain(args.doc, args.path)
             _emit(
@@ -180,6 +274,11 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     "inputs": list(why.inputs),
                     "shadowed": list(why.shadowed),
                     "model_errors": [_model_error(e) for e in why.model_errors],
+                    "dependencies": [
+                        {"path": path, "value": None if value is ABSENT else to_canonical(value)}
+                        for path, value in why.dependencies
+                    ],
+                    "effect_seq": why.effect_seq,
                 },
             )
             return 0
@@ -202,6 +301,27 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
         return _audit(args, service)
     finally:
         service.storage.close()
+
+
+def _recompute(args: argparse.Namespace, service: Aduku) -> int:
+    caller = Identity(args.contributor, (args.tier,), tuple(args.role))
+    try:
+        report = service.recompute(args.doc, args.field, caller=caller)
+    except RejectedError as rejection:
+        _emit(args, {"rejected": {"code": rejection.code.value, "reasons": [_reason(r) for r in rejection.reasons]}})
+        for reason in rejection.reasons:
+            print(f"{reason.code.value}: {reason.message}", file=sys.stderr)
+        return 1
+    _emit(
+        args,
+        {
+            "recomputed": list(report.recomputed),
+            "skipped": list(report.skipped),
+            "failed": [{"field": name, "kind": kind} for name, kind in report.failed],
+            "effect_seqs": [{"field": name, "effect_seq": number} for name, number in report.effect_seqs],
+        },
+    )
+    return 1 if report.failed else 0
 
 
 def _append(args: argparse.Namespace, service: Aduku) -> int:

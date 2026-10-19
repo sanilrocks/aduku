@@ -7,18 +7,19 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from ulid import ULID
 
-from aduku.model import Entry
+from aduku.model import EffectRecord, Entry
 
 __all__ = [
     "AuditBackend",
     "AuditRow",
     "Clock",
     "ConstraintError",
+    "EffectRecord",
     "FakeClock",
     "IdSource",
     "RequestRecord",
@@ -28,6 +29,7 @@ __all__ = [
     "Tx",
     "UlidIdSource",
     "ViewRow",
+    "effects_to_prune",
     "live",
 ]
 
@@ -51,6 +53,23 @@ class ConstraintError(Exception):
     """A ledger constraint was violated (non-consecutive seq, reused idempotency key or request key)."""
 
 
+def effects_to_prune(records: Sequence[EffectRecord], now: datetime, keep: int, max_age: timedelta) -> list[int]:
+    """The `effect_seq` of each record to remove: superseded ones beyond the newest `keep` of their key, and superseded
+    ones older than `max_age`. The latest record of a key (the one in force) is never listed."""
+    by_key: dict[tuple[str, str, str, str], list[EffectRecord]] = {}
+    for record in sorted(records, key=lambda r: r.effect_seq or 0):
+        by_key.setdefault((record.doc, record.field, record.fingerprint, record.hook), []).append(record)
+    cutoff = now - max_age
+    doomed: list[int] = []
+    for group in by_key.values():
+        superseded = group[:-1]
+        for index, record in enumerate(superseded):
+            too_many = index < len(superseded) - keep
+            if (too_many or record.recorded_at < cutoff) and record.effect_seq is not None:
+                doomed.append(record.effect_seq)
+    return doomed
+
+
 @dataclass(frozen=True)
 class RequestRecord:
     request_id: str
@@ -71,6 +90,7 @@ class ViewRow:
     document: str
     model_errors: str
     provenance: str
+    effects_seq: int = 0  # the greatest effect-log sequence number the view was derived with (feature 002)
 
 
 @dataclass(frozen=True)
@@ -143,6 +163,25 @@ class Tx(Protocol):
     def get_view(self, doc: str) -> ViewRow | None: ...
 
     def put_view(self, view: ViewRow) -> None: ...
+
+    def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
+        """Append outcomes of impure computes to the effect log; returns the sequence numbers assigned, in order."""
+
+    def latest_effects(self, doc: str) -> list[EffectRecord]:
+        """The outcome in force (the greatest `effect_seq`) for each (field, fingerprint, hook) of a document."""
+
+    def effects_seq(self, doc: str) -> int:
+        """The greatest `effect_seq` recorded for a document, 0 if none."""
+
+    def list_effects(self, doc: str, field: str | None = None, limit: int | None = None) -> list[EffectRecord]:
+        """Oldest first; `limit` keeps the newest N."""
+
+    def prune_effects(
+        self, doc: str | None, now: datetime, keep: int = 5, max_age: timedelta = timedelta(days=90)
+    ) -> int:
+        """Remove superseded outcomes beyond the newest `keep` per key and those older than `max_age`; returns how many.
+
+        The outcome in force is never removed, so no derivation changes."""
 
     def drop_view(self, doc: str) -> None: ...
 

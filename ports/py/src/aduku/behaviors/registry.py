@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from aduku.errors import SchemaError
+from aduku.expr.errors import ExprError
+from aduku.expr.evaluator import Compiled, compile_expression
+from aduku.expr.limits import Limits
 
-__all__ = ["Behavior", "BehaviorRegistry", "Laws"]
+__all__ = ["Behavior", "BehaviorRegistry", "Laws", "MacroImpl", "PRESET_NAMES"]
 
 
 @dataclass(frozen=True)
@@ -18,14 +21,56 @@ class Laws:
     idempotent: bool = False
 
 
+# Names of the ready-made macros (SPEC 9.3). They are reserved: no custom macro or hook may take one.
+PRESET_NAMES = frozenset(
+    {
+        "upper",
+        "lower",
+        "trim",
+        "concat",
+        "coalesce",
+        "len",
+        "sum",
+        "min",
+        "max",
+        "round",
+        "format_ts",
+        "hash",
+        "join",
+        "if",
+        "eq",
+    }
+)
+
+
+@dataclass(frozen=True)
+class MacroImpl:
+    """A registered custom macro: a compiled expression, and whether it runs when an input is missing."""
+
+    name: str
+    version: int
+    program: Compiled
+    accepts_missing: bool
+
+    @property
+    def params(self) -> tuple[str, ...]:
+        return self.program.params
+
+    def call(self, args: Sequence[Any]) -> Any:
+        """The value for these arguments. Raises ExprFault (a limit, or a type error in the expression)."""
+        return self.program.run(args)
+
+    __call__ = call  # a macro is a behavior like any other: its `impl` is callable
+
+
 @dataclass(frozen=True)
 class Behavior:
     name: str
     version: int
-    kind: Literal["merge", "validate"]
+    kind: Literal["merge", "validate", "macro", "hook"]
     impl: Callable[..., Any]
     laws: Laws = Laws()
-    purity: Literal["pure"] = "pure"
+    purity: Literal["pure", "io"] = "pure"
     # Kinds of schema type the behavior can merge (see schema.model.parse_type); None means any type.
     applies_to: tuple[str, ...] | None = None
     # True for a rule that merges a struct child by child: writes of struct values are spread over the child paths.
@@ -66,7 +111,36 @@ class BehaviorRegistry:
     ) -> Behavior:
         return self._add(Behavior(name, version, "validate", check, check_args=check_args))
 
+    def register_macro(
+        self,
+        name: str,
+        version: int,
+        params: Sequence[str],
+        expression: str,
+        *,
+        accepts_missing: bool = False,
+        limits: Mapping[str, int] | None = None,
+    ) -> Behavior:
+        """A custom macro: `expression` over the named `params`, run in the sandbox of `expr/` (feature 002).
+
+        `limits` may name any of steps, expression_chars, depth, value_bytes, input_bytes, up to the platform maximum.
+        Raises SchemaError for a preset name, an expression that does not compile or uses a name that is not a
+        parameter, a bad parameter list, or a limit over the maximum.
+        """
+        program_limits = Limits.for_macro(**(limits or {}))
+        try:
+            program = compile_expression(expression, params, program_limits)
+        except ExprError as error:
+            raise SchemaError(f"BAD_MACRO_EXPRESSION: macro {name}@{version}: {error}") from error
+        return self._add(Behavior(name, version, "macro", MacroImpl(name, version, program, accepts_missing)))
+
+    def register_hook(self, name: str, version: int, call: Callable[..., Any]) -> Behavior:
+        """`call(inputs, timeout)` for an impure compute: idempotent, given only its declared dependencies (feature 002)."""
+        return self._add(Behavior(name, version, "hook", call, purity="io"))
+
     def _add(self, behavior: Behavior) -> Behavior:
+        if behavior.kind in ("macro", "hook") and behavior.name in PRESET_NAMES:
+            raise SchemaError(f"RESERVED_MACRO_NAME: {behavior.name!r} is the name of a preset macro and is reserved")
         key = (behavior.name, behavior.version)
         if key in self._behaviors:
             raise SchemaError(f"behavior {behavior.name}@{behavior.version} is already registered")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from aduku.behaviors.registry import BehaviorRegistry, Laws
 from aduku.behaviors.validate import Subject
 from aduku.ion_codec import ABSENT
@@ -35,10 +37,60 @@ MERGES = {
 }
 
 
+class CountingHook:
+    """A hook that counts its calls (conformance fixtures `fx.*`, feature 002). `calls` counts every call; `inputs` keeps
+    the arguments of each, so a test can check that a hook is given only its declared dependencies."""
+
+    def __init__(self, name: str, behavior: Callable[[dict[str, object], int], object]) -> None:
+        self.name = name
+        self._behavior = behavior
+        self.calls = 0
+        self.inputs: list[dict[str, object]] = []
+        self._seen: dict[str, int] = {}
+
+    def __call__(self, inputs: dict[str, object], timeout: float) -> object:
+        self.calls += 1
+        self.inputs.append(dict(inputs))
+        key = repr(sorted(inputs.items()))
+        self._seen[key] = self._seen.get(key, 0) + 1
+        return self._behavior(inputs, self._seen[key])
+
+
+def _echo(inputs: dict[str, object], attempt: int) -> object:
+    return "tax-" + str(inputs["/country"])
+
+
+def _fail(inputs: dict[str, object], attempt: int) -> object:
+    raise RuntimeError("the registry is down")
+
+
+def _flaky(inputs: dict[str, object], attempt: int) -> object:
+    if attempt == 1:
+        raise RuntimeError("try again")
+    return "tax-" + str(inputs["/country"])
+
+
+HOOKS = {"fx.echo@1": ("fx.echo", _echo), "fx.fail@1": ("fx.fail", _fail), "fx.flaky@1": ("fx.flaky", _flaky)}
+
+
+def hook_of(behaviors: BehaviorRegistry, name: str, version: int = 1) -> CountingHook:
+    """The counting hook registered under `name` (to read its call count)."""
+    behavior = behaviors.get(name, version)
+    assert behavior is not None and isinstance(behavior.impl, CountingHook), name
+    return behavior.impl
+
+
 def register_fixtures(behaviors: BehaviorRegistry, names: list[str] | None = None) -> None:
-    wanted = names if names is not None else ["acme.max_spouses_by_country@1", *MERGES]
+    wanted = names if names is not None else ["acme.max_spouses_by_country@1", "acme.label@1", *MERGES, *HOOKS]
     for key in wanted:
-        if key in MERGES:
+        if key == "acme.label@1":
+            if behaviors.get("acme.label", 1) is None:
+                behaviors.register_macro("acme.label", 1, ["name", "city"], 'name + " (" + city + ")"')
+        elif key in HOOKS:
+            name, behavior = HOOKS[key]
+            if behaviors.get(name, 1) is None:
+                behaviors.register_hook(name, 1, CountingHook(name, behavior))
+        elif key in MERGES:
             name, version, combine, laws = MERGES[key]
             if behaviors.get(name, version) is None:
                 behaviors.register_merge(name, version, combine, laws)

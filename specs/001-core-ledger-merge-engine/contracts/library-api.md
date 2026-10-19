@@ -39,8 +39,9 @@ db.rebuild(doc: str | None = None) -> RebuildReport   # None = all; verifies cac
 ```
 
 `get` re-derives when the cached view's schema version or rules fingerprint differs from the active (or the document's
-pinned) version, then keeps the result in memory. It never writes to the ledger or takes the write lock; the stored
-view is written by `append` and `rebuild`. A retried request is answered from a read, without the write lock.
+pinned) version, then keeps the result in memory. It never writes to the ledger or takes the write lock, with one
+exception added by feature 002: a read that finds an impure computed field with no recorded outcome calls its hook and
+records the outcome in a short write transaction. The stored view is written by `append` and `rebuild`. A retried request is answered from a read, without the write lock.
 
 `explain` names the entry that supplied the value (or `"default"`; `None` when nothing sets the path), the rule as
 `name@version`, the entries the value depends on, and the entries that make no difference to it. It is worked out from the
@@ -85,5 +86,6 @@ storage fails during a commit or a read; no entry of the request is visible.
 ## Guarantees
 
 - Output documents and model errors are byte-identical (canonical Ion text) for identical ledgers and schema versions.
-- `get` of a document with no entries returns the defaults only.
+- `get` of a document with no entries returns the defaults only; since feature 002 it also holds each computed field as
+  `computed::null` (or leaves it out under `on_missing: absent`).
 - Concurrent `append` calls to one document receive distinct, strictly increasing `seq`.

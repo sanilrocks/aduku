@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from aduku.behaviors.registry import BehaviorRegistry
+from aduku.engine.compute import compute_fields
 from aduku.engine.derive import (
     DerivationState,
     Prepared,
@@ -22,6 +23,7 @@ from aduku.engine.derive import (
     fold_entries,
     merge_tiers,
 )
+from aduku.engine.effects import EffectView, PendingCall
 from aduku.engine.validate import validate_document
 from aduku.ion_codec import FrozenStruct
 from aduku.model import Entry, ModelError, Violation
@@ -33,6 +35,7 @@ __all__ = [
     "Origin",
     "Replay",
     "advance",
+    "can_have_errors",
     "catch_up",
     "extend",
     "has_validators",
@@ -57,6 +60,7 @@ class Extension:
     document: FrozenStruct
     added: tuple[ModelError, ...]
     resolved: tuple[ModelError, ...]
+    pending: tuple[PendingCall, ...] = ()  # hook calls the derivation still needs
 
     @property
     def errors(self) -> tuple[ModelError, ...]:
@@ -69,6 +73,15 @@ class Extension:
 
 def has_validators(schema: Schema) -> bool:
     return bool(schema.document_validate) or any(field.validate for field in schema.fields)
+
+
+def can_have_errors(schema: Schema) -> bool:
+    """True if a document under this schema can have model errors: validators, or computed fields that report them."""
+    return (
+        has_validators(schema)
+        or any(field.impure is not None for field in schema.fields)
+        or any(field.derived == "computed" and field.on_missing == "error" for field in schema.fields)
+    )
 
 
 def update_errors(
@@ -92,13 +105,23 @@ def update_errors(
 
 
 def _evaluate(
-    schema: Schema, behaviors: BehaviorRegistry, prepared: Prepared, state: DerivationState
-) -> tuple[FrozenStruct, list[Violation], tuple[str, ...]]:
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    prepared: Prepared,
+    state: DerivationState,
+    effects: EffectView | None = None,
+) -> tuple[FrozenStruct, list[Violation], tuple[str, ...], tuple[PendingCall, ...]]:
     clashes: list[Path] = []
     merged = merge_tiers(schema, behaviors, state, prepared, clashes)
     document = build_document(schema, behaviors, merged, prepared, clashes)
-    violations = validate_document(schema, behaviors, document) if has_validators(schema) else []
-    return document, violations, tuple(sorted({format_path(path) for path in clashes}))
+    violations: list[Violation] = []
+    pending: tuple[PendingCall, ...] = ()
+    if prepared.computed:  # P4, then validation of the whole result
+        computed = compute_fields(schema, behaviors, document, prepared.computed, effects)
+        document, violations, pending = computed.document, list(computed.violations), computed.pending
+    if has_validators(schema):
+        violations = [*violations, *validate_document(schema, behaviors, document)]
+    return document, violations, tuple(sorted({format_path(path) for path in clashes})), pending
 
 
 def extend(
@@ -109,18 +132,20 @@ def extend(
     entries: Sequence[Entry],
     origin: Origin,
     previous: Sequence[ModelError] = (),
+    effects: EffectView | None = None,
 ) -> Extension:
     """Fold `entries` (normally one request) into `state`, build the document, validate it and update the errors."""
     folded = fold_entries(schema, behaviors, state, entries, prepared)
-    document, violations, conflicts = _evaluate(schema, behaviors, prepared, folded)
+    document, violations, conflicts, pending = _evaluate(schema, behaviors, prepared, folded, effects)
     errors = update_errors(previous, violations, origin)
     before = {error.identity for error in previous}
     after = {error.identity for error in errors}
     return Extension(
-        replace(folded, errors=errors, conflicts=conflicts),
+        replace(folded, errors=errors, conflicts=conflicts, effects_seq=effects.seq if effects else 0),
         document,
         tuple(error for error in errors if error.identity not in before),
         tuple(error for error in previous if error.identity not in after),
+        pending,
     )
 
 
@@ -135,32 +160,52 @@ def group_requests(entries: Sequence[Entry]) -> list[list[Entry]]:
     return groups
 
 
-def render(schema: Schema, behaviors: BehaviorRegistry, prepared: Prepared, state: DerivationState) -> FrozenStruct:
-    """The document a state stands for."""
-    return _evaluate(schema, behaviors, prepared, state)[0]
+def render(
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    prepared: Prepared,
+    state: DerivationState,
+    effects: EffectView | None = None,
+) -> tuple[FrozenStruct, tuple[PendingCall, ...]]:
+    """The document a state stands for, and the hook calls it still needs."""
+    document, _, _, pending = _evaluate(schema, behaviors, prepared, state, effects)
+    return document, pending
 
 
 def advance(
-    schema: Schema, behaviors: BehaviorRegistry, prepared: Prepared, state: DerivationState, entries: Sequence[Entry]
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    prepared: Prepared,
+    state: DerivationState,
+    entries: Sequence[Entry],
+    effects: EffectView | None = None,
 ) -> Extension:
     """Catch a state up with entries accepted since (possibly by another process), one request at a time."""
     if not entries:
-        return Extension(state, render(schema, behaviors, prepared, state), (), ())
-    if not has_validators(schema):
-        return extend(schema, behaviors, prepared, state, entries, Origin())
+        document, pending = render(schema, behaviors, prepared, state, effects)
+        return Extension(state, document, (), (), pending)
+    if not can_have_errors(schema):
+        return extend(schema, behaviors, prepared, state, entries, Origin(), effects=effects)
     ext: Extension | None = None
     for group in group_requests(entries):
-        ext = extend(schema, behaviors, prepared, state, group, Origin(request_id=group[0].request_id), state.errors)
+        ext = extend(
+            schema, behaviors, prepared, state, group, Origin(request_id=group[0].request_id), state.errors, effects
+        )
         state = ext.state
     assert ext is not None
     return ext
 
 
 def catch_up(
-    schema: Schema, behaviors: BehaviorRegistry, prepared: Prepared, state: DerivationState, entries: Sequence[Entry]
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    prepared: Prepared,
+    state: DerivationState,
+    entries: Sequence[Entry],
+    effects: EffectView | None = None,
 ) -> DerivationState:
     """Like `advance`, but builds nothing when there is nothing to catch up with."""
-    return state if not entries else advance(schema, behaviors, prepared, state, entries).state
+    return state if not entries else advance(schema, behaviors, prepared, state, entries, effects).state
 
 
 @dataclass(frozen=True)
@@ -179,6 +224,7 @@ def replay(
     prepare_for: Callable[[Schema], Prepared],
     entries: Sequence[Entry],
     capture: str | None = None,
+    effects: EffectView | None = None,
 ) -> Replay:
     """Derive from scratch: the document under `read_schema`, and each error attributed as the ledger dictates.
 
@@ -189,8 +235,12 @@ def replay(
     """
     ordered = sorted(entries, key=lambda e: e.seq)
     read = prepare_for(read_schema)
-    if not has_validators(read_schema):  # nothing can be an error under this version, whatever the history was
-        return Replay(extend(read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version)))
+    if not can_have_errors(read_schema):  # nothing can be an error under this version, whatever the history was
+        return Replay(
+            extend(
+                read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), effects=effects
+            )
+        )
 
     errors: tuple[ModelError, ...] = ()
     state: DerivationState | None = None
@@ -206,13 +256,15 @@ def replay(
         if version != current:
             if done:  # the rules changed under the document as it stood
                 refolded = fold_entries(schema, behaviors, None, done, prepared)
-                _, violations, _ = _evaluate(schema, behaviors, prepared, refolded)
+                _, violations, _, _ = _evaluate(schema, behaviors, prepared, refolded, effects)
                 errors = update_errors(errors, violations, Origin(schema_version=version))
                 state = replace(refolded, errors=errors)
             current = version
         if capture == group[0].request_id:
             before = errors
-        last = extend(schema, behaviors, prepared, state, group, Origin(request_id=group[0].request_id), errors)
+        last = extend(
+            schema, behaviors, prepared, state, group, Origin(request_id=group[0].request_id), errors, effects
+        )
         state, errors = last.state, last.errors
         if capture == group[0].request_id:
             after = errors
@@ -220,5 +272,7 @@ def replay(
 
     if last is not None and current == read_schema.version:
         return Replay(last, before, after)
-    final = extend(read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), errors)
+    final = extend(
+        read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), errors, effects
+    )
     return Replay(final, before, after)

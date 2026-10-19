@@ -1,7 +1,7 @@
 # aduku-py
 
 The Python port of **aduku**: an append-only ledger of contributions merged into documents by a central annotated schema
-(Document Oriented Design). This is feature 001, the core ledger and merge engine. The specification is
+(Document Oriented Design): the core ledger and merge engine (feature 001) and computed fields (feature 002). The specification is
 [`docs/SPEC.md`](../../docs/SPEC.md); the shared test vectors are in [`conformance/`](../../conformance).
 
 ## Install
@@ -28,8 +28,27 @@ print(db.get("d1").document)
 print(db.explain("d1", "/name").winner)
 ```
 
+### Computed fields
+
+A field can be computed from others (`computed: {macro: upper, args: ["/name"]}`); it appears in the document as
+`computed::"ALICE"` and nobody can write it. Custom macros are small expressions registered by name; impure computes call a
+registered hook, record every outcome in an effect log and never call it again for the same inputs:
+
+```python
+behaviors = BehaviorRegistry.with_builtins()
+behaviors.register_macro("acme.label", 1, ["name", "city"], 'name + " (" + city + ")"')
+behaviors.register_hook("tax.lookup", 1, lambda inputs, timeout: "tax-" + inputs["/country"])
+db = Aduku(SqliteStorage("demo.db"), registry, behaviors=behaviors)  # a schema may name both
+db.recompute("d1", "/taxId", caller=Identity("root", ("admin",)))  # only who the schema's recompute_by lists
+```
+
+The command line takes the same registrations from a module: `aduku --behaviors demo_hooks ...` (see
+[`examples/demo_hooks.py`](examples/demo_hooks.py)). The macro language is in
+[`contracts/expression-language.md`](../../specs/002-computed-fields/contracts/expression-language.md).
+
 The full API is in
-[`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md). `MemoryStorage` and
+[`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields,
+[`contracts/library-api.md`](../../specs/002-computed-fields/contracts/library-api.md). `MemoryStorage` and
 `SqliteStorage` implement the same storage contract; there is also a command line, `uv run aduku --help`
 ([`contracts/cli.md`](../../specs/001-core-ledger-merge-engine/contracts/cli.md)).
 
@@ -50,10 +69,13 @@ The golden tests run every vector in `conformance/` against both storage backend
 |---|---|
 | `src/aduku/ion_codec.py` | Ion parsing and the canonical text every port must produce byte for byte |
 | `src/aduku/schema/` | schema loader, immutable versions, the registry |
-| `src/aduku/behaviors/` | merge rules and validators |
-| `src/aduku/engine/` | admission, squash, overlay, tombstones, validation, model errors, explain (pure; no clock, no IO) |
+| `src/aduku/behaviors/` | merge rules, validators, the preset macros |
+| `src/aduku/expr/` | the sandboxed expression language of custom macros (pure) |
+| `src/aduku/engine/` | admission, squash, overlay, tombstones, computed fields, effects, validation, model errors, explain (pure; no clock, no IO) |
+| `src/aduku/hooks.py` | the one module that calls out: runs impure hooks with timeout, retry and deadline |
 | `src/aduku/storage/` | the storage contract, in-memory and SQLite |
-| `src/aduku/service.py` | `Aduku`: append, get, explain, rebuild, the rejection audit |
+| `src/aduku/service.py` | `Aduku`: append, get, explain, rebuild, recompute, the rejection audit, the effect log |
+| `examples/` | behaviors for trying computed fields from the command line |
 | `tests/` | `unit/`, `integration/`, `property/`, `golden/` |
 
 ## Where this code lives
