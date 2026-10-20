@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from aduku.behaviors.merge import SchemaMergeContext
+from aduku.engine.layer_codec import Layer, decode_layer
 from aduku.engine.merge_layers import apply_layer
 from aduku.ion_codec import TOMBSTONE, FrozenStruct
 from aduku.model import Entry
@@ -18,11 +19,14 @@ from aduku.paths import Path, Segment, parse_path
 
 __all__ = ["Layer", "entry_layer", "spread", "squash"]
 
-Layer = dict[Path, Any]
-
 
 def entry_layer(ctx: SchemaMergeContext, entry: Entry) -> Layer:
-    """The writes one entry makes: a delete is a tombstone at its path; a set is the value, spread if field-wise."""
+    """The writes one entry makes: a delete is a tombstone at its path; a set is the value, spread if field-wise.
+
+    A `layer` entry (feature 005) is what compaction wrote for a tier: its value is the tier's whole folded layer.
+    """
+    if entry.op == "layer":
+        return decode_layer(entry.value)
     path = parse_path(entry.path)
     if entry.op == "delete":
         return {path: TOMBSTONE}

@@ -9,13 +9,14 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from typing import Any
 
 from aduku.audit import AuditRecord
 from aduku.behaviors.registry import BehaviorRegistry
-from aduku.errors import AdukuError, RejectedError, SchemaError
+from aduku.errors import AdukuError, HistoryCompactedError, RejectedError, SchemaError
 from aduku.ion_codec import ABSENT, FrozenStruct, IonError, parse, to_canonical
-from aduku.model import Entry, EntryInput, Identity, ModelError
+from aduku.model import AsOf, AsOfInfo, Entry, EntryInput, Identity, ModelError, PurgeScope
 from aduku.schema.loader import load_schema
 from aduku.schema.model import Schema
 from aduku.schema.registry import SchemaRegistry
@@ -65,6 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     append.add_argument("--lenient", action="store_true")
     append.add_argument("--request-key")
     append.add_argument("--idem-key")
+    append.add_argument("--valid-time", metavar="ISO8601", help="when the facts became true (a moment with an offset)")
     append.add_argument("--set", dest="ops", action=_OpAction, metavar="PATH=VALUE")
     append.add_argument("--delete", dest="ops", action=_OpAction, metavar="PATH")
 
@@ -74,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     get.add_argument(
         "--include", action="append", default=[], choices=("pending",), help="say what pending fields wait for"
     )
+    get.add_argument("--as-of", action="append", default=[], metavar="KIND=VALUE", help="seq=N, tx=ISO or valid=ISO")
 
     rebuild = sub.add_parser("rebuild", help="re-derive from the ledger and compare with the cached views")
     rebuild.add_argument("doc", nargs="?")
@@ -114,6 +117,32 @@ def _parser() -> argparse.ArgumentParser:
     explain = sub.add_parser("explain", help="why a field has its value")
     explain.add_argument("doc")
     explain.add_argument("path")
+    explain.add_argument(
+        "--as-of", action="append", default=[], metavar="KIND=VALUE", help="seq=N, tx=ISO or valid=ISO"
+    )
+
+    compact = sub.add_parser(
+        "compact", help="replace old entries by one synthetic entry per tier (the originals are archived)"
+    )
+    compact.add_argument("doc")
+    compact.add_argument("--through-seq", type=int)
+    compact.add_argument("--older-than", metavar="DURATION", help="for example 90d, 12h, 30m")
+
+    archive = sub.add_parser("archive", help="the archive of compacted originals")
+    archive_sub = archive.add_subparsers(dest="archive_command", required=True)
+    archive_sub.add_parser("verify", help="derive from the originals and compare").add_argument("doc")
+    expire = archive_sub.add_parser("expire", help="delete archived originals up to a seq (recorded; cannot be undone)")
+    expire.add_argument("doc")
+    expire.add_argument("--through-seq", type=int, required=True)
+
+    purge = sub.add_parser("purge", help="erase contributions for good (legal erasure); the schema says who may")
+    purge.add_argument("doc")
+    purge.add_argument("--path", help="every contribution at or below this path")
+    purge.add_argument("--scope-tier", help="with --path: only the contributions of this tier")
+    purge.add_argument("--entry", action="append", default=[], metavar="ID", help="an entry to erase (repeatable)")
+    purge.add_argument("--reason", required=True, help="the reason or ticket, recorded in the purge log")
+    _caller_options(purge)
+    sub.add_parser("purge-log", help="what was purged, by whom and why (never a value)").add_argument("doc")
 
     entries = sub.add_parser("entries", help="list ledger entries")
     entries.add_argument("doc")
@@ -262,6 +291,7 @@ def _check_schema(args: argparse.Namespace) -> int:
             "tiers": list(schema.tiers),
             "fields": len(schema.fields),
             "merge_rules": rules,
+            "purge_by": list(schema.purge_by),
             "derived": [spec.pattern for spec in schema.fields if spec.derived],
             **_inventory(schema),
         },
@@ -289,10 +319,19 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
         if args.command == "append":
             return _append(args, service)
         if args.command == "get":
-            result = service.get(args.doc, consistency="fresh" if args.fresh else "cached", include=tuple(args.include))
+            try:
+                result = service.get(
+                    args.doc,
+                    consistency="fresh" if args.fresh else "cached",
+                    include=tuple(args.include),
+                    as_of=_as_of_arg(args.as_of),
+                )
+            except HistoryCompactedError as refusal:
+                return _refused(args, refusal)
             _emit(
                 args,
                 {
+                    **({"as_of": _as_of_info(result.as_of)} if result.as_of is not None else {}),
                     "document": to_canonical(result.document),
                     "deferred": [_deferred_status(d) for d in result.deferred],
                     "model_errors": [_model_error(e) for e in result.model_errors],
@@ -349,7 +388,10 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                 _emit(args, {"pruned": service.prune_effects(args.doc)})
             return 0
         if args.command == "explain":
-            why = service.explain(args.doc, args.path)
+            try:
+                why = service.explain(args.doc, args.path, as_of=_as_of_arg(args.as_of))
+            except HistoryCompactedError as refusal:
+                return _refused(args, refusal)
             _emit(
                 args,
                 {
@@ -370,6 +412,14 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     "authority": list(why.authority) if why.authority is not None else None,
                     "authority_from": why.authority_from,
                     "as_of": why.as_of.isoformat() if why.as_of else None,
+                    "originals_kept": None
+                    if why.originals_kept is None
+                    else ("kept" if why.originals_kept else "expired"),
+                    "sources": list(why.sources),
+                    "purged": [
+                        {"entry": m.entry_id, "seq": m.seq, "at": m.purged_at.isoformat(), "reason": m.reason}
+                        for m in why.purged
+                    ],
                 },
             )
             return 0
@@ -383,9 +433,43 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     "differing": list(report.differing),
                     "refreshed": list(report.refreshed),
                     "failed": [{"doc": name, "why": why} for name, why in report.failed],
+                    "layers_differing": [{"doc": d, "tier": t} for d, t in report.layers_differing],
+                    "layers_refreshed": [{"doc": d, "tier": t} for d, t in report.layers_refreshed],
                 },
             )
             return 0 if report.identical else 1
+        if args.command == "compact":
+            return _compact(args, service)
+        if args.command == "purge":
+            return _purge(args, service)
+        if args.command == "purge-log":
+            _emit(
+                args,
+                {
+                    "purges": [
+                        {
+                            "purge": r.id,
+                            "scope": r.scope,
+                            "reason": r.reason,
+                            "actor": r.actor,
+                            "at": r.at.isoformat(),
+                            "counts": r.counts,
+                        }
+                        for r in service.purge_log(args.doc)
+                    ]
+                },
+            )
+            return 0
+        if args.command == "archive":
+            if args.archive_command == "verify":
+                verified = service.verify_archive(args.doc)
+                _emit(
+                    args, {"doc": verified.doc, "checked": verified.checked, "differences": list(verified.differences)}
+                )
+                return 0 if not verified.differences else 1
+            gone = service.expire_archive(args.doc, through_seq=args.through_seq)
+            _emit(args, {"doc": gone.doc, "through_seq": gone.through_seq, "expired": gone.expired})
+            return 0
         if args.command == "entries":
             _emit(args, {"entries": [_entry(e) for e in service.list_entries(args.doc, since_seq=args.since)]})
             return 0
@@ -455,19 +539,136 @@ def _recompute(args: argparse.Namespace, service: Aduku) -> int:
     return 1 if report.failed else 0
 
 
+_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _duration(text: str, option: str) -> timedelta:
+    if len(text) < 2 or text[-1] not in _UNITS or not text[:-1].isdigit():
+        raise _UsageError(f"{option}: {text!r} is not a duration such as 90d, 12h or 30m")
+    return timedelta(seconds=int(text[:-1]) * _UNITS[text[-1]])
+
+
+def _refused(args: argparse.Namespace, rejection: RejectedError) -> int:
+    """Print a refusal the way a rejected request is printed; exit 1."""
+    _emit(args, {"rejected": {"code": rejection.code.value, "reasons": [_reason(r) for r in rejection.reasons]}})
+    for reason in rejection.reasons:
+        print(f"{reason.code.value}: {reason.message}", file=sys.stderr)
+    return 1
+
+
+def _purge(args: argparse.Namespace, service: Aduku) -> int:
+    if bool(args.path) == bool(args.entry):
+        raise _UsageError("purge needs exactly one of --path PATH and --entry ID (repeatable)")
+    if args.scope_tier and not args.path:
+        raise _UsageError("--scope-tier narrows a --path scope")
+    scope = PurgeScope(path=args.path, tier=args.scope_tier, entries=tuple(args.entry))
+    try:
+        report = service.purge(
+            args.doc,
+            scope,
+            reason=args.reason,
+            caller=Identity(args.contributor, (args.tier,), tuple(args.role)),
+        )
+    except RejectedError as rejection:
+        return _refused(args, rejection)
+    _emit(
+        args,
+        {
+            "purge": report.purge_id,
+            "doc": report.doc,
+            "entries_erased": report.entries_erased,
+            "entries_rewritten": report.entries_rewritten,
+            "archive_rows": report.archive_erased,
+            "effects_erased": report.effects_erased,
+            "derived_erased": report.derived_erased,
+            "audit_scrubbed": report.audit_scrubbed,
+            "expired_sources": report.expired_sources,
+        },
+    )
+    return 0
+
+
+def _compact(args: argparse.Namespace, service: Aduku) -> int:
+    if (args.through_seq is None) == (args.older_than is None):
+        raise _UsageError("compact needs exactly one of --through-seq N and --older-than DURATION")
+    older = _duration(args.older_than, "--older-than") if args.older_than else None
+    try:
+        report = service.compact(args.doc, through_seq=args.through_seq, older_than=older)
+    except RejectedError as rejection:
+        return _refused(args, rejection)
+    if report.noop:
+        _emit(args, {"noop": True, "message": "nothing to compact"})
+        return 0
+    _emit(
+        args,
+        {
+            "noop": False,
+            "compaction": report.compaction_id,
+            "watermark": report.watermark_seq,
+            "replaced": report.replaced,
+            "synthetic": report.synthetic,
+            "checked_paths": report.checked_paths,
+        },
+    )
+    return 0
+
+
+def _moment(text: str, option: str) -> datetime:
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError as error:
+        raise _UsageError(f"{option}: {text!r} is not an ISO 8601 moment") from error
+
+
+def _as_of_arg(items: Sequence[str]) -> AsOf | None:
+    """`--as-of seq=N | tx=ISO | valid=ISO`, exactly once; anything else is AS_OF_AMBIGUOUS or a usage error."""
+    if not items:
+        return None
+    if len(items) != 1:
+        raise _UsageError("AS_OF_AMBIGUOUS: --as-of takes exactly one point: seq=N, tx=ISO8601 or valid=ISO8601")
+    kind, _, text = items[0].partition("=")
+    if kind == "seq":
+        if not text.lstrip("-").isdigit():
+            raise _UsageError(f"--as-of seq={text}: the seq is a whole number")
+        return AsOf(seq=int(text))
+    if kind == "tx":
+        return AsOf(tx_time=_moment(text, "--as-of tx"))
+    if kind == "valid":
+        return AsOf(valid_time=_moment(text, "--as-of valid"))
+    raise _UsageError(f"--as-of {items[0]!r}: use seq=N, tx=ISO8601 or valid=ISO8601")
+
+
+def _as_of_info(info: AsOfInfo) -> dict[str, Any]:
+    point = info.point.isoformat() if isinstance(info.point, datetime) else str(info.point)
+    return {
+        "kind": info.kind,
+        "point": point,
+        "resolved_seq": info.resolved_seq,
+        "included": info.included,
+        "inside_request": info.inside_request,
+    }
+
+
 def _append(args: argparse.Namespace, service: Aduku) -> int:
     ops = args.ops or []
     if not ops:
         raise _UsageError("append needs at least one --set PATH=VALUE or --delete PATH")
     if args.idem_key and len(ops) != 1:
         raise _UsageError("--idem-key applies to a single entry; submit one --set or --delete")
+    valid_time = _moment(args.valid_time, "--valid-time") if args.valid_time else None
     entries: list[EntryInput] = []
     for kind, text in ops:
         if kind == "delete":
-            entries.append(EntryInput(tier=args.tier, path=text, op="delete", idem_key=args.idem_key))
+            entries.append(
+                EntryInput(tier=args.tier, path=text, op="delete", idem_key=args.idem_key, valid_time=valid_time)
+            )
         else:
             path, value = _split_assignment(text)
-            entries.append(EntryInput(tier=args.tier, path=path, op="set", value=value, idem_key=args.idem_key))
+            entries.append(
+                EntryInput(
+                    tier=args.tier, path=path, op="set", value=value, idem_key=args.idem_key, valid_time=valid_time
+                )
+            )
     try:
         result = service.append(
             args.doc,
@@ -567,6 +768,9 @@ def _entry(entry: Entry) -> dict[str, Any]:
         "lenient": entry.lenient,
         "schema_version": entry.schema_version,
         "tx_time": entry.tx_time.isoformat(),
+        "valid_time": entry.valid_time.isoformat() if entry.valid_time is not None else None,
+        "synthetic": entry.synthetic,
+        "purged": True if entry.purged else None,
     }
     return {key: value for key, value in full.items() if value is not None}
 

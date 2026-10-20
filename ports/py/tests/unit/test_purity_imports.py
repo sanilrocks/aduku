@@ -24,7 +24,13 @@ FORBIDDEN = (
 )
 # Feature 003: the planner and the schedule take the time as an argument, so they may name the `datetime` type; they may
 # never read a clock (checked below), and every other forbidden import still applies to them.
-PURE_MODULES = ("engine/deferred.py", "engine/schedule.py")
+PURE_MODULES = (
+    "engine/deferred.py",
+    "engine/schedule.py",
+    "engine/asof.py",  # feature 005: the compaction and purge planners take times as values too
+    "engine/compaction.py",
+    "engine/purge.py",
+)
 CLOCK_CALLS = {"now", "utcnow", "today", "time", "monotonic", "perf_counter", "sleep"}
 
 
@@ -71,6 +77,26 @@ def test_the_deferred_planner_and_schedule_are_pure_modules() -> None:
     for name in PURE_MODULES:
         path = SRC / name
         assert path.exists(), f"{name} is missing"
+        calls = {
+            node.func.attr
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls & CLOCK_CALLS == set(), f"{name} reads a clock"
+
+
+def test_the_snapshot_time_travel_compaction_and_purge_modules_are_pure() -> None:
+    """Feature 005 (Principle III): layers, point selection, the compaction planner and the purge planner are pure."""
+    for name in ("layer_codec", "asof", "compaction", "purge"):
+        path = SRC / "engine" / f"{name}.py"
+        assert path.exists(), f"engine/{name}.py is missing"
+        allowed_datetime = f"engine/{name}.py" in PURE_MODULES
+        bad = [
+            n
+            for n in _imports(path)
+            if any(n == b or n.startswith(b + ".") for b in FORBIDDEN) and not (allowed_datetime and n == "datetime")
+        ]
+        assert bad == [], f"{name} imports {bad}"
         calls = {
             node.func.attr
             for node in ast.walk(ast.parse(path.read_text()))

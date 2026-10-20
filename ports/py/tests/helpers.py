@@ -25,6 +25,9 @@ def make_entry(
     schema_version: int = 1,
     meta: Value = None,
     tx_time: datetime = T0,
+    valid_time: datetime | None = None,
+    synthetic: str | None = None,
+    purged: bool = False,
 ) -> Entry:
     return Entry(
         id=f"e-{doc}-{seq}",
@@ -43,4 +46,7 @@ def make_entry(
         request_hash=request_hash,
         lenient=lenient,
         meta=meta,
+        valid_time=valid_time,
+        synthetic=synthetic,
+        purged=purged,
     )

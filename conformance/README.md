@@ -84,3 +84,19 @@ a derived path) and the extended `schema-load-failures`.
 New `explain` expectations: `authority` (a list of tiers and roles, or `null` for any permitted tier) and `authority_from` (the field
 pattern that declared the list, or `null`). A rejected `append` may list `reasons: [{ path, rule }]`; a port also checks that no reason
 text contains a value the request submitted. The 16.1 and 16.2 vectors are unchanged.
+
+## Feature 005: snapshots, time travel, compaction and purge
+
+Cases added: `snapshots` (a long history read, appended to, restarted and read; a damaged layer repaired by `rebuild`), `compaction-versions` (a mixed-version range refused; a version that folds differently, from the archive or refused after expiry), `time-travel`
+(`as_of` by seq, `tx_time` and `valid_time`, the empty and the beyond-the-end cases, `AS_OF_AMBIGUOUS`, `BAD_VALID_TIME`, the request hash only
+when `valid_time` is given), `compaction` (watermarks on and inside a request, tombstones and re-creations, keys, a retried request, `explain` exact while the archive is kept, `as_of` inside a range before and after expiry) and `purge` (scopes, authority, reasons, `explain` marks, a retried request, `rebuild` clean, no stored text holds the
+marker).
+
+New steps: `{ append: { ..., valid_time: <timestamp> } }`; `{ as_of: { seq: N } }` (or `tx_time: T`, `valid_time: T`) with
+`expect: { document, model_errors, resolved_seq, included, refused }`; `{ compact: { through_seq: N } }` (the runner reads the
+document, the model errors and the `explain` of every path before and after and requires them equal), `{ expire: { through_seq: N } }`,
+`{ purge: { path: P, reason: R, as: <identity> } }` with `expect: { absent_everywhere: "<marker text>", purge_log_count: N }`,
+`{ restart: {} }` (a new service on the same storage) and `{ rebuild: {} }` with `expect: { identical: true }`.
+
+Every vector of every case file is also run with saved layers off; the results must be identical (Feature 005 SC-008). The 16.1 and 16.2
+vectors are unchanged.

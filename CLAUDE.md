@@ -9,13 +9,13 @@ contributions merged into documents by a central annotated schema. Language port
 1. `docs/notes.md`: decisions with reasons, prior art, pending items. Start here for context.
 2. `docs/SPEC.md`: the authoritative specification. Do not contradict it without updating it.
 3. `.specify/memory/constitution.md`: governing principles; plans and tasks must comply.
-4. `specs/004-validation-authority/spec.md`: the current feature (features 001 to 003, in `specs/001-core-ledger-merge-engine/`, `specs/002-computed-fields/` and `specs/003-deferred-fields/`, are implemented).
+4. `specs/005-snapshots-compaction-time-travel/spec.md`: the current feature (features 001 to 004, in `specs/001-core-ledger-merge-engine/` to `specs/004-validation-authority/`, are implemented).
 
 ## Workflow
 
 Spec Kit (hyphenated commands: `/speckit-constitution`, `-specify`, `-clarify`, `-plan`, `-tasks`, `-analyze`,
 `-implement`, `-converge`). Run Claude Code from this folder. Prompts for the features still to be specified are in `docs/prompts/specify-features.md`.
-Current step: feature 004 (validation rule library and per-field authority) is implemented (tasks T001 to T049 done); next `/speckit-analyze` and `/speckit-converge`. Features 001 to 003 are implemented and committed. Features 5 and 6 are still to be specified (`docs/prompts/specify-features.md`).
+Current step: feature 005 (snapshots, time travel, compaction and purge) is implemented (tasks T001 to T070 done); next `/speckit-analyze` and `/speckit-converge`. Features 001 to 004 are implemented and committed. Feature 6 is still to be specified (`docs/prompts/specify-features.md`).
 
 ## Rules
 

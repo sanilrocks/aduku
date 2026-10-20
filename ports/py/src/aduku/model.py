@@ -11,6 +11,20 @@ from aduku.ion_codec import Value
 
 __all__ = [
     "AppendResult",
+    "ArchiveReport",
+    "AsOf",
+    "AsOfInfo",
+    "CompactionPlan",
+    "CompactionRecord",
+    "CompactionReport",
+    "SourceRow",
+    "ExpiryReport",
+    "PurgeApplication",
+    "PurgeRecord",
+    "PurgeReport",
+    "PurgeScope",
+    "PurgedMark",
+    "StoredOp",
     "DeferredInfo",
     "DeferredStatus",
     "DerivedRecord",
@@ -30,6 +44,7 @@ __all__ = [
 ]
 
 Op = Literal["set", "delete"]
+StoredOp = Literal["set", "delete", "layer"]  # `layer` is only ever written by compaction (feature 005)
 
 
 @dataclass(frozen=True)
@@ -42,7 +57,7 @@ class Entry:
     request_id: str
     tier: str
     path: str
-    op: Op
+    op: StoredOp
     value: Value
     contributor: str
     tx_time: datetime  # informational: never used for ordering or merging
@@ -52,6 +67,11 @@ class Entry:
     request_hash: str | None = None
     lenient: bool = False
     meta: Value = None
+    # Feature 005: when the fact became true in the world (read only by `as_of` valid-time reads); the compaction id of a
+    # synthetic entry; True for a placeholder whose value, meta, valid_time and request hash were erased by a purge.
+    valid_time: datetime | None = None
+    synthetic: str | None = None
+    purged: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +84,7 @@ class EntryInput:
     value: Value = None
     idem_key: str | None = None
     meta: Value = None
+    valid_time: datetime | None = None  # feature 005: a timezone-aware moment; never affects ordering or a normal read
 
 
 @dataclass(frozen=True)
@@ -110,6 +131,8 @@ class DocumentResult:
     conflicts: tuple[str, ...] = ()
     # The status of every deferred field (feature 003), in path order; the stored values are in `document`.
     deferred: tuple[DeferredStatus, ...] = ()
+    # Feature 005: set only by an `as_of` read.
+    as_of: AsOfInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -133,10 +156,14 @@ class RebuildReport:
     differing: tuple[str, ...] = ()
     refreshed: tuple[str, ...] = ()
     failed: tuple[tuple[str, str], ...] = ()  # (document, why) for documents that could not be derived at all
+    # Feature 005: saved per-tier layers, as (document, tier). `layers_differing` were current but not what the ledger gives
+    # (repaired); `layers_refreshed` were missing or made under another version (derived afresh and saved).
+    layers_differing: tuple[tuple[str, str], ...] = ()
+    layers_refreshed: tuple[tuple[str, str], ...] = ()
 
     @property
     def identical(self) -> bool:
-        return not self.differing and not self.failed
+        return not self.differing and not self.failed and not self.layers_differing
 
 
 @dataclass(frozen=True)
@@ -165,6 +192,11 @@ class Explanation:
     # Who may write the path (tiers and roles; None: any permitted tier) and the field pattern that declared the list.
     authority: tuple[str, ...] | None = None
     authority_from: str | None = None
+    # Feature 005: purged entries that touched the path; whether the originals behind a synthetic entry are still kept
+    # (None when no synthetic entry took part); the source ids a synthetic winner or input stands for.
+    purged: tuple[PurgedMark, ...] = ()
+    originals_kept: bool | None = None
+    sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,7 +239,7 @@ class RecomputeReport:
     effect_seqs: tuple[tuple[str, int], ...] = ()
 
 
-DeferredState = Literal["ok", "stale", "pending", "error"]
+DeferredState = Literal["ok", "stale", "pending", "error", "unavailable"]  # unavailable: an `as_of` read (feature 005)
 
 
 @dataclass(frozen=True)
@@ -289,3 +321,152 @@ class SchedulerReport:
     calls: int = 0
     reason: str | None = None
     items: tuple[tuple[str, str, str], ...] = ()  # (doc, field, ok|failed|skipped)
+
+
+# -- feature 005: time travel, compaction and purge ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AsOf:
+    """A point in a document's history: exactly one of a seq, a recording time or a moment in the world."""
+
+    seq: int | None = None
+    tx_time: datetime | None = None
+    valid_time: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AsOfInfo:
+    """What an `as_of` read stood at: `resolved_seq` (for a valid-time read, the highest seq that took part), how many
+    entries took part, and whether the seq falls between two entries of one request."""
+
+    kind: Literal["seq", "tx_time", "valid_time"]
+    point: object
+    resolved_seq: int
+    included: int
+    inside_request: bool = False
+
+
+@dataclass(frozen=True)
+class PurgedMark:
+    entry_id: str
+    seq: int
+    purged_at: datetime
+    reason: str
+
+
+@dataclass(frozen=True)
+class CompactionReport:
+    doc: str
+    compaction_id: str | None
+    watermark_seq: int
+    replaced: int
+    synthetic: int
+    checked_paths: int
+    noop: bool = False
+
+
+@dataclass(frozen=True)
+class ArchiveReport:
+    doc: str
+    checked: bool
+    differences: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExpiryReport:
+    doc: str
+    through_seq: int
+    expired: int
+
+
+@dataclass(frozen=True)
+class PurgeScope:
+    """What to erase: every contribution at or below `path` (optionally of one `tier`), or the listed entry ids."""
+
+    path: str | None = None
+    tier: str | None = None
+    entries: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PurgeReport:
+    purge_id: str
+    doc: str
+    entries_erased: int
+    entries_rewritten: int
+    archive_erased: int
+    effects_erased: int
+    derived_erased: int
+    audit_scrubbed: int
+    expired_sources: bool = False
+
+
+@dataclass(frozen=True)
+class PurgeRecord:
+    """One entry of the purge log: who erased what, when and why. Never a value."""
+
+    id: str
+    doc: str
+    scope: str
+    reason: str
+    actor: str
+    at: datetime
+    counts: str
+
+
+@dataclass(frozen=True)
+class PurgeApplication:
+    """What the storage changes in one purge: replacement entries (by id) for ledger and archive rows, the requests whose
+    stored hash goes, and the derived fields whose effect-log records and derived-store rows go."""
+
+    doc: str
+    live: tuple[Entry, ...]
+    archive: tuple[Entry, ...]
+    requests: tuple[str, ...]
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CompactionRecord:
+    """One compaction (data-model.md): what range it replaced, under which rules, and what a replay of requests would have
+    computed on the way (the attributed model errors and the skipped seqs at the watermark)."""
+
+    id: str
+    doc: str
+    watermark_seq: int
+    schema_version: int
+    fold_fingerprint: str
+    created: datetime
+    policy: str
+    base_errors: str  # canonical text of the model errors at the watermark
+    base_skipped: tuple[int, ...]
+    archived: bool
+    first_tx_time: datetime | None
+    last_tx_time: datetime | None
+    has_valid_time: bool
+
+
+@dataclass(frozen=True)
+class SourceRow:
+    """An entry a compaction replaced: kept after the archive is expired."""
+
+    compaction_id: str
+    source_id: str
+    seq: int
+    tier: str
+    idem_key: str | None = None
+
+
+@dataclass(frozen=True)
+class CompactionPlan:
+    """Everything one compaction changes, decided in advance by the pure planner."""
+
+    record: CompactionRecord
+    replaced: tuple[Entry, ...]  # the live entries to archive and remove
+    synthetic: tuple[Entry, ...]  # one `layer` entry per tier, put in their place
+    sources: tuple[SourceRow, ...]
+    request_index: tuple[tuple[str, str, int], ...]  # (request id, entry id, seq) of the replaced contributed entries
+    retired_keys: tuple[str, ...]  # idempotency keys of the replaced contributed entries
+    # (request id, model errors it added, model errors it resolved) as canonical text: what a retry of it is answered with
+    request_effects: tuple[tuple[str, str, str], ...] = ()

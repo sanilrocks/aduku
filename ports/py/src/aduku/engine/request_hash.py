@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 
-from aduku.ion_codec import FrozenStruct, or_placeholder, to_canonical
+from aduku.ion_codec import FrozenStruct, or_placeholder, to_canonical, to_utc
 from aduku.model import EntryInput
 
 __all__ = ["request_hash"]
@@ -35,6 +35,8 @@ def request_hash(doc: str, contributor_id: str, lenient: bool, entries: Sequence
                         "value": or_placeholder(entry.value) if entry.op != "delete" else None,
                         "idem_key": entry.idem_key,
                         "meta": or_placeholder(entry.meta),
+                        # only when given, so that the hash of a request without it is what it always was (feature 005)
+                        **({"valid_time": _instant(entry.valid_time)} if entry.valid_time is not None else {}),
                     }
                 )
                 for entry in entries
@@ -42,3 +44,11 @@ def request_hash(doc: str, contributor_id: str, lenient: bool, entries: Sequence
         }
     )
     return hashlib.sha256(to_canonical(body).encode("utf-8")).hexdigest()
+
+
+def _instant(moment: object) -> str:
+    """The instant in UTC as fixed-width text, so that the same moment in any offset hashes alike."""
+    try:
+        return to_utc(moment).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return "invalid"  # a request with a bad valid_time is rejected before its hash matters

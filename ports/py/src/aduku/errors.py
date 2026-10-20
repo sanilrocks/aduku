@@ -24,6 +24,15 @@ class ErrorCode(StrEnum):
     IDEM_KEY_REQUIRED = "IDEM_KEY_REQUIRED"
     SEQ_CONFLICT = "SEQ_CONFLICT"
     SCHEMA_INACTIVE = "SCHEMA_INACTIVE"
+    BAD_VALID_TIME = "BAD_VALID_TIME"
+    AS_OF_AMBIGUOUS = "AS_OF_AMBIGUOUS"
+    HISTORY_COMPACTED = "HISTORY_COMPACTED"
+    MIXED_SCHEMA_RANGE = "MIXED_SCHEMA_RANGE"
+    IDEM_KEY_MISSING = "IDEM_KEY_MISSING"
+    COMPACTION_CHECK_FAILED = "COMPACTION_CHECK_FAILED"
+    LEDGER_CHANGED = "LEDGER_CHANGED"
+    PURGE_REASON_REQUIRED = "PURGE_REASON_REQUIRED"
+    UNKNOWN_ENTRY = "UNKNOWN_ENTRY"
     STORAGE_ERROR = "STORAGE_ERROR"
 
 
@@ -65,6 +74,17 @@ class RejectedError(AdukuError):
         self.code = code
         self.reasons: tuple[Reason, ...] = tuple(reasons) if reasons else (Reason(code, message or code.value),)
         super().__init__(message or "; ".join(f"{r.code.value}: {r.message}" for r in self.reasons))
+
+
+class HistoryCompactedError(RejectedError):
+    """A time-travel read (or a schema change) needs history that compaction replaced and the archive no longer keeps.
+
+    `earliest_seq` is the lowest seq that can still be answered exactly.
+    """
+
+    def __init__(self, message: str, earliest_seq: int = 0) -> None:
+        super().__init__(ErrorCode.HISTORY_COMPACTED, message=message)
+        self.earliest_seq = earliest_seq
 
 
 class StorageError(AdukuError):

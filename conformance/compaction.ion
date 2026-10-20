@@ -1,0 +1,67 @@
+// Feature 005, US4: compaction changes no answer (the runner compares the document, the model errors and `explain` of every path
+// before and after each `compact`), keeps tombstones, keys and retries, and is exact for any point while the archive is kept.
+// After `expire` a point inside the compacted range is refused, never answered wrongly.
+case::{
+  name: "compaction",
+  fixtures: ["acme.add@1"],
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max}, "/n": {type: int, merge: "acme.add@1"} }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "ann"}, {tier: user, path: "/age", value: 3}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/name", value: "zed"}] },
+      expect: { accepted: [{seq: 3}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/n", value: 1, idem_key: "K1"}] },
+      expect: { accepted: [{seq: 4}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/n", value: 2, idem_key: "K2"}] },
+      expect: { accepted: [{seq: 5}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "RK",
+                entries: [{tier: user, path: "/name", value: "bob"}] },
+      expect: { accepted: [{seq: 6}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/age", op: delete}] },
+      expect: { accepted: [{seq: 7}] } },
+    { get: "d1", expect: { document: "{n: 3, name: \"bob\"}" } },
+
+    // a watermark inside a request moves down to the end of the request before it: seq 2 ends request 1, seq 1 does not
+    { compact: {doc: "d1", through_seq: 1}, expect: { noop: true } },
+    { compact: {doc: "d1", through_seq: 3}, expect: { watermark: 3, replaced: 3, remaining: 6 } },
+    { get: "d1", expect: { document: "{n: 3, name: \"bob\"}" } },
+    { compact: {doc: "d1", through_seq: 5}, expect: { watermark: 5, replaced: 4, remaining: 4 } },
+    { get: "d1", expect: { document: "{n: 3, name: \"bob\"}" } },
+
+    // a repeated key is still refused; a retried request is still a duplicate with its original answer
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/n", value: 1, idem_key: "K1"}] },
+      expect: { rejected: { code: DUPLICATE_IDEM_KEY } } },
+    { compact: {doc: "d1", through_seq: 7}, expect: { watermark: 7, remaining: 3 } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "RK",
+                entries: [{tier: user, path: "/name", value: "bob"}] },
+      expect: { accepted: [{seq: 6}], duplicate: true } },
+    { compact: {doc: "d1", through_seq: 7}, expect: { noop: true } },
+
+    // while the archive keeps the originals explain is exact; once they are expired a synthetic entry is one entry
+    { explain: {doc: "d1", path: "/name"}, expect: { originals_kept: true, value: "bob" } },
+
+    // while the archive keeps the originals every point is answered exactly
+    { as_of: {doc: "d1", seq: 2}, expect: { document: "{age: 3, name: \"ann\"}", resolved_seq: 2 } },
+    { as_of: {doc: "d1", seq: 3}, expect: { document: "{age: 3, name: \"ann\"}" } },
+    { as_of: {doc: "d1", seq: 6}, expect: { document: "{age: 3, n: 3, name: \"bob\"}" } },
+
+    // after expiry the range is refused, and what can still be answered exactly is
+    { expire: {doc: "d1", through_seq: 7}, expect: { expired: 11 } },
+    { explain: {doc: "d1", path: "/name"}, expect: { originals_kept: false, value: "bob" } },
+    { as_of: {doc: "d1", seq: 2}, expect: { refused: HISTORY_COMPACTED } },
+    { as_of: {doc: "d1", seq: 7}, expect: { document: "{n: 3, name: \"bob\"}", resolved_seq: 7 } },
+    { get: "d1", expect: { document: "{n: 3, name: \"bob\"}" } },
+
+    // a field that is not idempotent is compacted only with its keys
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/n", value: 1}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "x"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { compact: {doc: "d2", through_seq: 2}, expect: { refused: IDEM_KEY_MISSING } },
+    { get: "d2", expect: { document: "{n: 1, name: \"x\"}" } }
+  ]
+}

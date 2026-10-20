@@ -512,3 +512,16 @@ def test_the_new_load_codes_exit_2(tmp_path: pathlib.Path, capsys: pytest.Captur
     )
     code, out, _ = run(capsys, "--db", str(tmp_path / "b.db"), "schema", "check", str(schema))
     assert code == 2 and {"EMPTY_AUTHORITY", "RULE_WRONG_PLACE"} <= set(out["codes"])
+
+
+def test_schema_check_prints_purge_by_as_a_list_and_empty_means_nobody(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plain = tmp_path / "plain.ion"
+    plain.write_text('schema::{id: "t", version: 1, tiers: [user], fields: {"/name": {type: string, merge: lww}}}')
+    listed = tmp_path / "listed.ion"
+    listed.write_text(
+        'schema::{id: "t", version: 1, tiers: [user, admin], roles: [dpo], purge_by: [admin, dpo], fields: {"/name": {type: string, merge: lww}}}'
+    )
+    assert run(capsys, "schema", "check", str(plain))[1]["purge_by"] == []
+    assert run(capsys, "schema", "check", str(listed))[1]["purge_by"] == ["admin", "dpo"]

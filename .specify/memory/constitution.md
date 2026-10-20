@@ -4,12 +4,18 @@
 
 ### I. Ledger Is Truth
 Ledger entries MUST be immutable and append-only. Document state MUST always be derived from the ledger
-and never edited in place; corrections MUST be new entries. Only accepted contributions become entries: a
+and never edited in place; corrections MUST be new entries. The only operations that MAY change or remove an
+existing entry are compaction and purge: each MUST be a recorded, atomic operation; a compaction MUST be verified,
+before it commits, to change no document, model error or provenance answer, and MUST keep the replaced originals
+in an archive until an operator expires them; a purge MUST leave a placeholder so that sequence numbers stay
+continuous, MUST leave no copy of the erased values in any store, and MUST be logged without them. Only accepted contributions become entries: a
 rejected request MUST record nothing in the ledger. A request MUST be accepted or rejected as a whole (atomic).
 Rejected requests MAY be kept only in a separate, capped, audit-only log, enabled by schema setting, that MUST
 NOT be read by any merge, validation or derivation.
 Rationale: provenance, replay and reversibility depend on history never being rewritten, and refused data must
-never influence a document or accumulate without bound.
+never influence a document or accumulate without bound. History cannot grow without bound either, and the law
+sometimes requires data to be erased, so those two exceptions exist, and they are held to proof (compaction) and
+to an audit trail (purge).
 
 ### II. Schema Is the Single Source of Truth
 Field semantics (type, merge, default, computed, deferred, validate, authority) MUST be declared in the
@@ -98,4 +104,4 @@ MAJOR for removing or redefining a principle in a backward-incompatible way, MIN
 principle or materially expanding guidance, PATCH for clarifications. Every plan and review MUST verify
 compliance, and complexity MUST be justified. Runtime guidance lives in docs/SPEC.md.
 
-**Version**: 1.4.0 | **Ratified**: 2026-10-18 | **Last Amended**: 2026-10-18
+**Version**: 1.5.0 | **Ratified**: 2026-10-18 | **Last Amended**: 2026-10-20

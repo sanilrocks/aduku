@@ -1,6 +1,6 @@
 # aduku — Specification
 
-Status: Draft 0.11 · Audience: implementers and reviewers
+Status: Draft 0.12 · Audience: implementers and reviewers
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** are used as in RFC 2119.
 
@@ -147,11 +147,12 @@ entry {
   seq:            int         // per-document, strictly increasing; assigned by ledger at commit
   tier:           symbol      // contributor tier, must exist in the schema's tier list
   path:           string      // see 3.2
-  op:             symbol      // "set" | "delete" (core); extension ops in 4.3
+  op:             symbol      // "set" | "delete" (core); extension ops in 4.3; "layer" is written only by compaction (15.3)
   value:          any         // omitted for delete; for delete the engine uses deleted::null
   contributor:    string      // authenticated identity (user id, job id, service id)
   tx_time:        timestamp   // wall-clock at commit (informational; never used for ordering)
-  valid_time:     timestamp?  // OPTIONAL: when the fact became true in the world (bitemporal reads)
+  valid_time:     timestamp?  // OPTIONAL: when the fact became true in the world; a timestamp with an offset (BAD_VALID_TIME otherwise);
+                              // read only by as_of valid-time reads (12.2, 15.4); part of the request hash only when given (4.2 item 4)
   idem_key:       string?     // OPTIONAL per-entry key; REQUIRED for non-idempotent merge behaviors (6.3); reuse is rejected
   request_key:    string?     // OPTIONAL caller-supplied retry key shared by the entries of one request (4.2 item 4)
   request_hash:   string?     // SHA-256 of the canonical request (4.2 item 4); set when request_key is present
@@ -159,18 +160,22 @@ entry {
   request_id:     string      // entries accepted together share it; a request is atomic (4.2)
   lenient:        bool?       // true if written with the non-rejection flag (section 10.2)
   meta:           struct?     // free-form (batch id, ticket, reason text)
+  synthetic:      string?     // the compaction id, on the entries compaction writes in place of others (15.3)
+  purged:         bool?       // true for the placeholder a purge leaves in place of an erased entry (15.5)
 }
 ```
 
 ### 4.2 Invariants
 
-1. Entries are **immutable and append-only**. Corrections are new entries.
+1. Entries are **immutable and append-only**. Corrections are new entries. The only operations that change or remove an
+   existing entry are **compaction** (15.3) and **purge** (15.5). Both are recorded operations and atomic; compaction is
+   verified to change no answer before it commits, and a purge leaves a placeholder so that `seq` stays continuous.
 2. `seq` is the only ordering within a tier. `tx_time` MUST NOT affect merge results.
 3. **Only accepted contributions become entries.** A rejected request records **nothing** in the ledger. When rejection
    auditing is enabled (section 4.5) it is written to the separate rejection audit log, which is never read by any fold.
 4. **Retries are no-ops.** A request MAY carry a caller-supplied `request_key`. The request hash is SHA-256 over the canonical
-   form of `(doc, contributor identity, lenient flag, entries)` (each entry as tier, path, op, value, idem_key, meta;
-   `expected_seq` excluded). If the ledger already holds a request with the same `(doc, contributor, request_key)`:
+   form of `(doc, contributor identity, lenient flag, entries)` (each entry as tier, path, op, value, idem_key, meta, and
+   `valid_time` only when the entry carries one; `expected_seq` excluded). If the ledger already holds a request with the same `(doc, contributor, request_key)`:
    - same request hash: the request is a **duplicate**. It is not admitted, nothing is validated, audited or written, and the
      response is the same shape as the original success: the original `(id, seq)` list and `request_id`, the model-error
      changes recorded for that request, and the latest materialized view. A retry therefore never changes the response shape
@@ -805,6 +810,17 @@ one fetch deadline for the whole read; a field not finished by then follows its 
 `deferred`, never a rejection or a model error. `deferred` lists the status of every deferred field; `include: pending` adds
 what each pending field waits for. A write never calls a source, and `rebuild` never does.
 
+**Time travel.** `as_of` names exactly one point (more, or none, is `AS_OF_AMBIGUOUS`): a `seq` (the document after that
+entry, nothing after it; a seq beyond the last reads the current state, below the first the empty document), a `tx_time`
+(the document at the highest seq recorded at or before it; recording times need not grow with seq, so this is a maximum
+over all entries) or a `valid_time` (the entries whose `valid_time` is after it are left out, entries with no `valid_time`
+always take part, the rest are folded in the usual order). The answer says the seq it resolved to and how many entries took
+part. A time-travel read uses the schema version the document has now, writes nothing, and calls no hook or source: an
+impure compute uses the outcome recorded for its inputs at that point (none recorded: the model error
+`NO_RECORDED_OUTCOME`), and deferred fields are listed with status `unavailable` and no value. A point inside a compacted
+range is answered from the archived originals while they are kept; once they are expired it is refused with
+`HISTORY_COMPACTED` (and `earliest_seq`) unless it can still be answered exactly (15.4).
+
 ### 12.3 Explain
 
 ```
@@ -821,22 +837,31 @@ explain(doc, path) -> {
 ```
 The winner is the entry after which the path's value last changed, folding the entries that touch it in merge order. An
 entry is an input if deriving without it gives another value there (the winner is always an input); the rest are shadowed.
-A path the schema does not declare is `UNKNOWN_PATH`.
+A path the schema does not declare is `UNKNOWN_PATH`. `explain` accepts the same `as_of` as a read. After a compaction
+`explain` is answered from the archived originals while they are kept; once they are expired a synthetic entry (15.3) is
+one entry: an input if any of its sources was, shadowed if none was, and the answer lists its source ids and says the originals
+are no longer kept. A purged entry (15.5) is never the winner, an input or shadowed; the answer lists the purged entries that
+touched the path with when and why they were erased.
 
 ### 12.4 Admin
 
-`list_entries`, `rebuild(doc|all)`, `compact(doc, policy)`, `schema.put/activate`, `hook.invalidate(doc?, field)`,
+`list_entries`, `rebuild(doc|all)`, `compact(doc, policy)`, `verify_archive(doc)`, `expire_archive(doc, through_seq)`,
+`purge(doc, scope, reason)` (permitted only to the tiers and roles the schema lists in `purge_by`; `NOT_AUTHORIZED` otherwise),
+`purge_log(doc)`, `schema.put/activate`, `hook.invalidate(doc?, field)`,
 `scheduler.run(hook)` (both permitted only to the tiers and roles a field lists in `invalidate_by`; `NOT_AUTHORIZED` otherwise), `list_rejections(doc, { since?, limit? })`, `set_rejection_audit(doc, enabled|inherit)`,
 `prune_rejections(doc?)`, `recompute(doc, field?)`, `list_effects(doc, field?)`, `prune_effects(doc?)`.
 
-`rebuild` derives each document from the ledger alone and compares it with the cached view. A current view that differs is
-reported and repaired; a missing view, or one from another schema version, is derived afresh and stored (not a
-difference); a document that cannot be derived is reported and does not stop the others. It never writes to the ledger.
+`rebuild` derives each document from the ledger alone and compares it with the cached view and with the saved per-tier
+layers (15.1), byte for byte. A current view or layer that differs is reported and repaired; a missing one, one from another
+schema version or epoch, or a layer that merely lags, is derived afresh and stored (not a difference); a document that cannot
+be derived is reported and does not stop the others. It never writes to the ledger and calls no deferred source; it calls no impure hook while the recorded outcomes cover the inputs
+and otherwise fills a missing outcome once (9.3.1).
 
 ### 12.5 Error codes (non-exhaustive)
 
 `FIELD_NOT_WRITABLE`, `NOT_AUTHORIZED`, `TIER_NOT_PERMITTED`, `UNKNOWN_PATH`, `TYPE_MISMATCH`,
-`OP_NOT_ALLOWED`, `VALIDATION_FAILED`, `MODEL_ERROR_INTRODUCED`, `COMPUTE_FAULT`, `IMPURE_COMPUTE_FAILED`, `LENIENT_NOT_PERMITTED`, `DUPLICATE_IDEM_KEY`, `REQUEST_KEY_REUSED`, `IDEM_KEY_REQUIRED`, `SEQ_CONFLICT`, `SCHEMA_INACTIVE`, `STORAGE_ERROR` (an error, not a rejection).
+`OP_NOT_ALLOWED`, `VALIDATION_FAILED`, `MODEL_ERROR_INTRODUCED`, `COMPUTE_FAULT`, `IMPURE_COMPUTE_FAILED`, `LENIENT_NOT_PERMITTED`, `DUPLICATE_IDEM_KEY`, `REQUEST_KEY_REUSED`, `IDEM_KEY_REQUIRED`, `SEQ_CONFLICT`, `SCHEMA_INACTIVE`, `BAD_VALID_TIME`, `AS_OF_AMBIGUOUS`, `HISTORY_COMPACTED`, `MIXED_SCHEMA_RANGE`, `IDEM_KEY_MISSING`,
+`COMPACTION_CHECK_FAILED`, `LEDGER_CHANGED`, `PURGE_REASON_REQUIRED`, `UNKNOWN_ENTRY`, `STORAGE_ERROR` (an error, not a rejection).
 
 ---
 
@@ -874,6 +899,8 @@ difference); a document that cannot be derived is reported and does not stop the
 | Make field derived | **Breaking** | Historic entries shadowed (9.2). |
 | Change an impure compute's hook version or `depends` | Visible | Recorded outcomes for the old version or fingerprint are not reused; the next derivation that needs the value calls the hook again (a read may therefore do IO once). |
 | Change `failure_mode` / `impure_failure_mode` | Visible | Applies from the next request or derivation; existing model errors and recorded outcomes stay. |
+| Add, change or remove `purge_by` (15.5) | Visible | Applies to purges asked from then on. |
+| Change merge rules, types, tiers or which fields are derived, on a document with compacted history (15.3) | **Breaking** | The document is derived from the archived originals; once they are expired the version is refused for it (`HISTORY_COMPACTED`). A version that only changes validation, computed or deferred rules reuses the compacted entries. |
 | Insert/reorder tier | **Breaking** | `(tier, seq)` order changes; rebuild required. |
 | Drop or rename a tier used by existing entries | **Breaking** | Refused at activation while any entry in the ledger uses it. |
 
@@ -882,42 +909,80 @@ difference); a document that cannot be derived is reported and does not stop the
 
 ---
 
-## 15. Storage, snapshots and compaction
+## 15. Storage, snapshots, compaction and purge
 
 ### 15.1 Layout
 
-- **Ledger**: append-only, partitioned by document, ordered by `seq`.
-- **Snapshots**: optional per-tier layers `{doc, tier, watermark_seq, schema_version, state}`.
+- **Ledger**: append-only, partitioned by document, ordered by `seq`; changed only by compaction (15.3) and purge (15.5).
+- **Snapshots (saved layers)**: one per document and tier, `{doc, tier, tier_seq, schema_version, rules_fingerprint, epoch, state}`,
+  where `state` is the canonical text of the tier's folded layer (a list of `{p: path, s: value}`, with `t: true` for a tombstone,
+  `r: true` for a reset mark and `a: true` for absent, sorted by path text) and `tier_seq` is the highest seq of that tier it covers.
+  Saved layers are disposable: they never change a result, only the cost of getting it (15.2).
+- **Epoch**: a per-document number that grows with each compaction and purge; a layer or view of another epoch is not used.
+- **Archive**: the originals a compaction replaced, until an operator expires them (15.3).
+- **Purge log**: append-only, never read by a derivation (15.5).
 - **Derived store**: section 9.5.
 - **Effect log**: append-only impure-compute outcomes, separate from the ledger (section 9.3.1).
-- **Provenance index**: path → winning entry ids per layer.
 - **Rejection audit log** (optional): separate, capped by retention (section 4.5); never read by derivation.
 - **Model errors**: stored with the derived document view, keyed by schema version.
 
 ### 15.2 Incremental recomputation
 
-On append of an accepted entry at tier *t*: invalidate `Squash(t)`, `Merged`, and all derived fields downstream of the touched
-paths (via the dependency graph). Other tiers' snapshots remain valid. An impure compute is re-called only when its input
-fingerprint changes (or on `recompute`); otherwise its recorded outcome is reused.
+On append of an accepted entry at tier *t*, in the transaction that commits it, the layer of *t* (and of any tier whose saved
+layer is missing or stale) is saved with the cached view; other tiers' layers are reused as they are. A layer is used only if,
+for every tier with entries up to the view's watermark, a row of the same schema version, rules fingerprint and epoch covers
+exactly up to that tier's last seq. A reader that finds saved layers that fit continues from them, folding only the entries
+after the watermark; if they do not fit, or cannot be read or saved, the document is derived from the ledger and the result is
+the same. An impure compute is re-called only when its input fingerprint changes (or on `recompute`); otherwise its recorded
+outcome is reused.
 
 ### 15.3 Compaction
 
-- Compaction MAY replace accepted entries at or below a watermark with **one synthetic entry per tier and field set** that
-  reproduces the same squash result **and** carries the list of source entry ids.
-- Compaction MUST NOT change `Merged(d)` or the answer to `explain` beyond replacing entry ids with synthetic ids that
-  resolve to the retained originals in cold storage.
-- Non-idempotent behaviors (`sum`, `append`) MUST be compacted only together with their idempotency keys.
-- Compaction applies to ledger entries only. It MUST NOT remove or alter effect-log outcomes that derivation still reuses
-  (section 9.3.1); outcomes are pruned only by their own retention.
-- Retention policy decides when originals leave cold storage. Legal erasure uses **purge** (physical removal or
-  crypto-shredding of values) which is a recorded, auditable operation distinct from a tombstone.
+- Compaction replaces the accepted entries up to a **request boundary** (a request is never split) with **one synthetic `layer`
+  entry per tier**: its value is the tier's folded layer, its `seq` the highest of its sources, `synthetic` the compaction id. The
+  range must have been written under one schema version (`MIXED_SCHEMA_RANGE`). A field with a non-idempotent merge behavior is
+  compacted only with its idempotency keys (`IDEM_KEY_MISSING`); the keys of every source stay recorded, so a repeat is still
+  `DUPLICATE_IDEM_KEY`.
+- The originals go to the **archive**; the compaction also records the model errors (with who introduced each) and the skipped
+  seqs a replay of the requests had computed, the ids of its sources, and a request index, so that nothing a replay shows and no
+  retry answer changes.
+- Compaction MUST NOT change `Merged(d)`, its model errors, status, skipped and conflicting paths, or any `explain` answer while the
+  archive keeps the originals. Before it commits it derives the document, model errors, skipped and conflicting paths and the
+  `explain` answer of every path the range touched from the compacted ledger alone, compares them with the ledger as it is, and
+  refuses (`COMPACTION_CHECK_FAILED`, naming the first differences) if any differs; it MAY refuse a case it cannot prove equal.
+- Compaction applies to ledger entries only. It MUST NOT remove or alter effect-log outcomes, derived-store records, rejection
+  audit records or the request records that make a retry return its original answer.
+- `expire_archive(doc, through_seq)` deletes the archived originals of the compactions at or below a seq; it is recorded and
+  cannot be undone. The synthetic entries, their source ids, the request index and the retired idempotency keys stay.
+- A schema version that folds differently (see the change table in 14) is applied to a compacted document by deriving from the
+  archived originals; once they are expired it is refused (`HISTORY_COMPACTED`).
 
 ### 15.4 Time
 
-- `seq` orders; `tx_time` records. `valid_time` (optional) supports bitemporal reads (`as_of: {valid: t}`) by
-  filtering entries before folding.
+- `seq` orders; `tx_time` records. `valid_time` (optional) supports bitemporal reads (`as_of: {valid_time}`) by filtering
+  entries before folding; entries with no `valid_time` always take part.
 - **Late arrivals** (e.g. backfill) are modeled by **tier**, not by timestamps: a backfill entry arriving today sorts below
   earlier user entries in `(tier, seq)` and cannot clobber them under `lww`.
+- After the archive of a compaction is expired, a time-travel point inside its range is answered exactly only if: its seq is at or
+  above the watermark; its `tx_time` is earlier than the first or not earlier than the last recording time of the range; or it is
+  a `valid_time` and none of the compacted entries carried one. Anything else is `HISTORY_COMPACTED`.
+
+### 15.5 Purge
+
+- `purge(doc, scope, reason)` erases contributions for legal reasons: a scope is a path (every contribution at or below it,
+  optionally of one tier) or a list of entry ids. The schema lists who may purge in `purge_by` (tiers and roles; nobody by default)
+  and a reason is required. Physical removal is the only mode in v1.
+- It removes the erased values, `meta` and `valid_time` from the ledger, the archive, the compacted layers, the saved layers and
+  views, the effect-log inputs and outputs and the derived values of the fields that read the erased paths, and the attempted
+  values in the rejection audit records, in one transaction. A struct written above the path keeps the rest of its value. If the
+  originals of a compacted range were expired, the whole compacted contribution at the path is erased and the purge log says so.
+- The erased entry stays as a **placeholder** (id, seq, tier, path, operation, contributor, `tx_time`, request, schema version,
+  lenient flag and idempotency key stay; the value, `meta`, `valid_time` and the request hash are erased) and has no effect on any
+  derivation. The stored hash of every request that held an erased value goes too (a hash of a value is still a copy of it); a
+  retry of such a request is a duplicate with its original answer.
+- Each purge is recorded in the **purge log** (who, when, reason, document, scope, counts, erased entry ids), never a value. The
+  log is never read by a derivation and cannot be purged. A purge is not a tombstone: a tombstone is an entry that keeps the
+  history and says a field is deleted.
 
 ---
 
@@ -931,7 +996,7 @@ An implementation conforms if it passes:
    `tx_time` yields identical results.
 4. **Authority**: no sequence of accepted entries changes a derived field's value except via its behavior.
 5. **Sandbox**: a computed behavior given extra undeclared paths in the input document cannot observe them.
-6. **Replay**: `rebuild` from the ledger reproduces cached snapshots bit-for-bit.
+6. **Replay**: `rebuild` from the ledger reproduces cached snapshots (views and per-tier layers) bit-for-bit.
 7. **Rejection and atomicity**: a request with any rejected entry appends none of its entries; accepted requests commit
    their entries with consecutive `seq`; a rejected request leaves the ledger and every document unchanged; with auditing off nothing is
    recorded anywhere; with it on exactly one audit record exists; deleting the audit log changes no document.
@@ -1065,6 +1130,8 @@ Every question below was decided on 2026-10-18. The Decision line says what is i
 ---
 
 ## Appendix A. Changelog
+
+- **0.12**: Snapshots, time travel, compaction and purge as built in feature 005: saved per-tier layers with an epoch (15.1, 15.2), `as_of` by seq, `tx_time` and `valid_time` with the rules of 12.2 and 15.4, compaction with one `layer` entry per tier, an archive, its check and its expiry (15.3), and purge with `purge_by`, placeholders and the purge log (15.5); the append-only rule of 4.2 names compaction and purge as its only exceptions; `valid_time` joins the request hash only when given (4.1, 4.2).
 
 - **0.11**: Rule library and authority as clarified for feature 004: the rules of 10.6, authority inheritance and the wording of `NOT_AUTHORIZED` reasons (11).
 - **0.10**: Deferred fields as clarified and built for feature 003 (12.2 now says reads may call deferred sources): `invalidate_by` is required on every deferred field, a `per_fetch` value is reused only while its inputs are unchanged, the circuit breaker is per hook, the fetch deadline covers the whole read, and a notification only marks values out of date (9.5, 5.3, 12.4).

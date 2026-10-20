@@ -7,18 +7,30 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any, Literal
 
 from aduku.audit import AuditRecord, RejectionAudit
 from aduku.behaviors.registry import BehaviorRegistry
+from aduku.engine import compaction as compaction_engine
+from aduku.engine import purge as purge_engine
 from aduku.engine.admission import check_request
+from aduku.engine.asof import Selection, point_of, select
 from aduku.engine.compute import compute_fields, failure_mode_of
-from aduku.engine.derive import DerivationState, Prepared, prepare
+from aduku.engine.derive import (
+    DerivationState,
+    Prepared,
+    layers_fit,
+    prepare,
+    state_from_layers,
+)
 from aduku.engine.effects import EffectView, PendingCall, fingerprint, view_from_records
+from aduku.engine.explain import entry_touches
 from aduku.engine.explain import explain as explain_path
+from aduku.engine.layer_codec import decode_layer, encode_layer
 from aduku.engine.model_errors import (
+    Base,
     Extension,
     Origin,
     Replay,
@@ -30,32 +42,51 @@ from aduku.engine.model_errors import (
 )
 from aduku.engine.project import project
 from aduku.engine.request_hash import request_hash
+from aduku.engine.squash import spread
 from aduku.engine.validate import ValidatorFault
-from aduku.errors import ComputeFault, ErrorCode, Reason, RejectedError, SchemaError, StorageError
+from aduku.errors import (
+    ComputeFault,
+    ErrorCode,
+    HistoryCompactedError,
+    Reason,
+    RejectedError,
+    SchemaError,
+    StorageError,
+)
 from aduku.fetch import DeferredStage
 from aduku.hooks import HookRunner
-from aduku.ion_codec import ABSENT, TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical
+from aduku.ion_codec import ABSENT, TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical, to_utc
 from aduku.log import emit
 from aduku.model import (
     AppendResult,
+    ArchiveReport,
+    AsOf,
+    CompactionReport,
     DeferredInfo,
+    DeferredStatus,
     DocumentResult,
     EffectInfo,
     EffectRecord,
     Entry,
     EntryInput,
+    ExpiryReport,
     Explanation,
     Identity,
     ModelError,
+    PurgeApplication,
+    PurgedMark,
+    PurgeRecord,
+    PurgeReport,
+    PurgeScope,
     RebuildReport,
     RecomputeReport,
     SchedulerReport,
 )
-from aduku.paths import PathError, parse_path
+from aduku.paths import PathError, format_path, parse_path
 from aduku.scheduler import DEFAULT_BUDGET, Scheduler
 from aduku.schema.model import FieldSpec, Schema, conforms
 from aduku.schema.registry import SchemaRegistry
-from aduku.storage.base import Clock, ConstraintError, IdSource, RequestRecord, Storage, Tx, ViewRow
+from aduku.storage.base import Clock, ConstraintError, IdSource, LayerRow, RequestRecord, Storage, Tx, ViewRow
 
 __all__ = ["Aduku"]
 
@@ -88,10 +119,11 @@ def _decode_errors(text: str) -> tuple[ModelError, ...]:
     )
 
 
-def _fits(view: ViewRow | None, last: int, schema: Schema, effects_seq: int = 0) -> bool:
+def _fits(view: ViewRow | None, last: int, schema: Schema, effects_seq: int = 0, epoch: int = 0) -> bool:
     """A cached view serves a read only if it is of the latest entry and effect, and of this very version and rules."""
     return (
         view is not None
+        and view.epoch == epoch
         and view.watermark_seq == last
         and view.schema_version == schema.version
         and view.rules_fingerprint == schema.rules_fingerprint
@@ -106,6 +138,17 @@ def _decode_view(view: ViewRow) -> DocumentResult:
     )
 
 
+def _scope_text(scope: PurgeScope) -> FrozenStruct:
+    fields: dict[str, Any] = {}
+    if scope.path is not None:
+        fields["path"] = scope.path
+    if scope.tier is not None:
+        fields["tier"] = scope.tier
+    if scope.entries:
+        fields["entries"] = tuple(scope.entries)
+    return FrozenStruct(fields)
+
+
 def _known_request(
     tx: Tx, doc: str, contributor: Identity, request_key: str, digest: str | None
 ) -> AppendResult | None:
@@ -113,12 +156,14 @@ def _known_request(
     known = tx.find_request(doc, contributor.id, request_key)
     if known is None:
         return None
-    if known.request_hash != digest:
+    # a request whose values were erased by a purge has no hash left to compare (a hash of a value is a copy of it)
+    if known.request_hash is not None and known.request_hash != digest:
         raise RejectedError(
             ErrorCode.REQUEST_KEY_REUSED, message=f"request key {request_key!r} was used for a different request"
         )
-    stored = tx.entries_of_request(known.request_id)
-    return AppendResult(entries=tuple((e.id, e.seq) for e in stored), request_id=known.request_id, duplicate=True)
+    return AppendResult(
+        entries=tuple(tx.request_entries(known.request_id)), request_id=known.request_id, duplicate=True
+    )
 
 
 class _Cold(Exception):
@@ -155,8 +200,12 @@ class Aduku:
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         scheduler_budget: float = DEFAULT_BUDGET,
+        layers: bool = True,
     ) -> None:
         self.storage = storage
+        # Feature 005: save and use per-tier layers. False runs the same service without them (for tests and conformance:
+        # no result may depend on it).
+        self.layers = layers
         self.schemas = schemas
         self.clock = clock or Clock.system()
         self.ids = ids or IdSource.system()
@@ -189,13 +238,16 @@ class Aduku:
         self._retried_effects: OrderedDict[
             tuple[str, str, int, str], tuple[tuple[ModelError, ...], tuple[ModelError, ...]]
         ] = OrderedDict()
+        self._bases: dict[str, Base] = {}  # compaction id -> what a replay had computed when it was made (immutable)
         self._states_lock = threading.Lock()
         self._prepared: dict[
             tuple[str, int], Prepared
         ] = {}  # per schema version: the merge context, defaults and fallbacks
         self.state_cache_size = state_cache_size  # documents kept in memory; the least recently used are dropped
         self.derivations = 0  # how many times a document was derived (not served from a cache); for tests
-        schemas.guard(self._tiers_in_use)  # activating or pinning a version checks it against the ledger
+        schemas.guard(
+            self._tiers_in_use, self._compaction_problem
+        )  # activating or pinning checks it against the ledger
 
     # -- write ---------------------------------------------------------------------------------------------------
 
@@ -377,7 +429,9 @@ class Aduku:
             tx.append_request(RequestRecord(request_id, doc, contributor.id, request_key, digest), stored_entries)
         except ConstraintError as error:
             raise StorageError(f"ledger constraint violated: {error}") from error
-        state_now = ext.state
+        state_now = replace(
+            ext.state, epoch=tx.epoch(doc)
+        )  # the epoch it was derived in, not the one seen when remembered
         to_store = [
             r for r in fresh if stored_view is not None and stored_view.lookup(r.field, r.fingerprint, r.hook) is None
         ]
@@ -385,7 +439,8 @@ class Aduku:
             tx.append_effects(to_store)
             state_now = replace(state_now, effects_seq=tx.effects_seq(doc))
         document, text = self._settle(ext.document)
-        tx.put_view(self._view_row(doc, last + len(stored_entries), schema, text, state_now))
+        tx.put_view(self._view_row(doc, last + len(stored_entries), schema, text, state_now, tx.epoch(doc)))
+        self._save_layers(tx, doc, schema, state_now, {entry.tier for entry in entries})
         result = AppendResult(
             entries=tuple((e.id, e.seq) for e in stored_entries),
             request_id=request_id,
@@ -426,6 +481,7 @@ class Aduku:
                 request_hash=digest,
                 lenient=lenient,
                 meta=normalize(entry.meta) if entry.meta is not None else None,
+                valid_time=to_utc(entry.valid_time).replace(tzinfo=UTC) if entry.valid_time is not None else None,
             )
             for offset, entry in enumerate(entries)
         ]
@@ -489,15 +545,19 @@ class Aduku:
             memo = self._retried_effects.get(key)
         if memo is None:  # the ledger never changes, so what a request did never changes: work it out once
             with self.storage.read() as tx:
-                entries = tx.entries(doc, 0)
+                recorded = tx.request_effects(result.request_id)  # a request a compaction replaced: kept when it was
+                entries = self._entries(tx, doc, schema) if recorded is None else []
                 effects = self._effect_view(tx, self._engine(schema), doc)
-            replayed = self._replay(schema, entries, capture=result.request_id, effects=effects)
-            before = {e.identity for e in replayed.before}
-            after = {e.identity for e in replayed.after}
-            memo = (
-                tuple(e for e in replayed.after if e.identity not in before),
-                tuple(e for e in replayed.before if e.identity not in after),
-            )
+            if recorded is not None:
+                memo = (_decode_errors(recorded[0]), _decode_errors(recorded[1]))
+            else:
+                replayed = self._replay(schema, entries, capture=result.request_id, effects=effects)
+                before = {e.identity for e in replayed.before}
+                after = {e.identity for e in replayed.after}
+                memo = (
+                    tuple(e for e in replayed.after if e.identity not in before),
+                    tuple(e for e in replayed.before if e.identity not in after),
+                )
             with self._states_lock:
                 self._retried_effects[key] = memo
                 while len(self._retried_effects) > self.state_cache_size:
@@ -538,8 +598,12 @@ class Aduku:
         *,
         consistency: Literal["cached", "fresh"] = "cached",
         include: Sequence[str] = (),
+        as_of: AsOf | None = None,
     ) -> DocumentResult:
         """The merged document: a pure function of the ledger and the schema version the document is read under.
+
+        `as_of` (feature 005) reads the document at an earlier point: a seq, a recording time or a moment in the world. Such
+        a read writes nothing and calls no hook or source; deferred fields are listed `unavailable` and have no value.
 
         A read never takes the write lock: a view it has to derive is kept in memory only. The stored view is written
         by `append` and `rebuild`. Deferred fields (feature 003) are overlaid after that: sources that are due are
@@ -548,6 +612,8 @@ class Aduku:
         """
         if consistency not in ("cached", "fresh"):
             raise ValueError("consistency is cached or fresh")
+        if as_of is not None:
+            return self._as_of_document(doc, as_of)
         schema = self.schemas.version_for(doc)
         core = self._core(doc, schema)
         if not DeferredStage.has_deferred(schema):
@@ -561,10 +627,11 @@ class Aduku:
             last = tx.last_seq(doc)
             effects = self._effect_view(tx, ready, doc)
             seen = effects.seq if effects else 0
+            epoch = tx.epoch(doc)
             view = tx.get_view(doc)
-            if not _fits(view, last, schema, seen):
+            if not _fits(view, last, schema, seen, epoch):
                 view = self._kept_view(doc)
-            if view is not None and _fits(view, last, schema, seen):
+            if view is not None and _fits(view, last, schema, seen, epoch):
                 return _decode_view(view)
             state, entries = self._load(tx, schema, doc, last, seen)
         ext = self._rebuild(schema, state, entries, effects)  # outside the read transaction
@@ -573,12 +640,73 @@ class Aduku:
                 schema, doc, ext, effects or EffectView(), lambda view: self._rebuild(schema, state, entries, view)
             )
         self.derivations += 1
-        self._remember(doc, ext.state)
+        self._remember(doc, replace(ext.state, epoch=epoch))
         document, text = self._settle(ext.document)
-        self._keep_view(self._view_row(doc, last, schema, text, ext.state))
+        self._keep_view(self._view_row(doc, last, schema, text, ext.state, epoch))
         return project(document, ext.errors, ext.state.skipped, ext.conflicts)
 
-    def explain(self, doc: str, path: str) -> Explanation:
+    def _as_of_inputs(
+        self, doc: str, schema: Schema, ready: Prepared, as_of: AsOf
+    ) -> tuple[Selection, EffectView | None, set[str]]:
+        """The entries that take part at `as_of`, the recorded outcomes of impure computes and the ids that came out of the
+        archive; reads only."""
+        point_of(as_of)  # one point, or a refusal, before anything is read
+        as_of = AsOf(
+            as_of.seq,
+            None if as_of.tx_time is None else to_utc(as_of.tx_time).replace(tzinfo=UTC),
+            None if as_of.valid_time is None else to_utc(as_of.valid_time).replace(tzinfo=UTC),
+        )
+        with self.storage.read() as tx:
+            # the originals the archive still keeps stand in for the synthetic entries, so any point inside a compacted range
+            # is answered exactly; what is expired is refused below (feature 005, FR-029)
+            entries, archived = self._restore(tx, doc, tx.entries(doc, 0), strict=False)
+            self._refuse_expired_point(tx, doc, as_of)
+            effects = self._effect_view(tx, ready, doc)
+            tx_seq = tx.seq_at_tx_time(doc, as_of.tx_time) if as_of.tx_time is not None else None
+        return select(entries, as_of, tx_seq=tx_seq), effects, archived
+
+    @staticmethod
+    def _refuse_expired_point(tx: Tx, doc: str, as_of: AsOf) -> None:
+        """Refuse a point that falls inside a compacted range whose originals were expired (never a wrong document)."""
+        expired = [c for c in tx.compactions(doc) if not c.archived]
+        for record in expired:
+            if as_of.seq is not None:
+                inside = as_of.seq < record.watermark_seq
+            elif as_of.tx_time is not None:
+                first, last = record.first_tx_time, record.last_tx_time
+                inside = first is not None and last is not None and first <= as_of.tx_time < last
+            else:
+                inside = record.has_valid_time
+            if inside:
+                earliest = max(c.watermark_seq for c in expired)
+                raise HistoryCompactedError(
+                    f"{doc!r} was compacted up to seq {earliest} and the originals are no longer kept, so this point "
+                    f"cannot be answered exactly; the earliest seq that can be is {earliest}",
+                    earliest_seq=earliest,
+                )
+
+    def _as_of_document(self, doc: str, as_of: AsOf) -> DocumentResult:
+        """The document at a point of its history, under the schema version it has now (feature 005, research R-11)."""
+        schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
+        selection, effects, _ = self._as_of_inputs(doc, schema, ready, as_of)
+        ext = self._replay(schema, selection.entries, effects=effects).final
+        # an impure field with no recorded outcome for its inputs at that point: a model error, never a hook call
+        missing = tuple(
+            ModelError("NO_RECORDED_OUTCOME", call.field, "no outcome was recorded for this field's inputs")
+            for call in ext.pending
+        )
+        errors = tuple(sorted((*ext.errors, *missing), key=lambda error: error.identity))
+        document, _ = self._settle(ext.document)
+        result = project(document, errors, ext.state.skipped, ext.conflicts)
+        unavailable = tuple(
+            DeferredStatus(spec.pattern, "unavailable", reason="history_not_kept")
+            for spec in sorted(schema.fields, key=lambda spec: spec.pattern)
+            if spec.deferred is not None
+        )
+        return replace(result, deferred=unavailable, as_of=selection.info)
+
+    def explain(self, doc: str, path: str, *, as_of: AsOf | None = None) -> Explanation:
         """Why `path` has its value in `doc`: the winning entry, the rule, and the entries that made no difference.
 
         Worked out from the ledger under the schema version the document is read under. Raises RejectedError
@@ -592,6 +720,8 @@ class Aduku:
         if schema.field_for(parsed) is None:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message="the schema does not declare this path")
         derived = schema.derived_field_at_or_above(parsed)
+        if as_of is not None:
+            return self._explain_as_of(doc, path, parsed, schema, derived, as_of)
         if derived is not None and derived.derived == "deferred":
             return self._with_authority(
                 schema, parsed, self._deferred.explain(schema, doc, self._core(doc, schema), derived.pattern, path)
@@ -600,11 +730,70 @@ class Aduku:
         if ready.has_impure:
             self.get(doc)  # makes sure every impure field has an outcome for its current inputs
         with self.storage.read() as tx:
-            entries = tx.entries(doc, 0)
+            entries: list[Entry]
+            archived: set[str]
+            if tx.epoch(doc) == 0:
+                entries, archived = tx.entries(doc, 0), set()
+            else:  # exact while the archive keeps the originals; a synthetic entry is one entry once they are expired
+                entries, archived = self._restore(tx, doc, tx.entries(doc, 0), strict=False)
+            marks = self._purged_marks(tx, doc, entries, parsed)
             effects = self._effect_view(tx, ready, doc)
         errors = self._replay(schema, entries, effects=effects).final.errors  # of the same entries, so one snapshot
         return self._with_authority(
-            schema, parsed, explain_path(schema, self.behaviors, ready, entries, path, errors, effects)
+            schema,
+            parsed,
+            replace(
+                self._with_compaction(
+                    explain_path(schema, self.behaviors, ready, entries, path, errors, effects), entries, archived
+                ),
+                purged=marks,
+            ),
+        )
+
+    @staticmethod
+    def _purged_marks(tx: Tx, doc: str, entries: list[Entry], path: Any) -> tuple[PurgedMark, ...]:
+        """The purged entries that touched `path`, with when and why they were erased (feature 005)."""
+        placeholders = [e for e in entries if e.purged and entry_touches(e, path)]
+        if not placeholders:
+            return ()
+        by_entry: dict[str, PurgeRecord] = {}
+        for record in tx.purge_log(doc):
+            for entry_id in parse(record.counts).get("ids", ()):
+                by_entry.setdefault(str(entry_id), record)
+        return tuple(
+            PurgedMark(e.id, e.seq, by_entry[e.id].at, by_entry[e.id].reason) for e in placeholders if e.id in by_entry
+        )
+
+    def _with_compaction(self, why: Explanation, entries: list[Entry], archived: set[str]) -> Explanation:
+        """Say whether a synthetic entry took part in the answer (and what it stands for) or the originals were used."""
+        named = {why.winner, *why.inputs, *why.shadowed}
+        synthetic = {e.id: e for e in entries if e.synthetic is not None and e.id in named}
+        if synthetic:
+            with self.storage.read() as tx:
+                sources = tuple(row.source_id for e in synthetic.values() for row in tx.sources_of(e.synthetic or ""))
+            return replace(why, originals_kept=False, sources=sources)
+        if named & archived:
+            return replace(why, originals_kept=True)
+        return why
+
+    def _explain_as_of(
+        self, doc: str, path: str, parsed: Any, schema: Schema, derived: FieldSpec | None, as_of: AsOf
+    ) -> Explanation:
+        ready = self._engine(schema)
+        selection, effects, archived = self._as_of_inputs(doc, schema, ready, as_of)
+        if derived is not None and derived.derived == "deferred":  # no history is kept for a deferred value
+            return self._with_authority(
+                schema, parsed, Explanation(path, None, "deferred", None, None, status="unavailable")
+            )
+        errors = self._replay(schema, selection.entries, effects=effects).final.errors
+        return self._with_authority(
+            schema,
+            parsed,
+            self._with_compaction(
+                explain_path(schema, self.behaviors, ready, selection.entries, path, errors, effects),
+                selection.entries,
+                archived,
+            ),
         )
 
     @staticmethod
@@ -643,9 +832,13 @@ class Aduku:
         differing: list[str] = []
         refreshed: list[str] = []
         failed: list[tuple[str, str]] = []
+        layers_differing: list[tuple[str, str]] = []
+        layers_refreshed: list[tuple[str, str]] = []
         for name in names:
             try:
-                outcome = self._rebuild_one(name)
+                outcome, tiers_differ, tiers_fresh = self._rebuild_one(name)
+                layers_differing.extend((name, tier) for tier in tiers_differ)
+                layers_refreshed.extend((name, tier) for tier in tiers_fresh)
             except (
                 ValidatorFault,
                 ComputeFault,
@@ -660,20 +853,37 @@ class Aduku:
                 differing.append(name)
             elif outcome == "refreshed":
                 refreshed.append(name)
-        report = RebuildReport(tuple(names), tuple(differing), tuple(refreshed), tuple(failed))
-        emit("rebuild", checked=len(names), differing=differing, refreshed=refreshed, failed=[d for d, _ in failed])
+        report = RebuildReport(
+            tuple(names),
+            tuple(differing),
+            tuple(refreshed),
+            tuple(failed),
+            tuple(layers_differing),
+            tuple(layers_refreshed),
+        )
+        emit(
+            "rebuild",
+            checked=len(names),
+            differing=differing,
+            refreshed=refreshed,
+            failed=[d for d, _ in failed],
+            layers_differing=layers_differing,
+            layers_refreshed=layers_refreshed,
+        )
         return report
 
-    def _rebuild_one(self, doc: str) -> str:
+    def _rebuild_one(self, doc: str) -> tuple[str, list[str], list[str]]:
         schema = self.schemas.version_for(doc)
         ready = self._engine(schema)
         with self.storage.read() as tx:
             last = tx.last_seq(doc)
             cached = tx.get_view(doc)
-            entries = tx.entries(doc, 0)
+            entries = self._entries(tx, doc, schema)
             effects = self._effect_view(tx, ready, doc)
+            epoch = tx.epoch(doc)
+            saved = {row.tier: row for row in tx.get_layers(doc)} if self.layers else {}
         if last == 0:  # no entries: nothing to derive, cache or compare
-            return "same"
+            return "same", [], []
         ext = self._replay(schema, entries, effects=effects).final  # from the ledger alone: no kept state is trusted
         if ext.pending:
             ext, effects = self._fill(
@@ -685,14 +895,76 @@ class Aduku:
             )
         self.derivations += 1
         _, text = self._settle(ext.document)
-        fresh = self._view_row(doc, last, schema, text, ext.state)
-        self._remember(doc, ext.state)
-        if cached == fresh:
-            return "same"
+        fresh = self._view_row(doc, last, schema, text, ext.state, epoch)
+        self._remember(doc, replace(ext.state, epoch=epoch))
+        wanted, layers_differ, layers_fresh = self._compare_layers(doc, schema, ext.state, entries, epoch, saved)
+        if cached == fresh and not layers_differ and not layers_fresh:
+            return "same", [], []
         with self.storage.transaction() as tx:  # repair, unless something was appended in the meantime
-            if tx.last_seq(doc) == last:
-                tx.put_view(fresh)
-        return "differs" if _fits(cached, last, schema, fresh.effects_seq) else "refreshed"
+            if tx.last_seq(doc) == last and tx.epoch(doc) == epoch:
+                if cached != fresh:
+                    tx.put_view(fresh)
+                if layers_differ or layers_fresh:
+                    tx.drop_layers(doc)
+                    tx.put_layers(wanted)
+        if layers_differ or layers_fresh:
+            emit("layers_repaired", doc=doc, differing=layers_differ, refreshed=layers_fresh)
+        if cached == fresh:
+            return "same", layers_differ, layers_fresh
+        outcome = "differs" if _fits(cached, last, schema, fresh.effects_seq, epoch) else "refreshed"
+        return outcome, layers_differ, layers_fresh
+
+    def _compare_layers(
+        self,
+        doc: str,
+        schema: Schema,
+        state: DerivationState,
+        entries: Sequence[Entry],
+        epoch: int,
+        saved: dict[str, LayerRow],
+    ) -> tuple[list[LayerRow], list[str], list[str]]:
+        """The layers the ledger gives, and the tiers whose saved layer differs from them or is missing or stale.
+
+        A saved layer made under this very version and epoch whose text or coverage is not what the ledger gives is a
+        difference, unless it merely lags behind (a writer that did not get to save it): that is stale, like a missing
+        layer or one from another version.
+        """
+        if not self.layers:
+            return [], [], []
+        last_by_tier: dict[str, int] = {}
+        for entry in entries:
+            last_by_tier[entry.tier] = max(last_by_tier.get(entry.tier, 0), entry.seq)
+        wanted: list[LayerRow] = []
+        differ: list[str] = []
+        stale: list[str] = []
+        for tier in schema.tiers:
+            seq = last_by_tier.get(tier, 0)
+            row = saved.get(tier)
+            if seq == 0:
+                if row is not None and row.tier_seq != 0:
+                    differ.append(tier)
+                continue
+            expected = LayerRow(
+                doc,
+                tier,
+                seq,
+                schema.version,
+                schema.rules_fingerprint,
+                epoch,
+                encode_layer(state.layers.get(tier, {})),
+            )
+            wanted.append(expected)
+            if row is None or (row.schema_version, row.rules_fingerprint, row.epoch) != (
+                expected.schema_version,
+                expected.rules_fingerprint,
+                expected.epoch,
+            ):
+                stale.append(tier)
+            elif row.tier_seq < seq:
+                stale.append(tier)
+            elif row != expected:
+                differ.append(tier)
+        return wanted, differ, stale
 
     def _engine(self, schema: Schema) -> Prepared:
         with self._states_lock:
@@ -705,26 +977,175 @@ class Aduku:
         self, tx: Tx, schema: Schema, doc: str, last: int, effects_seq: int = 0
     ) -> tuple[DerivationState | None, list[Entry]]:
         """The kept state if it fits this schema and this effect log, and the entries it has not folded in yet."""
+        epoch = tx.epoch(doc)
         with self._states_lock:
             state = self._states.get(doc)
         if state is not None and (
-            state.schema_ref is not schema or state.watermark > last or state.effects_seq != effects_seq
+            state.schema_ref is not schema
+            or state.watermark > last
+            or state.effects_seq != effects_seq
+            or state.epoch != epoch  # a compaction or purge since: the entries it folded are no longer the ledger's
         ):
             state = (
                 None  # built under other rules or an older log (or ahead of the ledger): start again from the ledger
             )
-        entries = tx.entries(doc, state.watermark if state else 0)
+        if state is None:
+            state = self._saved_state(tx, schema, doc, last, effects_seq)  # a cold process: the saved layers
+        entries = self._entries(tx, doc, schema, state.watermark if state else 0)
         if state is not None and any(e.schema_version != schema.version for e in entries):
             state, entries = (
                 None,
-                tx.entries(doc, 0),
+                self._entries(tx, doc, schema),
             )  # written under other rules: attribute as a replay of the ledger does
         return state, entries
 
+    def _saved_state(self, tx: Tx, schema: Schema, doc: str, last: int, effects_seq: int) -> DerivationState | None:
+        """The state the saved layers and the stored view stand for, if they fit the ledger (research R-3), else None.
+
+        A layer that is missing, lagging, damaged or from other rules is simply not used; the caller replays the ledger.
+        """
+        if not self.layers:
+            return None
+        view = tx.get_view(doc)
+        epoch = tx.epoch(doc)
+        if (
+            view is None
+            or view.watermark_seq > last
+            or view.schema_version != schema.version
+            or view.rules_fingerprint != schema.rules_fingerprint
+            or view.effects_seq != effects_seq
+            or view.epoch != epoch
+        ):
+            return None
+        rows = {row.tier: row for row in tx.get_layers(doc)}
+        tier_seqs = {tier: tx.tier_last_seq(doc, tier, view.watermark_seq) for tier in schema.tiers}
+        if not layers_fit(rows, tier_seqs, schema, epoch):
+            return None
+        try:
+            notes = parse(view.provenance)
+            return state_from_layers(
+                schema,
+                view.watermark_seq,
+                {tier: row.state for tier, row in rows.items()},
+                skipped=tuple(notes.get("skipped", ())),
+                errors=_decode_errors(view.model_errors),
+                conflicts=tuple(notes.get("conflicts", ())),
+                effects_seq=view.effects_seq,
+                epoch=epoch,
+            )
+        except (IonError, ValueError, AttributeError, KeyError, TypeError):
+            return None  # damaged: ignored, and replaced by the next write
+
+    def _layer_rows(
+        self, tx: Tx, doc: str, schema: Schema, state: DerivationState, touched: set[str]
+    ) -> list[LayerRow]:
+        """The layers to save for `state`: those of the tiers a request touched, and any that are missing or stale."""
+        epoch = tx.epoch(doc)
+        existing = {row.tier: row for row in tx.get_layers(doc)}
+        rows: list[LayerRow] = []
+        for tier in schema.tiers:
+            seq = tx.tier_last_seq(doc, tier, state.watermark)
+            if seq == 0:
+                continue
+            saved = existing.get(tier)
+            current = (
+                saved is not None
+                and saved.tier_seq == seq
+                and saved.schema_version == schema.version
+                and saved.rules_fingerprint == schema.rules_fingerprint
+                and saved.epoch == epoch
+            )
+            if current and tier not in touched:
+                continue
+            text = encode_layer(state.layers.get(tier, {}))
+            rows.append(LayerRow(doc, tier, seq, schema.version, schema.rules_fingerprint, epoch, text))
+        return rows
+
+    def _save_layers(self, tx: Tx, doc: str, schema: Schema, state: DerivationState, touched: set[str]) -> None:
+        """Save layers in the transaction that commits the request (research R-1, R-3).
+
+        Best effort: layers are a cache, so a failure here is logged and never fails or rejects the request.
+        """
+        if not self.layers:
+            return
+        try:
+            rows = self._layer_rows(tx, doc, schema, state, touched)
+            if rows:
+                tx.put_layers(rows)
+        except Exception as error:  # noqa: BLE001 - a cache: whatever went wrong, the request stands
+            emit("layers_not_saved", doc=doc, error=type(error).__name__)
+
     def _replay(
-        self, schema: Schema, entries: list[Entry], capture: str | None = None, effects: EffectView | None = None
+        self,
+        schema: Schema,
+        entries: list[Entry],
+        capture: str | None = None,
+        effects: EffectView | None = None,
+        bases: dict[str, Base] | None = None,
+        trail: dict[str, tuple[tuple[ModelError, ...], tuple[ModelError, ...]]] | None = None,
     ) -> Replay:
-        return replay(schema, self.schemas.get, self.behaviors, self._engine, entries, capture, effects)
+        known = {**self._bases_for(entries), **(bases or {})}
+        return replay(schema, self.schemas.get, self.behaviors, self._engine, entries, capture, effects, known, trail)
+
+    def _bases_for(self, entries: Sequence[Entry]) -> dict[str, Base]:
+        """For the compactions whose synthetic entries are among `entries`: what their replay had computed (feature 005)."""
+        wanted = {e.synthetic: e.doc for e in entries if e.synthetic is not None}
+        with self._states_lock:
+            missing = [cid for cid in wanted if cid not in self._bases]
+        if missing:
+            with self.storage.read() as tx:
+                for doc in sorted({wanted[cid] for cid in missing}):
+                    for record in tx.compactions(doc):
+                        base = Base(_decode_errors(record.base_errors), record.base_skipped)
+                        with self._states_lock:
+                            self._bases.setdefault(record.id, base)
+        with self._states_lock:
+            return {cid: self._bases[cid] for cid in wanted if cid in self._bases}
+
+    def _entries(self, tx: Tx, doc: str, schema: Schema, since_seq: int = 0) -> list[Entry]:
+        """The entries a derivation under `schema` folds: the live ledger, or, if the document was compacted under rules
+        that fold differently, the originals restored from the archive (feature 005, research R-10)."""
+        if tx.epoch(doc) == 0:
+            return tx.entries(doc, since_seq)
+        records = tx.compactions(doc)
+        if not records or all(r.fold_fingerprint == schema.fold_fingerprint for r in records):
+            return tx.entries(doc, since_seq)
+        restored = self._restore(tx, doc, tx.entries(doc, 0), strict=True)[0]
+        return [e for e in restored if e.seq > since_seq]
+
+    def _restore(self, tx: Tx, doc: str, entries: list[Entry], strict: bool) -> tuple[list[Entry], set[str]]:
+        """`entries` with every synthetic entry replaced by the originals the archive keeps (recursively).
+
+        A synthetic entry whose archive was expired stays as it is, or, with `strict`, raises HistoryCompactedError. The
+        second result is the ids of the entries that came out of the archive."""
+        archived: set[str] = set()
+
+        def expand(entry: Entry) -> list[Entry]:
+            if entry.synthetic is None:
+                return [entry]
+            originals = [o for o in tx.archive_of(entry.synthetic) if o.tier == entry.tier]  # this tier's sources
+            if not originals:  # expired
+                if strict:
+                    watermark = max((c.watermark_seq for c in tx.compactions(doc)), default=entry.seq)
+                    raise HistoryCompactedError(
+                        f"the history of {doc!r} up to seq {watermark} was compacted and its originals are no longer kept",
+                        earliest_seq=watermark,
+                    )
+                return [entry]
+            found = [piece for original in originals for piece in expand(original)]
+            archived.update(piece.id for piece in found)
+            return found
+
+        restored = [piece for entry in entries for piece in expand(entry)]
+        return sorted(restored, key=lambda e: e.seq), archived
+
+    def _forget(self, doc: str) -> None:
+        """Drop what this process kept in memory about a document (after the stored ledger was rewritten)."""
+        with self._states_lock:
+            self._states.pop(doc, None)
+            self._views.pop(doc, None)
+            for key in [k for k in self._retried_effects if k[0] == doc]:
+                del self._retried_effects[key]
 
     def _rebuild(
         self, schema: Schema, state: DerivationState | None, entries: list[Entry], effects: EffectView | None = None
@@ -922,8 +1343,9 @@ class Aduku:
                 last = tx.last_seq(doc)
                 effects = self._effect_view(tx, self._engine(schema), doc)
                 state, entries = self._load(tx, schema, doc, last, effects.seq if effects else 0)
+                epoch = tx.epoch(doc)
             if entries:
-                self._remember(doc, self._catch_up(schema, state, entries, effects))
+                self._remember(doc, replace(self._catch_up(schema, state, entries, effects), epoch=epoch))
         except (ValidatorFault, ComputeFault, RejectedError):
             return
 
@@ -933,7 +1355,9 @@ class Aduku:
         text = to_canonical(document)
         return parse(text), text
 
-    def _view_row(self, doc: str, last: int, schema: Schema, text: str, state: DerivationState) -> ViewRow:
+    def _view_row(
+        self, doc: str, last: int, schema: Schema, text: str, state: DerivationState, epoch: int = 0
+    ) -> ViewRow:
         notes = FrozenStruct({"skipped": tuple(state.skipped), "conflicts": state.conflicts})
         return ViewRow(
             doc,
@@ -944,6 +1368,7 @@ class Aduku:
             _encode_errors(state.errors),
             to_canonical(notes),
             state.effects_seq,
+            epoch,
         )
 
     def _remember(self, doc: str, folded: DerivationState) -> None:
@@ -954,6 +1379,357 @@ class Aduku:
             self._states.move_to_end(doc)
             while len(self._states) > self.state_cache_size:
                 self._states.popitem(last=False)
+
+    # -- purge (feature 005) --------------------------------------------------------------------------------------------
+
+    def purge(self, doc: str, scope: PurgeScope, *, reason: str, caller: Identity) -> PurgeReport:
+        """Erase contributions for good (legal erasure) and record that it was done, without the values.
+
+        Allowed only to a caller whose tier or role the schema lists in `purge_by` (nobody, by default), and only with a
+        reason. The erased values, `meta` and `valid_time` go from the ledger, the archive, the compacted layers, the saved
+        layers and views, the effect-log records and derived values downstream of the erased paths, and the values in the
+        rejection audit log, in one transaction; the entries stay as placeholders so that seq numbers stay continuous.
+        """
+        schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
+        if not {*caller.tiers, *caller.roles} & set(schema.purge_by):
+            raise RejectedError(ErrorCode.NOT_AUTHORIZED, message=f"{caller.id} may not purge documents of this schema")
+        if not reason.strip():
+            raise RejectedError(ErrorCode.PURGE_REASON_REQUIRED, message="a purge needs a reason or a ticket")
+        if (scope.path is None) == (not scope.entries):
+            raise ValueError("a purge scope names a path or entries, not both and not neither")
+        if scope.tier is not None and scope.tier not in schema.tiers:
+            raise RejectedError(
+                ErrorCode.TIER_NOT_PERMITTED, message=f"tier {scope.tier!r} is not defined by the schema"
+            )
+        parsed: Any = None
+        if scope.path is not None:
+            try:
+                parsed = parse_path(scope.path)
+            except PathError as error:
+                raise RejectedError(ErrorCode.UNKNOWN_PATH, message=f"invalid path: {error}") from error
+            if schema.field_for(parsed) is None:
+                raise RejectedError(ErrorCode.UNKNOWN_PATH, message="the schema does not declare this path")
+            derived = schema.derived_field_at_or_above(parsed)
+            if derived is not None:
+                raise RejectedError(
+                    ErrorCode.FIELD_NOT_WRITABLE,
+                    message=f"{derived.pattern} is a {derived.derived} field: nothing was contributed there",
+                )
+        with self.storage.transaction() as tx:
+            records = {r.id: r for r in tx.compactions(doc)}
+            live = tx.entries(doc, 0)
+            archive = [(cid, entry) for cid in records for entry in tx.archive_of(cid)]
+            known = {e.id for e in live if e.synthetic is None} | {e.id for _, e in archive if e.synthetic is None}
+            for entry_id in scope.entries:
+                if entry_id not in known:
+                    raise RejectedError(
+                        ErrorCode.UNKNOWN_ENTRY,
+                        message=f"no entry {entry_id!r} in {doc!r} (an entry whose originals were expired is purged by path)",
+                    )
+            changes = purge_engine.plan(
+                live, archive, records, schema, self.behaviors, ready,
+                path=parsed, tier=scope.tier, entry_ids=frozenset(scope.entries),
+            )  # fmt: skip
+            fields = purge_engine.downstream_fields(schema, [parse_path(p) for p in changes.paths])
+            effects, derived_rows = tx.apply_purge(
+                PurgeApplication(doc, changes.live, changes.archive, changes.requests, fields)
+            )
+            scrubbed = self._scrub_audit(doc, changes.paths)
+            erased_ids = sorted(e.id for e in (*changes.live, *changes.archive) if e.purged)
+            counts = FrozenStruct(
+                {
+                    "entries_erased": changes.erased,
+                    "entries_rewritten": changes.rewritten,
+                    "archive_rows": len(changes.archive),
+                    "effects_erased": effects,
+                    "derived_erased": derived_rows,
+                    "audit_scrubbed": scrubbed,
+                    "expired_sources": changes.expired_sources,
+                    "ids": tuple(erased_ids),
+                }
+            )
+            record = PurgeRecord(
+                self.ids.new_id(), doc, to_canonical(_scope_text(scope)), reason.strip(), caller.id, self.clock.now(),
+                to_canonical(counts),
+            )  # fmt: skip
+            tx.append_purge_log(record)
+        self._forget(doc)
+        emit(
+            "purge",
+            doc=doc,
+            purge=record.id,
+            actor=caller.id,
+            entries_erased=changes.erased,
+            entries_rewritten=changes.rewritten,
+            archive_rows=len(changes.archive),
+            effects_erased=effects,
+            derived_erased=derived_rows,
+            audit_scrubbed=scrubbed,
+        )
+        return PurgeReport(
+            record.id, doc, changes.erased, changes.rewritten, len(changes.archive), effects, derived_rows, scrubbed,
+            changes.expired_sources,
+        )  # fmt: skip
+
+    def purge_log(self, doc: str) -> list[PurgeRecord]:
+        """The record of every purge of a document, oldest first (never a value)."""
+        with self.storage.read() as tx:
+            return tx.purge_log(doc)
+
+    def _scrub_audit(self, doc: str, paths: Sequence[str]) -> int:
+        """Take the attempted values out of the rejection audit records that touch an erased path."""
+        erased = [parse_path(p) for p in paths]
+        backend = self.storage.audit_backend()
+        changed = 0
+        for row in backend.rows(doc):
+            attempts = list(parse(row.attempted))
+            scrubbed: list[Any] = []
+            touched = False
+            for item in attempts:
+                try:
+                    where = parse_path(str(item.get("path", "")))
+                except PathError:
+                    scrubbed.append(item)
+                    continue
+                if any(where[: len(p)] == p or p[: len(where)] == where for p in erased) and (
+                    "value" in item or "meta" in item
+                ):
+                    item = FrozenStruct(
+                        {k: v for k, v in item.items() if k not in ("value", "meta")} | {"purged": True}
+                    )
+                    touched = True
+                scrubbed.append(item)
+            if touched and row.id is not None:
+                backend.update_attempted(row.id, to_canonical(tuple(scrubbed)))
+                changed += 1
+        return changed
+
+    # -- compaction, archive and expiry (feature 005) ------------------------------------------------------------------
+
+    def compact(
+        self,
+        doc: str,
+        *,
+        through_seq: int | None = None,
+        older_than: timedelta | None = None,
+        verify: bool = True,
+    ) -> CompactionReport:
+        """Replace the entries up to a request boundary by one synthetic entry per tier, keeping the originals in the archive.
+
+        Before anything is written the document, its model errors (with who introduced each), its skipped and conflicting
+        paths and the `explain` answer of every path the range touched are derived from the compacted ledger and compared
+        with those of the ledger as it is; any difference refuses with COMPACTION_CHECK_FAILED and changes nothing. Entries
+        recorded meanwhile are kept, in order, after the watermark (LEDGER_CHANGED if the range itself changed).
+        """
+        if (through_seq is None) == (older_than is None):
+            raise ValueError("give exactly one of through_seq and older_than")
+        schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
+        with self.storage.read() as tx:
+            epoch0 = tx.epoch(doc)
+            entries = tx.entries(doc, 0)
+            records = tx.compactions(doc)
+            effects = self._effect_view(tx, ready, doc)
+        nothing = CompactionReport(doc, None, 0, 0, 0, 0, noop=True)
+        if not entries:
+            return nothing
+        if any(r.fold_fingerprint != schema.fold_fingerprint for r in records):
+            raise HistoryCompactedError(
+                f"{doc!r} was compacted under rules that fold differently from version {schema.version}"
+            )
+        if older_than is not None:
+            cutoff = self.clock.now() - older_than
+            bound = 0
+            for entry in entries:
+                if entry.tx_time >= cutoff:
+                    break
+                bound = entry.seq
+            policy = f"older_than={older_than.total_seconds():g}s"
+        else:
+            bound = int(through_seq or 0)
+            policy = f"through_seq={bound}"
+        watermark = compaction_engine.watermark_for(entries, bound)
+        if watermark == 0:
+            return nothing
+        head = [e for e in entries if e.seq <= watermark]
+        trail: dict[str, tuple[tuple[ModelError, ...], tuple[ModelError, ...]]] = {}
+        head_ext = self._replay(schema, head, effects=effects, trail=trail).final
+        base = Base(head_ext.errors, head_ext.state.skipped)
+        compaction_id = self.ids.new_id()
+        earlier = {
+            r.id: compaction_engine.EarlierCompaction(r.first_tx_time, r.last_tx_time, r.has_valid_time)
+            for r in records
+        }
+        result = compaction_engine.plan(
+            entries,
+            schema,
+            self.behaviors,
+            ready,
+            doc=doc,
+            through_seq=bound,
+            compaction_id=compaction_id,
+            new_id=self.ids.new_id,
+            created=self.clock.now(),
+            policy=policy,
+            base_errors=_encode_errors(base.errors),
+            base_skipped=base.skipped,
+            earlier=earlier,
+        )
+        if result is None:
+            return nothing
+        effects_of = []
+        for request_id in dict.fromkeys(row[0] for row in result.request_index):
+            was, now = trail.get(request_id, ((), ()))
+            kept, found = {e.identity for e in was}, {e.identity for e in now}
+            effects_of.append(
+                (
+                    request_id,
+                    _encode_errors(tuple(e for e in now if e.identity not in kept)),
+                    _encode_errors(tuple(e for e in was if e.identity not in found)),
+                )
+            )
+        result = replace(result, request_effects=tuple(effects_of))
+        after_entries = compaction_engine.compacted_ledger(result, entries)
+        recorded = Base(_decode_errors(result.record.base_errors), result.record.base_skipped)  # as it will be stored
+        after_ext = self._replay(schema, after_entries, effects=effects, bases={compaction_id: recorded}).final
+        checked = 0
+        if verify:
+            before_ext = self._replay(schema, entries, effects=effects).final
+            paths = self._touched_paths(schema, result.replaced)
+            found_differences = compaction_engine.shape_problems(result) + compaction_engine.differences(
+                self._observe(schema, ready, before_ext, entries, paths, effects),
+                self._observe(schema, ready, after_ext, after_entries, paths, effects),
+                compaction_engine.id_map(result),
+            )
+            if found_differences:
+                raise RejectedError(
+                    ErrorCode.COMPACTION_CHECK_FAILED,
+                    [Reason(ErrorCode.COMPACTION_CHECK_FAILED, text) for text in found_differences],
+                )
+            checked = len(paths)
+        try:
+            with self.storage.transaction() as tx:
+                same = [(e.id, e.seq) for e in tx.entries(doc, 0, until_seq=watermark)] == [(e.id, e.seq) for e in head]
+                outcomes_moved = effects is not None and tx.effects_seq(doc) != effects.seq
+                if tx.epoch(doc) != epoch0 or not same or outcomes_moved:
+                    raise RejectedError(
+                        ErrorCode.LEDGER_CHANGED, message="the ledger changed while the check ran; try again"
+                    )
+                tx.apply_compaction(result)
+                tx.drop_layers(doc)
+                if after_ext.pending:  # impure fields still waiting for an outcome: leave the view to the next read
+                    tx.drop_view(doc)
+                else:
+                    epoch = tx.epoch(doc)
+                    state = replace(after_ext.state, epoch=epoch)
+                    _, text = self._settle(after_ext.document)
+                    tx.put_view(self._view_row(doc, state.watermark, schema, text, state, epoch))
+                    self._save_layers(tx, doc, schema, state, set(schema.tiers))
+        except ConstraintError as error:
+            raise RejectedError(
+                ErrorCode.LEDGER_CHANGED, message=f"the ledger changed during the compaction: {error}"
+            ) from error
+        with self._states_lock:
+            self._bases[compaction_id] = recorded
+        self._forget(doc)
+        emit(
+            "compaction",
+            doc=doc,
+            compaction=compaction_id,
+            watermark=watermark,
+            replaced=len(result.replaced),
+            synthetic=len(result.synthetic),
+        )
+        return CompactionReport(doc, compaction_id, watermark, len(result.replaced), len(result.synthetic), checked)
+
+    def _touched_paths(self, schema: Schema, replaced: Sequence[Entry]) -> list[str]:
+        """The declared, contributed paths a range of entries wrote (what `explain` is compared on)."""
+        ready = self._engine(schema)
+        found: set[str] = set()
+        for entry in replaced:
+            if entry.purged or entry.tier not in schema.tiers:
+                continue
+            try:
+                if entry.op == "layer":
+                    written = list(decode_layer(entry.value))
+                elif entry.op == "set":
+                    written = list(spread(ready.ctx, parse_path(entry.path), entry.value))
+                else:
+                    written = [parse_path(entry.path)]
+            except (PathError, IonError):
+                continue
+            for path in written:
+                if schema.field_for(path) is not None and schema.derived_field_at_or_above(path) is None:
+                    found.add(format_path(path))
+        return sorted(found)
+
+    def _observe(
+        self,
+        schema: Schema,
+        ready: Prepared,
+        ext: Extension,
+        entries: list[Entry],
+        paths: Sequence[str],
+        effects: EffectView | None,
+    ) -> compaction_engine.Observed:
+        explained = {
+            path: explain_path(schema, self.behaviors, ready, entries, path, ext.errors, effects) for path in paths
+        }
+        return compaction_engine.Observed(
+            to_canonical(ext.document), ext.errors, ext.state.skipped, ext.conflicts, explained
+        )
+
+    def verify_archive(self, doc: str) -> ArchiveReport:
+        """Derive the document from the archived originals and from the compacted ledger, and say where they differ.
+
+        Not checked (checked=False) when the originals are no longer all kept, or the rules fold differently now."""
+        schema = self.schemas.version_for(doc)
+        ready = self._engine(schema)
+        with self.storage.read() as tx:
+            records = tx.compactions(doc)
+            entries = tx.entries(doc, 0)
+            effects = self._effect_view(tx, ready, doc)
+            if not records or any(r.fold_fingerprint != schema.fold_fingerprint for r in records):
+                return ArchiveReport(doc, False)
+            try:
+                originals, _ = self._restore(tx, doc, entries, strict=True)
+            except HistoryCompactedError:
+                return ArchiveReport(doc, False)
+        compacted = self._replay(schema, entries, effects=effects).final
+        full = self._replay(schema, originals, effects=effects).final
+        return ArchiveReport(
+            doc, True, tuple(compaction_engine.differences(self._observe_all(full), self._observe_all(compacted), {}))
+        )
+
+    @staticmethod
+    def _observe_all(ext: Extension) -> compaction_engine.Observed:
+        return compaction_engine.Observed(to_canonical(ext.document), ext.errors, ext.state.skipped, ext.conflicts)
+
+    def expire_archive(self, doc: str, *, through_seq: int) -> ExpiryReport:
+        """Delete the archived originals of the compactions with a watermark at or below `through_seq` (a recorded act).
+
+        The synthetic entries, their source ids, the request index and the retired idempotency keys stay."""
+        with self.storage.transaction() as tx:
+            removed = tx.expire_archive(doc, through_seq, self.clock.now())
+        emit("archive_expired", doc=doc, through_seq=through_seq, expired=removed)
+        return ExpiryReport(doc, through_seq, removed)
+
+    def _compaction_problem(self, schema: Schema, doc: str | None) -> str | None:
+        """Why a schema version may not serve a document (or any): its compacted history cannot be re-folded under it."""
+        with self.storage.read() as tx:
+            for name in [doc] if doc is not None else tx.doc_ids():
+                if tx.epoch(name) == 0:
+                    continue
+                records = tx.compactions(name)
+                if any(r.fold_fingerprint != schema.fold_fingerprint for r in records) and any(
+                    not r.archived for r in records
+                ):
+                    return (
+                        f"HISTORY_COMPACTED: version {schema.version} folds differently from the rules {name!r} was "
+                        "compacted under, and the originals are no longer kept"
+                    )
+        return None
 
     def list_entries(self, doc: str, *, since_seq: int = 0, limit: int | None = None) -> list[Entry]:
         with self.storage.read() as tx:
@@ -1062,7 +1838,7 @@ class Aduku:
             raise RejectedError(ErrorCode.NOT_AUTHORIZED, message=f"{caller.id} may not recompute {field}")
         skipped = tuple(sorted(spec.pattern for spec in chosen if spec not in permitted))
         with self.storage.read() as tx:
-            entries = tx.entries(doc, 0)
+            entries = self._entries(tx, doc, schema)
             effects = self._effect_view(tx, ready, doc)
         document = self._replay(schema, entries, effects=effects).final.document
         results = compute_fields(schema, self.behaviors, document, ready.computed, effects).results

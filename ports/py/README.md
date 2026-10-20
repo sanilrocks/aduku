@@ -1,7 +1,7 @@
 # aduku-py
 
 The Python port of **aduku**: an append-only ledger of contributions merged into documents by a central annotated schema
-(Document Oriented Design): the core ledger and merge engine (feature 001) computed fields (feature 002), deferred fields (feature 003) and the validation rule library with per-field authority (feature 004). The specification is
+(Document Oriented Design): the core ledger and merge engine (feature 001) computed fields (feature 002), deferred fields (feature 003), the validation rule library with per-field authority (feature 004) and saved layers, time travel, compaction and purge (feature 005). The specification is
 [`docs/SPEC.md`](../../docs/SPEC.md); the shared test vectors are in [`conformance/`](../../conformance).
 
 ## Install
@@ -100,6 +100,25 @@ behaviors.register_validate(
 declared. Try it with [`examples/rules.schema.ion`](examples/rules.schema.ion) and [`examples/demo_rules.py`](examples/demo_rules.py), as in
 [`quickstart.md`](../../specs/004-validation-authority/quickstart.md); the rules are in
 [`contracts/rules.md`](../../specs/004-validation-authority/contracts/rules.md).
+
+## Fast reads, time travel, compaction and purge (feature 005)
+
+```python
+from aduku import AsOf   # get(doc, as_of=AsOf(seq=7)); also AsOf(tx_time=...) and AsOf(valid_time=...)
+db.get("acme", as_of=AsOf(seq=7))                      # the document right after entry 7, with its model errors
+db.get("acme", as_of=AsOf(valid_time=march_first))     # only what was true then (entries with no valid_time always take part)
+db.compact("acme", through_seq=10_000)                 # one `layer` entry per tier; the originals go to the archive
+db.verify_archive("acme"); db.expire_archive("acme", through_seq=10_000)
+db.purge("acme", PurgeScope(path="/email"), reason="ticket 4711", caller=dpo)   # the schema's `purge_by` says who may
+```
+
+Saved per-tier layers make a cold start and an append fold only what is new; they are a cache, so losing them changes
+no result (`Aduku(..., layers=False)` runs without them), and `rebuild` compares them with the ledger byte for byte. A
+compaction derives the document, its model errors, its skipped paths and the `explain` answer of every touched path from the
+compacted ledger and refuses if anything differs; a purge leaves a placeholder per entry, cleans every store that holds the
+value and logs the act without it. The command line has `get --as-of`, `explain --as-of`, `append --valid-time`, `compact`,
+`archive verify|expire`, `purge` and `purge-log`. Try [`examples/demo_history.py`](examples/demo_history.py), as in
+[`quickstart.md`](../../specs/005-snapshots-compaction-time-travel/quickstart.md).
 
 The full API is in
 [`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields and

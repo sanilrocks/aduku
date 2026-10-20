@@ -7,16 +7,27 @@ A write therefore costs what it changes, not the size of the ledger, and a read 
 from __future__ import annotations
 
 import threading
+from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from aduku.model import DerivedRecord, Entry, SchedulerRun
+from aduku.model import (
+    CompactionPlan,
+    CompactionRecord,
+    DerivedRecord,
+    Entry,
+    PurgeApplication,
+    PurgeRecord,
+    SchedulerRun,
+    SourceRow,
+)
 from aduku.storage.base import (
     AuditRow,
     ConstraintError,
     EffectRecord,
+    LayerRow,
     RequestRecord,
     ViewRow,
     effects_to_prune,
@@ -37,6 +48,17 @@ class _State:
     derived: dict[tuple[str, str], DerivedRecord] = field(default_factory=dict)  # (doc, field) -> latest result
     runs: list[SchedulerRun] = field(default_factory=list)
     leases: dict[str, tuple[str, datetime]] = field(default_factory=dict)  # source -> (owner, expires)
+    layers: dict[tuple[str, str], LayerRow] = field(default_factory=dict)  # (doc, tier) -> saved layer (feature 005)
+    epochs: dict[str, int] = field(default_factory=dict)
+    archive: dict[str, list[tuple[str, Entry]]] = field(
+        default_factory=dict
+    )  # doc -> (compaction id, original), seq order
+    compactions: dict[str, list[CompactionRecord]] = field(default_factory=dict)  # doc -> oldest first
+    sources: dict[str, list[SourceRow]] = field(default_factory=dict)  # compaction id -> replaced entries
+    request_index: dict[str, list[tuple[str, int]]] = field(default_factory=dict)  # request id -> (entry id, seq)
+    expiries: list[tuple[str, int, datetime, int]] = field(default_factory=list)
+    request_effects: dict[str, tuple[str, str]] = field(default_factory=dict)  # request id -> (added, resolved) text
+    purges: list[PurgeRecord] = field(default_factory=list)
 
 
 class _MemoryTx:
@@ -54,10 +76,15 @@ class _MemoryTx:
         return rows[-1].seq if rows else 0
 
     @live
-    def entries(self, doc: str, since_seq: int = 0, limit: int | None = None) -> list[Entry]:
+    def entries(
+        self, doc: str, since_seq: int = 0, limit: int | None = None, *, until_seq: int | None = None
+    ) -> list[Entry]:
         rows = self._s.entries.get(doc, [])
-        # seqs are consecutive from 1 (append_request enforces it), so the entries after `since_seq` start at that index
-        return rows[max(since_seq, 0) :] if limit is None else rows[max(since_seq, 0) : max(since_seq, 0) + limit]
+        # seqs grow but may have gaps once history was compacted, so find the start by search
+        start = bisect_right(rows, max(since_seq, 0), key=lambda e: e.seq)
+        stop = len(rows) if until_seq is None else bisect_right(rows, until_seq, key=lambda e: e.seq)
+        found = rows[start:stop]
+        return found if limit is None else found[:limit]
 
     @live
     def entries_of_request(self, request_id: str) -> list[Entry]:
@@ -139,6 +166,166 @@ class _MemoryTx:
         previous = self._s.views.pop(doc, None)
         self._undo.append(lambda: self._restore_view(doc, previous))
 
+    # -- saved layers and the epoch (feature 005) --------------------------------------------------------------------
+
+    @live
+    def get_layers(self, doc: str) -> list[LayerRow]:
+        return sorted((r for (d, _), r in self._s.layers.items() if d == doc), key=lambda r: r.tier)
+
+    @live
+    def put_layers(self, rows: Sequence[LayerRow]) -> None:
+        layers = self._s.layers
+        before: dict[tuple[str, str], LayerRow | None] = {}
+        for row in rows:
+            key = (row.doc, row.tier)
+            kept = layers.get(key)
+            if kept is not None and (
+                row.epoch < kept.epoch or (row.epoch == kept.epoch and row.tier_seq < kept.tier_seq)
+            ):
+                continue
+            before.setdefault(key, kept)
+            layers[key] = row
+        self._undo.append(lambda: self._restore_layers(before))
+
+    @live
+    def drop_layers(self, doc: str) -> None:
+        doomed = {key: row for key, row in self._s.layers.items() if key[0] == doc}
+        for key in doomed:
+            del self._s.layers[key]
+        self._undo.append(lambda: self._restore_layers(dict(doomed)))
+
+    @live
+    def tier_last_seq(self, doc: str, tier: str, through: int) -> int:
+        return max((e.seq for e in self._s.entries.get(doc, []) if e.tier == tier and e.seq <= through), default=0)
+
+    @live
+    def epoch(self, doc: str) -> int:
+        return self._s.epochs.get(doc, 0)
+
+    @live
+    def bump_epoch(self, doc: str) -> int:
+        epochs = self._s.epochs
+        previous = epochs.get(doc, 0)
+        epochs[doc] = previous + 1
+        self._undo.append(lambda: epochs.__setitem__(doc, previous))
+        return previous + 1
+
+    @live
+    def seq_at_tx_time(self, doc: str, moment: datetime) -> int:
+        live_rows = self._s.entries.get(doc, [])
+        archived = [entry for _, entry in self._s.archive.get(doc, [])]
+        return max((e.seq for e in (*live_rows, *archived) if e.tx_time <= moment), default=0)
+
+    @live
+    def apply_compaction(self, plan: CompactionPlan) -> None:
+        state = self._s
+        doc = plan.record.doc
+        live_rows = state.entries.get(doc, [])
+        by_id = {entry.id: entry for entry in live_rows}
+        for entry in plan.replaced:
+            if by_id.get(entry.id) != entry:
+                raise ConstraintError(f"entry {entry.id!r} is not in the ledger as the compaction expects")
+        replaced = {entry.id for entry in plan.replaced}
+        for entry in plan.synthetic:
+            if entry.id in by_id and entry.id not in replaced:
+                raise ConstraintError(f"entry id {entry.id!r} is already used")
+        touched = {entry.request_id for entry in plan.replaced}
+        before = (
+            list(live_rows),
+            list(state.archive.get(doc, [])),
+            list(state.compactions.get(doc, [])),
+            {rid: list(state.request_index.get(rid, [])) for rid in touched},
+            {rid: list(state.by_request.get(rid, [])) for rid in touched},
+            state.epochs.get(doc, 0),
+        )
+        kept = [entry for entry in live_rows if entry.id not in replaced]
+        state.entries[doc] = sorted([*kept, *plan.synthetic], key=lambda entry: entry.seq)
+        state.archive[doc] = sorted(
+            [*state.archive.get(doc, []), *((plan.record.id, entry) for entry in plan.replaced)],
+            key=lambda item: item[1].seq,
+        )
+        state.compactions[doc] = [*state.compactions.get(doc, []), plan.record]
+        state.sources[plan.record.id] = list(plan.sources)
+        for request_id, entry_id, seq in plan.request_index:
+            state.request_index.setdefault(request_id, []).append((entry_id, seq))
+        for request_id in touched:
+            state.by_request[request_id] = [e for e in state.by_request.get(request_id, []) if e.id not in replaced]
+        state.epochs[doc] = before[5] + 1
+        for request_id, added, resolved in plan.request_effects:
+            state.request_effects[request_id] = (added, resolved)
+
+        def undo() -> None:
+            for request_id, _, _ in plan.request_effects:
+                state.request_effects.pop(request_id, None)
+            state.entries[doc] = before[0]
+            state.archive[doc] = before[1]
+            state.compactions[doc] = before[2]
+            state.sources.pop(plan.record.id, None)
+            for rid in touched:
+                state.request_index[rid] = before[3][rid]
+                if not before[3][rid]:
+                    del state.request_index[rid]
+                state.by_request[rid] = before[4][rid]
+            state.epochs[doc] = before[5]
+
+        self._undo.append(undo)
+
+    @live
+    def compactions(self, doc: str) -> list[CompactionRecord]:
+        return list(self._s.compactions.get(doc, []))
+
+    @live
+    def sources_of(self, compaction_id: str) -> list[SourceRow]:
+        return sorted(self._s.sources.get(compaction_id, []), key=lambda row: row.seq)
+
+    @live
+    def archive_of(self, compaction_id: str) -> list[Entry]:
+        found = [entry for rows in self._s.archive.values() for cid, entry in rows if cid == compaction_id]
+        return sorted(found, key=lambda entry: entry.seq)
+
+    @live
+    def archived_entries(self, doc: str, through_seq: int | None = None) -> list[Entry]:
+        rows = [entry for _, entry in self._s.archive.get(doc, [])]
+        return [e for e in rows if through_seq is None or e.seq <= through_seq]
+
+    @live
+    def request_entries(self, request_id: str) -> list[tuple[str, int]]:
+        live_entries = self._s.by_request.get(request_id, [])
+        if live_entries:
+            return [(entry.id, entry.seq) for entry in live_entries]
+        return sorted(self._s.request_index.get(request_id, []), key=lambda item: item[1])
+
+    @live
+    def request_effects(self, request_id: str) -> tuple[str, str] | None:
+        return self._s.request_effects.get(request_id)
+
+    @live
+    def expire_archive(self, doc: str, through_seq: int, at: datetime) -> int:
+        state = self._s
+        doomed = {c.id for c in state.compactions.get(doc, []) if c.archived and c.watermark_seq <= through_seq}
+        if not doomed:
+            return 0
+        before = (list(state.archive.get(doc, [])), list(state.compactions.get(doc, [])), len(state.expiries))
+        removed = [item for item in state.archive.get(doc, []) if item[0] in doomed]
+        state.archive[doc] = [item for item in state.archive.get(doc, []) if item[0] not in doomed]
+        state.compactions[doc] = [replace(c, archived=False) if c.id in doomed else c for c in state.compactions[doc]]
+        state.expiries.append((doc, through_seq, at, len(removed)))
+
+        def undo() -> None:
+            state.archive[doc] = before[0]
+            state.compactions[doc] = before[1]
+            del state.expiries[before[2] :]
+
+        self._undo.append(undo)
+        return len(removed)
+
+    def _restore_layers(self, before: Mapping[tuple[str, str], LayerRow | None]) -> None:
+        for key, row in before.items():
+            if row is None:
+                self._s.layers.pop(key, None)
+            else:
+                self._s.layers[key] = row
+
     @live
     def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
         state = self._s
@@ -186,6 +373,88 @@ class _MemoryTx:
         state.effects[:] = [r for r in state.effects if r.effect_seq not in doomed]
         self._undo.append(lambda: state.effects.__setitem__(slice(None), before))
         return len(doomed)
+
+    # -- purge (feature 005) -----------------------------------------------------------------------------------------
+
+    @live
+    def apply_purge(self, application: PurgeApplication) -> tuple[int, int]:
+        state = self._s
+        doc = application.doc
+        live_rows = state.entries.get(doc, [])
+        live_by_id = {entry.id: index for index, entry in enumerate(live_rows)}
+        archive_rows = state.archive.get(doc, [])
+        archive_by_id = {entry.id: index for index, (_, entry) in enumerate(archive_rows)}
+        for entry in application.live:
+            if entry.id not in live_by_id:
+                raise ConstraintError(f"entry {entry.id!r} is not in the ledger")
+        for entry in application.archive:
+            if entry.id not in archive_by_id:
+                raise ConstraintError(f"entry {entry.id!r} is not in the archive")
+        saved = (
+            list(live_rows),
+            list(archive_rows),
+            {rid: list(state.by_request.get(rid, [])) for rid in {e.request_id for e in application.live}},
+            {rid: state.requests.get(rid) for rid in application.requests},
+            [row for (d, _), row in state.layers.items() if d == doc],
+            state.views.get(doc),
+            state.epochs.get(doc, 0),
+            list(state.effects),
+            {key: value for key, value in state.derived.items() if key[0] == doc},
+        )
+        for entry in application.live:
+            live_rows[live_by_id[entry.id]] = entry
+            if entry.request_id in state.by_request:
+                state.by_request[entry.request_id] = [
+                    entry if e.id == entry.id else e for e in state.by_request[entry.request_id]
+                ]
+        for entry in application.archive:
+            archive_rows[archive_by_id[entry.id]] = (archive_rows[archive_by_id[entry.id]][0], entry)
+        for request_id in application.requests:
+            if request_id in state.requests:
+                state.requests[request_id] = replace(state.requests[request_id], request_hash=None)
+        for key in [key for key in state.layers if key[0] == doc]:
+            del state.layers[key]
+        state.views.pop(doc, None)
+        state.epochs[doc] = saved[6] + 1
+        fields = set(application.fields)
+        gone_effects = [r for r in state.effects if r.doc == doc and r.field in fields]
+        state.effects[:] = [r for r in state.effects if not (r.doc == doc and r.field in fields)]
+        gone_derived = [key for key in state.derived if key[0] == doc and key[1] in fields]
+        for key in gone_derived:
+            del state.derived[key]
+
+        def undo() -> None:
+            live_rows[:] = saved[0]
+            archive_rows[:] = saved[1]
+            for rid, rows in saved[2].items():
+                state.by_request[rid] = rows
+            for rid, record in saved[3].items():
+                if record is not None:
+                    state.requests[rid] = record
+            for row in saved[4]:
+                state.layers[(row.doc, row.tier)] = row
+            if saved[5] is not None:
+                state.views[doc] = saved[5]
+            state.epochs[doc] = saved[6]
+            state.effects[:] = saved[7]
+            state.derived.update(saved[8])
+
+        self._undo.append(undo)
+        return len(gone_effects), len(gone_derived)
+
+    @live
+    def append_purge_log(self, record: PurgeRecord) -> None:
+        purges = self._s.purges
+        purges.append(record)
+
+        def undo() -> None:
+            purges.pop()
+
+        self._undo.append(undo)
+
+    @live
+    def purge_log(self, doc: str) -> list[PurgeRecord]:
+        return [r for r in self._s.purges if r.doc == doc]
 
     # -- the derived store of deferred fields (feature 003) ----------------------------------------------------------
 
@@ -317,6 +586,27 @@ class _MemoryReadTx(_MemoryTx):
     def drop_view(self, doc: str) -> None:
         raise RuntimeError("read-only transaction")
 
+    def put_layers(self, rows: Sequence[LayerRow]) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def drop_layers(self, doc: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_compaction(self, plan: CompactionPlan) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_purge(self, application: PurgeApplication) -> tuple[int, int]:
+        raise RuntimeError("read-only transaction")
+
+    def append_purge_log(self, record: PurgeRecord) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def expire_archive(self, doc: str, through_seq: int, at: datetime) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def bump_epoch(self, doc: str) -> int:
+        raise RuntimeError("read-only transaction")
+
     def put_derived(self, records: Sequence[DerivedRecord]) -> None:
         raise RuntimeError("read-only transaction")
 
@@ -406,6 +696,10 @@ class MemoryAuditBackend:
     def add_pruned(self, doc: str, count: int) -> None:
         with self._lock:
             self._pruned[doc] = self._pruned.get(doc, 0) + count
+
+    def update_attempted(self, row_id: int, attempted: str) -> None:
+        with self._lock:
+            self._rows = [replace(r, attempted=attempted) if r.id == row_id else r for r in self._rows]
 
     def get_override(self, doc: str) -> str | None:
         with self._lock:

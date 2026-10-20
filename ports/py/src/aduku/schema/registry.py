@@ -38,6 +38,7 @@ class SchemaRegistry:
         self._active: int | None = None
         self._pins: dict[str, int] = {}
         self._usage: Callable[[str | None], set[str]] | None = None
+        self._compaction: Callable[[Schema, str | None], str | None] | None = None
 
     def load(self, path_or_text: str | PurePath, behaviors: BehaviorRegistry | None = None) -> Schema:
         """Parse and validate a schema from schema text or a file path, failing closed with every problem found.
@@ -75,13 +76,20 @@ class SchemaRegistry:
     def versions(self) -> tuple[int, ...]:
         return tuple(sorted(self._versions))
 
-    def guard(self, tiers_in_use: Callable[[str | None], set[str]]) -> None:
+    def guard(
+        self,
+        tiers_in_use: Callable[[str | None], set[str]],
+        compaction_problem: Callable[[Schema, str | None], str | None] | None = None,
+    ) -> None:
         """Tell the registry where to find the tiers the ledger uses (one document, or all with None).
+
+        `compaction_problem` (feature 005) says why a version cannot serve compacted history, or None.
 
         A service sets this when it is built. Without it nothing is known about the ledger and nothing is checked, so
         the version that is already active, and every pin, are checked now (SchemaError if one drops a used tier).
         """
         self._usage = tiers_in_use
+        self._compaction = compaction_problem
         if self._active is not None:
             self._check_tiers(self._versions[self._active], None)
         for doc, version in self._pins.items():
@@ -90,6 +98,9 @@ class SchemaRegistry:
     def _check_tiers(self, schema: Schema, doc: str | None) -> None:
         if self._usage is None:
             return
+        problem = self._compaction(schema, doc) if self._compaction is not None else None
+        if problem is not None:
+            raise SchemaError(problem)
         missing = sorted(self._usage(doc) - set(schema.tiers))
         if missing:
             where = f"document {doc!r}" if doc is not None else "the ledger"

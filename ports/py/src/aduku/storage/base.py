@@ -12,7 +12,17 @@ from typing import Any, Protocol, cast
 
 from ulid import ULID
 
-from aduku.model import DerivedRecord, EffectRecord, Entry, SchedulerRun
+from aduku.model import (
+    CompactionPlan,
+    CompactionRecord,
+    DerivedRecord,
+    EffectRecord,
+    Entry,
+    PurgeApplication,
+    PurgeRecord,
+    SchedulerRun,
+    SourceRow,
+)
 
 __all__ = [
     "AuditBackend",
@@ -22,6 +32,7 @@ __all__ = [
     "EffectRecord",
     "FakeClock",
     "IdSource",
+    "LayerRow",
     "RequestRecord",
     "SequentialIds",
     "Storage",
@@ -91,6 +102,21 @@ class ViewRow:
     model_errors: str
     provenance: str
     effects_seq: int = 0  # the greatest effect-log sequence number the view was derived with (feature 002)
+    epoch: int = 0  # feature 005: the document's epoch when it was derived; another epoch means it is not used
+
+
+@dataclass(frozen=True)
+class LayerRow:
+    """One saved per-tier layer (feature 005, research R-1): the canonical text of what the tier's entries fold to, up to
+    and including `tier_seq` (the highest seq of that tier it covers), made under one schema version and epoch."""
+
+    doc: str
+    tier: str
+    tier_seq: int
+    schema_version: int
+    rules_fingerprint: str
+    epoch: int
+    state: str
 
 
 @dataclass(frozen=True)
@@ -136,14 +162,19 @@ class AuditBackend(Protocol):
 
     def set_override(self, doc: str, setting: str | None) -> None: ...
 
+    def update_attempted(self, row_id: int, attempted: str) -> None:
+        """Replace the attempted entries of one record (a purge scrubs the values out of them)."""
+
 
 class Tx(Protocol):
     """One storage transaction. Reads see this transaction's own writes."""
 
     def last_seq(self, doc: str) -> int: ...
 
-    def entries(self, doc: str, since_seq: int = 0, limit: int | None = None) -> list[Entry]:
-        """Entries after `since_seq` in seq order; at most `limit` of them when given."""
+    def entries(
+        self, doc: str, since_seq: int = 0, limit: int | None = None, *, until_seq: int | None = None
+    ) -> list[Entry]:
+        """Entries after `since_seq` (and up to `until_seq` when given) in seq order; at most `limit` of them when given."""
 
     def entries_of_request(self, request_id: str) -> list[Entry]: ...
 
@@ -184,6 +215,74 @@ class Tx(Protocol):
         The outcome in force is never removed, so no derivation changes."""
 
     def drop_view(self, doc: str) -> None: ...
+
+    # -- saved layers and the document epoch (feature 005) -----------------------------------------------------------
+
+    def get_layers(self, doc: str) -> list[LayerRow]:
+        """The saved layers of a document, in tier-name order."""
+
+    def put_layers(self, rows: Sequence[LayerRow]) -> None:
+        """Save layers. A row replaces the saved one of its (document, tier) only if it is of a newer epoch, or of the same
+        epoch and covers at least as much (`tier_seq`): a slow writer cannot regress a newer layer."""
+
+    def drop_layers(self, doc: str) -> None: ...
+
+    def tier_last_seq(self, doc: str, tier: str, through: int) -> int:
+        """The highest seq of an entry of `tier` at or below `through`, 0 if there is none."""
+
+    def epoch(self, doc: str) -> int:
+        """The document's epoch: 0 until a compaction, an expiry or a purge changes the stored ledger (then it grows)."""
+
+    def bump_epoch(self, doc: str) -> int: ...
+
+    # -- compaction, archive and expiry (feature 005) ------------------------------------------------------------------
+
+    def apply_compaction(self, plan: CompactionPlan) -> None:
+        """One atomic step: copy the replaced entries to the archive, remove them, insert the synthetic entries, record the
+        compaction, its sources, the request index and the retired idempotency keys, and bump the document's epoch.
+
+        Raises ConstraintError (changing nothing of it) if a replaced entry is not in the ledger as the plan says. The
+        effect log, the derived store and the rejection audit log are never touched."""
+
+    def compactions(self, doc: str) -> list[CompactionRecord]:
+        """The compactions of a document, oldest first."""
+
+    def sources_of(self, compaction_id: str) -> list[SourceRow]:
+        """The entries a compaction replaced, in seq order; kept after the archive is expired."""
+
+    def archive_of(self, compaction_id: str) -> list[Entry]:
+        """The archived originals of one compaction, in seq order; empty after expiry."""
+
+    def archived_entries(self, doc: str, through_seq: int | None = None) -> list[Entry]:
+        """Every archived entry of a document (all compactions), in seq order, up to `through_seq` when given."""
+
+    def request_entries(self, request_id: str) -> list[tuple[str, int]]:
+        """(entry id, seq) of the entries of a request: the live ones, else those a compaction replaced."""
+
+    def request_effects(self, request_id: str) -> tuple[str, str] | None:
+        """For a request a compaction replaced: the model errors it added and resolved (canonical text), else None."""
+
+    def expire_archive(self, doc: str, through_seq: int, at: datetime) -> int:
+        """Delete the archive of every compaction of the document whose watermark is at or below `through_seq`, record the
+        expiry, and return how many archived entries went. Sources, the request index and retired keys stay."""
+
+    # -- purge (feature 005) -----------------------------------------------------------------------------------------
+
+    def apply_purge(self, application: PurgeApplication) -> tuple[int, int]:
+        """One atomic step: replace the entries of the ledger and of the archive by their erased versions, clear the stored
+        hash of the requests, drop the document's saved layers and view and bump its epoch, and delete the effect-log
+        records and derived-store rows of the fields. Returns (effect records deleted, derived rows deleted).
+
+        Raises ConstraintError if an entry to replace is not there."""
+
+    def append_purge_log(self, record: PurgeRecord) -> None: ...
+
+    def purge_log(self, doc: str) -> list[PurgeRecord]:
+        """The purge log of a document, oldest first."""
+
+    def seq_at_tx_time(self, doc: str, moment: datetime) -> int:
+        """The highest seq whose entry (live or archived) was recorded at or before `moment`, 0 if none. `tx_time` need
+        not grow with seq, so this is a maximum over all entries, not a search."""
 
     # -- the derived store of deferred fields (feature 003): the latest result per document and field -----------------
 

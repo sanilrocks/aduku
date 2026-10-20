@@ -87,6 +87,10 @@ def _check_entry(
     if entry.meta is not None and not conforms("any", entry.meta):
         add(ErrorCode.TYPE_MISMATCH, "meta contains a value with no Ion form")
 
+    moment = entry.valid_time
+    if moment is not None and not _is_aware_moment(moment):
+        add(ErrorCode.BAD_VALID_TIME, "valid_time must be a timestamp with a timezone offset")
+
     try:
         path = parse_path(entry.path)
     except PathError as error:
@@ -129,6 +133,17 @@ def _check_entry(
                     )
                     break
     return found
+
+
+def _is_aware_moment(value: object) -> bool:
+    """A timestamp that names an instant: it has a timezone offset (no import of `datetime` here, so by its behavior)."""
+    utcoffset = getattr(value, "utcoffset", None)
+    if isinstance(value, str | bytes) or not callable(utcoffset):
+        return False
+    try:
+        return utcoffset() is not None
+    except (TypeError, ValueError):
+        return False
 
 
 def _allowed(authority: tuple[str, ...], tier: str, contributor: Identity) -> bool:

@@ -148,9 +148,10 @@ def test_a_cold_append_does_not_fold_the_whole_ledger_inside_the_write_transacti
     seen = spy_on_folds(monkeypatch, spy)
     cold = make_service(spy, ids=SequentialIds("cold"))  # type: ignore[arg-type]
     cold.append("d1", [put("/age", 99)], contributor=ALICE)
-    assert seen == [(False, False, 30), (False, True, 1)]  # warmed outside any lock, then only the new entry inside
+    # feature 005: the saved layers cover the 30 old entries, so nothing is folded outside the lock and only the new entry inside
+    assert seen == [(False, True, 1)]
     cold.append("d1", [put("/age", 100)], contributor=ALICE)
-    assert seen[2:] == [(False, True, 1)]  # a warm service never warms again
+    assert seen[1:] == [(False, True, 1)]  # a warm service never warms again
 
 
 def test_memory_storage_default_is_unchanged() -> None:
@@ -218,6 +219,7 @@ def test_a_validator_that_faults_while_catching_up_is_a_rejection_not_a_crash(ba
     registry.put(load_schema(text, behaviors))
     registry.activate(1)
     first = Aduku(backend, registry, behaviors=behaviors, ids=SequentialIds("x"))
+    first.append("d1", [put("/note", "warm")], contributor=ALICE)  # its state is now cached, and then falls behind
     quiet = BehaviorRegistry.with_builtins()
     quiet.register_validate("acme.explode", 1, lambda subject: [])
     registry2 = SchemaRegistry()

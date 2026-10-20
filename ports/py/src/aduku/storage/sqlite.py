@@ -11,11 +11,21 @@ from datetime import UTC, datetime, timedelta
 
 from aduku.errors import StorageError
 from aduku.ion_codec import parse, to_canonical
-from aduku.model import DerivedRecord, Entry, SchedulerRun
+from aduku.model import (
+    CompactionPlan,
+    CompactionRecord,
+    DerivedRecord,
+    Entry,
+    PurgeApplication,
+    PurgeRecord,
+    SchedulerRun,
+    SourceRow,
+)
 from aduku.storage.base import (
     AuditRow,
     ConstraintError,
     EffectRecord,
+    LayerRow,
     RequestRecord,
     ViewRow,
     effects_to_prune,
@@ -40,14 +50,25 @@ CREATE TABLE IF NOT EXISTS entries (
     schema_version INTEGER NOT NULL,
     lenient INTEGER NOT NULL DEFAULT 0,
     meta TEXT,
+    valid_time TEXT,
+    synthetic TEXT,
+    purged INTEGER NOT NULL DEFAULT 0,
     UNIQUE (doc, seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS entries_idem_key ON entries (doc, idem_key) WHERE idem_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_request ON entries (request_id);
 CREATE INDEX IF NOT EXISTS entries_tier ON entries (tier);
-CREATE TRIGGER IF NOT EXISTS entries_no_update BEFORE UPDATE ON entries
+-- Feature 005: compaction, archive restore and purge are the only operations that change existing entries. They set
+-- ledger_rewrite.active inside their own transaction; any other update or delete is still refused.
+CREATE TABLE IF NOT EXISTS ledger_rewrite (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL);
+INSERT OR IGNORE INTO ledger_rewrite (id, active) VALUES (1, 0);
+DROP TRIGGER IF EXISTS entries_no_update;
+CREATE TRIGGER entries_no_update BEFORE UPDATE ON entries
+WHEN (SELECT active FROM ledger_rewrite WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'entries are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS entries_no_delete BEFORE DELETE ON entries
+DROP TRIGGER IF EXISTS entries_no_delete;
+CREATE TRIGGER entries_no_delete BEFORE DELETE ON entries
+WHEN (SELECT active FROM ledger_rewrite WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'entries are append-only'); END;
 
 CREATE TABLE IF NOT EXISTS doc_seq (doc TEXT PRIMARY KEY, last_seq INTEGER NOT NULL);
@@ -69,8 +90,122 @@ CREATE TABLE IF NOT EXISTS views (
     document TEXT NOT NULL,
     model_errors TEXT NOT NULL,
     provenance TEXT NOT NULL,
-    effects_seq INTEGER NOT NULL DEFAULT 0
+    effects_seq INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL DEFAULT 0
 );
+
+-- Feature 005: saved per-tier layers (disposable: always re-derivable from the ledger) and the document epoch.
+CREATE TABLE IF NOT EXISTS layers (
+    doc TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    tier_seq INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    rules_fingerprint TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    PRIMARY KEY (doc, tier)
+);
+CREATE TABLE IF NOT EXISTS doc_epoch (doc TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
+
+-- Feature 005: compaction. The archive holds the originals a compaction replaced until an operator expires them; the sources,
+-- the request index and the retired idempotency keys outlive the archive.
+CREATE TABLE IF NOT EXISTS archive_entries (
+    id TEXT PRIMARY KEY,
+    doc TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    path TEXT NOT NULL,
+    op TEXT NOT NULL,
+    value TEXT,
+    contributor TEXT NOT NULL,
+    tx_time TEXT NOT NULL,
+    idem_key TEXT,
+    request_key TEXT,
+    request_hash TEXT,
+    schema_version INTEGER NOT NULL,
+    lenient INTEGER NOT NULL DEFAULT 0,
+    meta TEXT,
+    valid_time TEXT,
+    synthetic TEXT,
+    purged INTEGER NOT NULL DEFAULT 0,
+    compaction_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS archive_doc_seq ON archive_entries (doc, seq);
+CREATE INDEX IF NOT EXISTS archive_compaction ON archive_entries (compaction_id, seq);
+CREATE INDEX IF NOT EXISTS archive_doc_tx_time ON archive_entries (doc, tx_time);
+CREATE TABLE IF NOT EXISTS compactions (
+    id TEXT PRIMARY KEY,
+    doc TEXT NOT NULL,
+    watermark_seq INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    fold_fingerprint TEXT NOT NULL,
+    created TEXT NOT NULL,
+    policy TEXT NOT NULL,
+    base_errors TEXT NOT NULL,
+    base_skipped TEXT NOT NULL,
+    archived INTEGER NOT NULL,
+    first_tx_time TEXT,
+    last_tx_time TEXT,
+    has_valid_time INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS compactions_doc ON compactions (doc, watermark_seq);
+CREATE TABLE IF NOT EXISTS compaction_sources (
+    compaction_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    tier TEXT NOT NULL,
+    idem_key TEXT,
+    PRIMARY KEY (compaction_id, source_id)
+);
+CREATE TABLE IF NOT EXISTS request_entries (
+    request_id TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (request_id, entry_id)
+);
+CREATE TABLE IF NOT EXISTS purge_log (
+    id TEXT PRIMARY KEY,
+    doc TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL,
+    counts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS purge_log_doc ON purge_log (doc, at);
+DROP TRIGGER IF EXISTS purge_log_no_update;
+CREATE TRIGGER purge_log_no_update BEFORE UPDATE ON purge_log
+BEGIN SELECT RAISE(ABORT, 'the purge log is append-only'); END;
+DROP TRIGGER IF EXISTS purge_log_no_delete;
+CREATE TRIGGER purge_log_no_delete BEFORE DELETE ON purge_log
+BEGIN SELECT RAISE(ABORT, 'the purge log is append-only'); END;
+CREATE TABLE IF NOT EXISTS request_effects (request_id TEXT PRIMARY KEY, added TEXT NOT NULL, resolved TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS retired_idem_keys (doc TEXT NOT NULL, idem_key TEXT NOT NULL, PRIMARY KEY (doc, idem_key));
+CREATE TABLE IF NOT EXISTS archive_expiry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc TEXT NOT NULL,
+    through_seq INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    expired INTEGER NOT NULL
+);
+DROP TRIGGER IF EXISTS archive_no_update;
+CREATE TRIGGER archive_no_update BEFORE UPDATE ON archive_entries
+WHEN (SELECT active FROM ledger_rewrite WHERE id = 1) = 0
+BEGIN SELECT RAISE(ABORT, 'the archive is append-only'); END;
+DROP TRIGGER IF EXISTS archive_no_delete;
+CREATE TRIGGER archive_no_delete BEFORE DELETE ON archive_entries
+WHEN (SELECT active FROM ledger_rewrite WHERE id = 1) = 0
+BEGIN SELECT RAISE(ABORT, 'the archive is append-only'); END;
+DROP TRIGGER IF EXISTS sources_no_update;
+CREATE TRIGGER sources_no_update BEFORE UPDATE ON compaction_sources
+BEGIN SELECT RAISE(ABORT, 'compaction sources are append-only'); END;
+DROP TRIGGER IF EXISTS sources_no_delete;
+CREATE TRIGGER sources_no_delete BEFORE DELETE ON compaction_sources
+BEGIN SELECT RAISE(ABORT, 'compaction sources are append-only'); END;
+
+CREATE INDEX IF NOT EXISTS entries_doc_tx_time ON entries (doc, tx_time);
+CREATE INDEX IF NOT EXISTS entries_doc_tier ON entries (doc, tier, seq);
 
 -- Outcomes of impure computes (feature 002). Separate from the ledger; append-only except through prune_effects.
 CREATE TABLE IF NOT EXISTS effects (
@@ -238,11 +373,63 @@ def _entry(row: sqlite3.Row) -> Entry:
         request_hash=row["request_hash"],
         lenient=bool(row["lenient"]),
         meta=parse(row["meta"]) if row["meta"] is not None else None,
+        valid_time=_maybe_unstamp(row["valid_time"]),
+        synthetic=row["synthetic"],
+        purged=bool(row["purged"]),
+    )
+
+
+_ENTRY_COLUMNS = (
+    "id, doc, seq, request_id, tier, path, op, value, contributor, tx_time, idem_key, request_key, request_hash,"
+    " schema_version, lenient, meta, valid_time, synthetic, purged"
+)
+
+
+def _entry_values(entry: Entry) -> tuple[object, ...]:
+    return (
+        entry.id,
+        entry.doc,
+        entry.seq,
+        entry.request_id,
+        entry.tier,
+        entry.path,
+        entry.op,
+        to_canonical(entry.value),
+        entry.contributor,
+        _stamp(entry.tx_time),
+        entry.idem_key,
+        entry.request_key,
+        entry.request_hash,
+        entry.schema_version,
+        int(entry.lenient),
+        to_canonical(entry.meta) if entry.meta is not None else None,
+        _maybe_stamp(entry.valid_time),
+        entry.synthetic,
+        int(entry.purged),
+    )
+
+
+def _record(row: sqlite3.Row) -> CompactionRecord:
+    return CompactionRecord(
+        id=row["id"],
+        doc=row["doc"],
+        watermark_seq=row["watermark_seq"],
+        schema_version=row["schema_version"],
+        fold_fingerprint=row["fold_fingerprint"],
+        created=_unstamp(row["created"]),
+        policy=row["policy"],
+        base_errors=row["base_errors"],
+        base_skipped=tuple(int(n) for n in row["base_skipped"].split(",") if n),
+        archived=bool(row["archived"]),
+        first_tx_time=_maybe_unstamp(row["first_tx_time"]),
+        last_tx_time=_maybe_unstamp(row["last_tx_time"]),
+        has_valid_time=bool(row["has_valid_time"]),
     )
 
 
 class _SqliteTx:
     def __init__(self, connection: sqlite3.Connection) -> None:
+
         self._c = connection
         self._open = True
 
@@ -267,10 +454,12 @@ class _SqliteTx:
         return [str(row[0]) for row in self._c.execute("SELECT doc FROM doc_seq ORDER BY doc")]
 
     @live
-    def entries(self, doc: str, since_seq: int = 0, limit: int | None = None) -> list[Entry]:
+    def entries(
+        self, doc: str, since_seq: int = 0, limit: int | None = None, *, until_seq: int | None = None
+    ) -> list[Entry]:
         rows = self._c.execute(
-            "SELECT * FROM entries WHERE doc = ? AND seq > ? ORDER BY seq LIMIT ?",
-            (doc, since_seq, -1 if limit is None else limit),
+            "SELECT * FROM entries WHERE doc = ? AND seq > ? AND (? IS NULL OR seq <= ?) ORDER BY seq LIMIT ?",
+            (doc, since_seq, until_seq, until_seq, -1 if limit is None else limit),
         )
         return [_entry(row) for row in rows]
 
@@ -294,6 +483,10 @@ class _SqliteTx:
         return (
             self._c.execute("SELECT 1 FROM entries WHERE doc = ? AND idem_key = ?", (doc, idem_key)).fetchone()
             is not None
+            or self._c.execute(
+                "SELECT 1 FROM retired_idem_keys WHERE doc = ? AND idem_key = ?", (doc, idem_key)
+            ).fetchone()
+            is not None
         )
 
     @live
@@ -313,26 +506,7 @@ class _SqliteTx:
             )
             for entry in entries:
                 self._c.execute(
-                    "INSERT INTO entries (id, doc, seq, request_id, tier, path, op, value, contributor, tx_time, idem_key,"
-                    " request_key, request_hash, schema_version, lenient, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        entry.id,
-                        entry.doc,
-                        entry.seq,
-                        entry.request_id,
-                        entry.tier,
-                        entry.path,
-                        entry.op,
-                        to_canonical(entry.value),
-                        entry.contributor,
-                        _stamp(entry.tx_time),
-                        entry.idem_key,
-                        entry.request_key,
-                        entry.request_hash,
-                        entry.schema_version,
-                        int(entry.lenient),
-                        to_canonical(entry.meta) if entry.meta is not None else None,
-                    ),
+                    f"INSERT INTO entries ({_ENTRY_COLUMNS}) VALUES ({','.join('?' * 19)})", _entry_values(entry)
                 )
             if entries:
                 self._c.execute(
@@ -363,16 +537,18 @@ class _SqliteTx:
             row["model_errors"],
             row["provenance"],
             row["effects_seq"],
+            row["epoch"],
         )
 
     @live
     def put_view(self, view: ViewRow) -> None:
         self._c.execute(
             "INSERT INTO views (doc, watermark_seq, schema_version, rules_fingerprint, document, model_errors, provenance,"
-            " effects_seq) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (doc) DO UPDATE SET watermark_seq = excluded.watermark_seq,"
+            " effects_seq, epoch) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (doc) DO UPDATE SET"
+            " watermark_seq = excluded.watermark_seq,"
             " schema_version = excluded.schema_version, rules_fingerprint = excluded.rules_fingerprint,"
             " document = excluded.document, model_errors = excluded.model_errors, provenance = excluded.provenance,"
-            " effects_seq = excluded.effects_seq",
+            " effects_seq = excluded.effects_seq, epoch = excluded.epoch",
             (
                 view.doc,
                 view.watermark_seq,
@@ -382,12 +558,211 @@ class _SqliteTx:
                 view.model_errors,
                 view.provenance,
                 view.effects_seq,
+                view.epoch,
             ),
         )
 
     @live
     def drop_view(self, doc: str) -> None:
         self._c.execute("DELETE FROM views WHERE doc = ?", (doc,))
+
+    # -- saved layers and the epoch (feature 005) --------------------------------------------------------------------
+
+    @live
+    def get_layers(self, doc: str) -> list[LayerRow]:
+        rows = self._c.execute("SELECT * FROM layers WHERE doc = ? ORDER BY tier", (doc,))
+        return [
+            LayerRow(
+                r["doc"], r["tier"], r["tier_seq"], r["schema_version"], r["rules_fingerprint"], r["epoch"], r["state"]
+            )
+            for r in rows
+        ]
+
+    @live
+    def put_layers(self, rows: Sequence[LayerRow]) -> None:
+        for r in rows:
+            self._c.execute(
+                "INSERT INTO layers (doc, tier, tier_seq, schema_version, rules_fingerprint, epoch, state)"
+                " VALUES (?,?,?,?,?,?,?) ON CONFLICT (doc, tier) DO UPDATE SET tier_seq = excluded.tier_seq,"
+                " schema_version = excluded.schema_version, rules_fingerprint = excluded.rules_fingerprint,"
+                " epoch = excluded.epoch, state = excluded.state"
+                " WHERE excluded.epoch > layers.epoch OR (excluded.epoch = layers.epoch AND excluded.tier_seq >= layers.tier_seq)",
+                (r.doc, r.tier, r.tier_seq, r.schema_version, r.rules_fingerprint, r.epoch, r.state),
+            )
+
+    @live
+    def drop_layers(self, doc: str) -> None:
+        self._c.execute("DELETE FROM layers WHERE doc = ?", (doc,))
+
+    @live
+    def tier_last_seq(self, doc: str, tier: str, through: int) -> int:
+        row = self._c.execute(
+            "SELECT MAX(seq) FROM entries WHERE doc = ? AND tier = ? AND seq <= ?", (doc, tier, through)
+        ).fetchone()
+        return int(row[0] or 0)
+
+    @live
+    def epoch(self, doc: str) -> int:
+        row = self._c.execute("SELECT epoch FROM doc_epoch WHERE doc = ?", (doc,)).fetchone()
+        return int(row[0]) if row else 0
+
+    @live
+    def bump_epoch(self, doc: str) -> int:
+        self._c.execute(
+            "INSERT INTO doc_epoch (doc, epoch) VALUES (?, 1) ON CONFLICT (doc) DO UPDATE SET epoch = epoch + 1", (doc,)
+        )
+        return self.epoch(doc)
+
+    @live
+    def seq_at_tx_time(self, doc: str, moment: datetime) -> int:
+        stamp = _stamp(moment)
+        row = self._c.execute("SELECT MAX(seq) FROM entries WHERE doc = ? AND tx_time <= ?", (doc, stamp)).fetchone()
+        best = int(row[0] or 0)
+        row = self._c.execute(
+            "SELECT MAX(seq) FROM archive_entries WHERE doc = ? AND tx_time <= ?", (doc, stamp)
+        ).fetchone()
+        return max(best, int(row[0] or 0))
+
+    # -- compaction, archive and expiry (feature 005) ------------------------------------------------------------------
+
+    @live
+    def apply_compaction(self, plan: CompactionPlan) -> None:
+        doc, record = plan.record.doc, plan.record
+        found = self._c.execute(
+            "SELECT * FROM entries WHERE doc = ? AND seq <= ? ORDER BY seq", (doc, record.watermark_seq)
+        )
+        present = {row["id"]: _entry(row) for row in found}
+        if present != {entry.id: entry for entry in plan.replaced}:
+            raise ConstraintError("the entries up to the watermark are not the ones the compaction expects")
+        self._c.execute("SAVEPOINT apply_compaction")
+        self._c.execute("UPDATE ledger_rewrite SET active = 1 WHERE id = 1")
+        try:
+            self._c.execute(
+                f"INSERT INTO archive_entries ({_ENTRY_COLUMNS}, compaction_id)"
+                f" SELECT {_ENTRY_COLUMNS}, ? FROM entries WHERE doc = ? AND seq <= ?",
+                (record.id, doc, record.watermark_seq),
+            )
+            self._c.execute("DELETE FROM entries WHERE doc = ? AND seq <= ?", (doc, record.watermark_seq))
+            for entry in plan.synthetic:
+                self._c.execute(
+                    f"INSERT INTO entries ({_ENTRY_COLUMNS}) VALUES ({','.join('?' * 19)})", _entry_values(entry)
+                )
+            self._c.execute(
+                "INSERT INTO compactions (id, doc, watermark_seq, schema_version, fold_fingerprint, created, policy,"
+                " base_errors, base_skipped, archived, first_tx_time, last_tx_time, has_valid_time)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record.id,
+                    doc,
+                    record.watermark_seq,
+                    record.schema_version,
+                    record.fold_fingerprint,
+                    _stamp(record.created),
+                    record.policy,
+                    record.base_errors,
+                    ",".join(str(n) for n in record.base_skipped),
+                    int(record.archived),
+                    _maybe_stamp(record.first_tx_time),
+                    _maybe_stamp(record.last_tx_time),
+                    int(record.has_valid_time),
+                ),
+            )
+            self._c.executemany(
+                "INSERT INTO compaction_sources (compaction_id, source_id, seq, tier, idem_key) VALUES (?,?,?,?,?)",
+                [(s.compaction_id, s.source_id, s.seq, s.tier, s.idem_key) for s in plan.sources],
+            )
+            self._c.executemany(
+                "INSERT OR IGNORE INTO request_entries (request_id, entry_id, seq) VALUES (?,?,?)",
+                list(plan.request_index),
+            )
+            self._c.executemany(
+                "INSERT OR IGNORE INTO retired_idem_keys (doc, idem_key) VALUES (?,?)",
+                [(doc, k) for k in plan.retired_keys],
+            )
+            self._c.executemany(
+                "INSERT OR REPLACE INTO request_effects (request_id, added, resolved) VALUES (?,?,?)",
+                list(plan.request_effects),
+            )
+            self._c.execute("UPDATE ledger_rewrite SET active = 0 WHERE id = 1")
+            self.bump_epoch(doc)
+        except sqlite3.IntegrityError as error:
+            self._undo_compaction()
+            raise ConstraintError(str(error)) from error
+        except BaseException:
+            self._undo_compaction()
+            raise
+        self._c.execute("RELEASE apply_compaction")
+
+    def _undo_compaction(self) -> None:
+        self._c.execute("ROLLBACK TO apply_compaction")
+        self._c.execute("RELEASE apply_compaction")
+        self._c.execute("UPDATE ledger_rewrite SET active = 0 WHERE id = 1")
+
+    @live
+    def compactions(self, doc: str) -> list[CompactionRecord]:
+        rows = self._c.execute("SELECT * FROM compactions WHERE doc = ? ORDER BY watermark_seq, created, id", (doc,))
+        return [_record(row) for row in rows]
+
+    @live
+    def sources_of(self, compaction_id: str) -> list[SourceRow]:
+        rows = self._c.execute(
+            "SELECT * FROM compaction_sources WHERE compaction_id = ? ORDER BY seq", (compaction_id,)
+        )
+        return [SourceRow(r["compaction_id"], r["source_id"], r["seq"], r["tier"], r["idem_key"]) for r in rows]
+
+    @live
+    def archive_of(self, compaction_id: str) -> list[Entry]:
+        rows = self._c.execute("SELECT * FROM archive_entries WHERE compaction_id = ? ORDER BY seq", (compaction_id,))
+        return [_entry(row) for row in rows]
+
+    @live
+    def archived_entries(self, doc: str, through_seq: int | None = None) -> list[Entry]:
+        rows = self._c.execute(
+            "SELECT * FROM archive_entries WHERE doc = ? AND (? IS NULL OR seq <= ?) ORDER BY seq, compaction_id",
+            (doc, through_seq, through_seq),
+        )
+        return [_entry(row) for row in rows]
+
+    @live
+    def request_entries(self, request_id: str) -> list[tuple[str, int]]:
+        rows = self._c.execute(
+            "SELECT id, seq FROM entries WHERE request_id = ? ORDER BY seq", (request_id,)
+        ).fetchall()
+        if not rows:
+            rows = self._c.execute(
+                "SELECT entry_id, seq FROM request_entries WHERE request_id = ? ORDER BY seq", (request_id,)
+            ).fetchall()
+        return [(str(row[0]), int(row[1])) for row in rows]
+
+    @live
+    def request_effects(self, request_id: str) -> tuple[str, str] | None:
+        row = self._c.execute(
+            "SELECT added, resolved FROM request_effects WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    @live
+    def expire_archive(self, doc: str, through_seq: int, at: datetime) -> int:
+        doomed = [
+            row["id"]
+            for row in self._c.execute(
+                "SELECT id FROM compactions WHERE doc = ? AND archived = 1 AND watermark_seq <= ?", (doc, through_seq)
+            )
+        ]
+        if not doomed:
+            return 0
+        marks = ",".join("?" * len(doomed))
+        self._c.execute("UPDATE ledger_rewrite SET active = 1 WHERE id = 1")
+        try:
+            removed = self._c.execute(f"DELETE FROM archive_entries WHERE compaction_id IN ({marks})", doomed).rowcount
+        finally:
+            self._c.execute("UPDATE ledger_rewrite SET active = 0 WHERE id = 1")
+        self._c.execute(f"UPDATE compactions SET archived = 0 WHERE id IN ({marks})", doomed)
+        self._c.execute(
+            "INSERT INTO archive_expiry (doc, through_seq, at, expired) VALUES (?,?,?,?)",
+            (doc, through_seq, _stamp(at), removed),
+        )
+        return int(removed)
 
     @live
     def append_effects(self, records: Sequence[EffectRecord]) -> list[int]:
@@ -452,6 +827,80 @@ class _SqliteTx:
         finally:
             self._c.execute("UPDATE effects_pruning SET active = 0 WHERE id = 1")
         return len(doomed)
+
+    # -- purge (feature 005) -----------------------------------------------------------------------------------------
+
+    @live
+    def apply_purge(self, application: PurgeApplication) -> tuple[int, int]:
+        doc = application.doc
+        for table, entries in (("entries", application.live), ("archive_entries", application.archive)):
+            for entry in entries:
+                found = self._c.execute(f"SELECT 1 FROM {table} WHERE id = ? AND doc = ?", (entry.id, doc)).fetchone()
+                if found is None:
+                    raise ConstraintError(f"entry {entry.id!r} is not in {table}")
+        self._c.execute("SAVEPOINT apply_purge")
+        self._c.execute("UPDATE ledger_rewrite SET active = 1 WHERE id = 1")
+        try:
+            for table, entries in (("entries", application.live), ("archive_entries", application.archive)):
+                for entry in entries:
+                    self._c.execute(
+                        f"UPDATE {table} SET value = ?, meta = ?, valid_time = ?, request_hash = ?, purged = ? WHERE id = ?",
+                        (
+                            None if entry.purged else to_canonical(entry.value),
+                            to_canonical(entry.meta) if entry.meta is not None else None,
+                            _maybe_stamp(entry.valid_time),
+                            entry.request_hash,
+                            int(entry.purged),
+                            entry.id,
+                        ),
+                    )
+            self._c.execute("UPDATE ledger_rewrite SET active = 0 WHERE id = 1")
+            for start in range(0, len(application.requests), 400):
+                chunk = application.requests[start : start + 400]
+                self._c.execute(
+                    f"UPDATE requests SET request_hash = NULL WHERE request_id IN ({','.join('?' * len(chunk))})", chunk
+                )
+            self._c.execute("DELETE FROM layers WHERE doc = ?", (doc,))
+            self._c.execute("DELETE FROM views WHERE doc = ?", (doc,))
+            self.bump_epoch(doc)
+            effects = derived = 0
+            names = list(application.fields)
+            for start in range(0, len(names), 400):
+                fields_chunk = names[start : start + 400]
+                marks = ",".join("?" * len(fields_chunk))
+                self._c.execute("UPDATE effects_pruning SET active = 1 WHERE id = 1")
+                try:
+                    effects += self._c.execute(
+                        f"DELETE FROM effects WHERE doc = ? AND field IN ({marks})", (doc, *fields_chunk)
+                    ).rowcount
+                finally:
+                    self._c.execute("UPDATE effects_pruning SET active = 0 WHERE id = 1")
+                derived += self._c.execute(
+                    f"DELETE FROM derived_values WHERE doc = ? AND field IN ({marks})", (doc, *fields_chunk)
+                ).rowcount
+        except BaseException:
+            self._c.execute("ROLLBACK TO apply_purge")
+            self._c.execute("RELEASE apply_purge")
+            self._c.execute("UPDATE ledger_rewrite SET active = 0 WHERE id = 1")
+            self._c.execute("UPDATE effects_pruning SET active = 0 WHERE id = 1")
+            raise
+        self._c.execute("RELEASE apply_purge")
+        return int(effects), int(derived)
+
+    @live
+    def append_purge_log(self, record: PurgeRecord) -> None:
+        self._c.execute(
+            "INSERT INTO purge_log (id, doc, scope, reason, actor, at, counts) VALUES (?,?,?,?,?,?,?)",
+            (record.id, record.doc, record.scope, record.reason, record.actor, _stamp(record.at), record.counts),
+        )
+
+    @live
+    def purge_log(self, doc: str) -> list[PurgeRecord]:
+        rows = self._c.execute("SELECT * FROM purge_log WHERE doc = ? ORDER BY at, rowid", (doc,))
+        return [
+            PurgeRecord(r["id"], r["doc"], r["scope"], r["reason"], r["actor"], _unstamp(r["at"]), r["counts"])
+            for r in rows
+        ]
 
     # -- the derived store of deferred fields (feature 003) ----------------------------------------------------------
 
@@ -593,6 +1042,27 @@ class _SqliteReadTx(_SqliteTx):
     def drop_view(self, doc: str) -> None:
         raise RuntimeError("read-only transaction")
 
+    def put_layers(self, rows: Sequence[LayerRow]) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def drop_layers(self, doc: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_compaction(self, plan: CompactionPlan) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_purge(self, application: PurgeApplication) -> tuple[int, int]:
+        raise RuntimeError("read-only transaction")
+
+    def append_purge_log(self, record: PurgeRecord) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def expire_archive(self, doc: str, through_seq: int, at: datetime) -> int:
+        raise RuntimeError("read-only transaction")
+
+    def bump_epoch(self, doc: str) -> int:
+        raise RuntimeError("read-only transaction")
+
     def put_derived(self, records: Sequence[DerivedRecord]) -> None:
         raise RuntimeError("read-only transaction")
 
@@ -709,6 +1179,9 @@ class SqliteAuditBackend:
             (doc, count),
         )
 
+    def update_attempted(self, row_id: int, attempted: str) -> None:
+        self._run("UPDATE rejection_audit SET attempted = ? WHERE id = ?", (attempted, row_id))
+
     def get_override(self, doc: str) -> str | None:
         rows = self._all("SELECT setting FROM audit_override WHERE doc = ?", (doc,))
         return str(rows[0][0]) if rows else None
@@ -758,6 +1231,16 @@ class SqliteStorage:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(views)")}
             if "effects_seq" not in columns:  # a database made before feature 002
                 connection.execute("ALTER TABLE views ADD COLUMN effects_seq INTEGER NOT NULL DEFAULT 0")
+            if "epoch" not in columns:  # a database made before feature 005
+                connection.execute("ALTER TABLE views ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
+            entry_columns = {row["name"] for row in connection.execute("PRAGMA table_info(entries)")}
+            for column, definition in (
+                ("valid_time", "TEXT"),
+                ("synthetic", "TEXT"),
+                ("purged", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in entry_columns:
+                    connection.execute(f"ALTER TABLE entries ADD COLUMN {column} {definition}")
         except sqlite3.Error as error:
             if connection is not None:
                 connection.close()  # do not leak the handle (and its locks) of a database that cannot be used

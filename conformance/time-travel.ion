@@ -1,0 +1,67 @@
+// Feature 005, US3: as_of by seq, tx_time and valid_time; the empty and beyond-the-end points; one point only; valid_time checked at
+// admission and part of the request hash only when given. Recording times are set by the harness clock.
+case::{
+  name: "time-travel",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} }
+  },
+  clock: {start: 2026-01-01T09:00:00Z, step_seconds: 0},
+  steps: [
+    { clock: {set: 2026-01-01T10:00:00Z} },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "ann", valid_time: 2024-03-01T00:00:00Z}] },
+      expect: { accepted: [{seq: 1}] } },
+    { clock: {set: 2026-01-01T10:10:00Z} },
+    { append: { doc: "d1", contributor: {id: "bob", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "bob", valid_time: 2024-04-01T00:00:00Z}] },
+      expect: { accepted: [{seq: 2}] } },
+    { clock: {set: 2026-01-01T10:20:00Z} },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 3}] } },
+
+    // by seq: the document after that entry
+    { as_of: {doc: "d1", seq: 1}, expect: { document: "{name: \"ann\"}", resolved_seq: 1, included: 1 } },
+    { as_of: {doc: "d1", seq: 2}, expect: { document: "{name: \"bob\"}", resolved_seq: 2 } },
+    { as_of: {doc: "d1", seq: 3}, expect: { document: "{age: 5, name: \"bob\"}", resolved_seq: 3 } },
+
+    // by recording time: the last entry recorded at or before it
+    { as_of: {doc: "d1", tx_time: 2026-01-01T10:15:00Z}, expect: { document: "{name: \"bob\"}", resolved_seq: 2 } },
+    { as_of: {doc: "d1", tx_time: 2026-01-01T10:20:00Z}, expect: { resolved_seq: 3 } },
+
+    // before the first entry: the empty document at seq 0; beyond the last: the current state
+    { as_of: {doc: "d1", tx_time: 2026-01-01T09:00:00Z}, expect: { document: "{}", resolved_seq: 0, included: 0 } },
+    { as_of: {doc: "d1", seq: 0}, expect: { document: "{}", resolved_seq: 0 } },
+    { as_of: {doc: "d1", seq: 99}, expect: { document: "{age: 5, name: \"bob\"}", resolved_seq: 3 } },
+
+    // by moment in the world: entries valid later are left out; entries with no valid_time always take part
+    { as_of: {doc: "d1", valid_time: 2024-03-15T00:00:00Z}, expect: { document: "{age: 5, name: \"ann\"}", included: 2, resolved_seq: 3 } },
+    { as_of: {doc: "d1", valid_time: 2024-01-01T00:00:00Z}, expect: { document: "{age: 5}", included: 1 } },
+    { as_of: {doc: "d1", valid_time: 2030-01-01T00:00:00Z}, expect: { document: "{age: 5, name: \"bob\"}", included: 3 } },
+    { get: "d1", expect: { document: "{age: 5, name: \"bob\"}" } },
+
+    // exactly one point
+    { as_of: {doc: "d1", seq: 1, valid_time: 2024-03-15T00:00:00Z}, expect: { refused: AS_OF_AMBIGUOUS } },
+    { as_of: {doc: "d1"}, expect: { refused: AS_OF_AMBIGUOUS } },
+
+    // a valid_time that is not a timestamp rejects the whole request and records nothing
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/age", value: 9}, {tier: user, path: "/name", value: "zed", valid_time: "yesterday"}] },
+      expect: { rejected: { code: BAD_VALID_TIME, reasons: [{path: "/name"}] } } },
+    { get: "d1", expect: { document: "{age: 5, name: \"bob\"}" } },
+
+    // valid_time is part of the request hash only when it is given
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "cy", valid_time: 2024-05-01T00:00:00Z}] },
+      expect: { accepted: [{seq: 4}], duplicate: false } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "cy", valid_time: 2024-05-01T00:00:00Z}] },
+      expect: { accepted: [{seq: 4}], duplicate: true } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "cy", valid_time: 2024-05-02T00:00:00Z}] },
+      expect: { rejected: { code: REQUEST_KEY_REUSED } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "K1",
+                entries: [{tier: user, path: "/name", value: "cy"}] },
+      expect: { rejected: { code: REQUEST_KEY_REUSED } } }
+  ]
+}

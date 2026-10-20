@@ -130,3 +130,19 @@ def test_cases_that_differ_only_in_the_clock_give_identical_results() -> None:
     case_early = load_case((CONFORMANCE_DIR / "clock-early.ion").read_text())
     case_late = load_case((CONFORMANCE_DIR / "clock-late.ion").read_text())
     assert case_early.clock != case_late.clock  # the clocks really do differ
+
+
+def test_rebuild_reproduces_the_saved_layers_of_the_worked_example_bit_for_bit(backend: Storage) -> None:
+    """SPEC 16 item 6, extended to saved layers (feature 005): the layers a service saved are what `rebuild` derives."""
+    case = load_case((CONFORMANCE_DIR / "worked-example-16-1.ion").read_text())
+    service = build_service(case, backend)
+    run_case(case, service)
+    with backend.read() as tx:
+        before = {doc: tx.get_layers(doc) for doc in tx.doc_ids()}
+        views = {doc: tx.get_view(doc) for doc in tx.doc_ids()}
+    assert before and all(rows for rows in before.values())
+    report = service.rebuild()
+    assert report.identical and report.layers_differing == () and report.layers_refreshed == ()
+    with backend.read() as tx:
+        assert {doc: tx.get_layers(doc) for doc in tx.doc_ids()} == before
+        assert {doc: tx.get_view(doc) for doc in tx.doc_ids()} == views

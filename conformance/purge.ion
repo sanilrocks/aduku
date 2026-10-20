@@ -1,0 +1,67 @@
+// Feature 005, US5: a purge erases what it names from every store and keeps the record without value; it is allowed only to
+// the identities the schema lists, needs a reason, and is logged without the erased values. The runner scans every stored
+// text of the service for the marker (`absent_everywhere`).
+case::{
+  name: "purge",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin], roles: [dpo], purge_by: [dpo],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max}, "/address": {type: struct, merge: struct},
+              "/address/city": {type: string, merge: lww}, "/address/zip": {type: string, merge: lww} }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "RK",
+                entries: [{tier: user, path: "/name", value: "secret-marker", meta: {ticket: "secret-marker"}}, {tier: user, path: "/age", value: 3}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, entries: [{tier: backfill, path: "/name", value: "older"}] },
+      expect: { accepted: [{seq: 3}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/age", value: 9}] },
+      expect: { accepted: [{seq: 4}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/nope", value: "secret-marker"}] },
+      expect: { rejected: { code: UNKNOWN_PATH } } },
+    { get: "d1", expect: { document: "{age: 9, name: \"secret-marker\"}" } },
+
+    // refused: not listed in purge_by, no reason; nothing changes
+    { purge: {doc: "d1", path: "/name", reason: "ticket", as: {id: "alice", tiers: [user]}}, expect: { refused: NOT_AUTHORIZED } },
+    { purge: {doc: "d1", path: "/name", reason: "", as: {id: "officer", tiers: [admin], roles: [dpo]}}, expect: { refused: PURGE_REASON_REQUIRED } },
+    { purge: {doc: "d1", path: "/nope", reason: "ticket", as: {id: "officer", tiers: [admin], roles: [dpo]}}, expect: { refused: UNKNOWN_PATH } },
+    { get: "d1", expect: { document: "{age: 9, name: \"secret-marker\"}" } },
+
+    // the purge: every contribution at /name goes; the document is what the rest gives; the record keeps its place
+    { purge: {doc: "d1", path: "/name", reason: "ticket 4711", as: {id: "officer", tiers: [admin], roles: [dpo]}},
+      expect: { entries_erased: 2, purge_log_count: 1, absent_everywhere: "secret-marker" } },
+    { get: "d1", expect: { document: "{age: 9}" } },
+    { rebuild: "d1", expect: { identical: true } },
+
+    // a retried request is still a duplicate with its original answer
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, request_key: "RK",
+                entries: [{tier: user, path: "/name", value: "secret-marker"}, {tier: user, path: "/age", value: 3}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}], duplicate: true } },
+
+    // explain names the purge and never a purged entry as winner, input or shadowed
+    { explain: {doc: "d1", path: "/name"}, expect: { purged_entries: 2, winner: null } },
+    { explain: {doc: "d1", path: "/age"}, expect: { purged_entries: 0 } },
+
+    // a struct written above the path keeps the rest of its value
+    { append: { doc: "d3", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/address", value: {city: "other-marker", zip: "1"}}] },
+      expect: { accepted: [{seq: 1}] } },
+    { purge: {doc: "d3", path: "/address/city", reason: "ticket 4714", as: {id: "officer", tiers: [admin], roles: [dpo]}},
+      expect: { absent_everywhere: "other-marker" } },
+    { get: "d3", expect: { document: "{address: {zip: \"1\"}}" } },
+
+    // compacted, archived and expired history: the whole compacted contribution at the path goes
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "secret-marker"}, {tier: user, path: "/age", value: 1}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 2}] },
+      expect: { accepted: [{seq: 3}] } },
+    { compact: {doc: "d2", through_seq: 2}, expect: { watermark: 2, replaced: 2, remaining: 2 } },
+    { purge: {doc: "d2", path: "/name", reason: "ticket 4712", as: {id: "officer", tiers: [admin], roles: [dpo]}},
+      expect: { absent_everywhere: "secret-marker" } },
+    { get: "d2", expect: { document: "{age: 2}" } },
+    { expire: {doc: "d2", through_seq: 2}, expect: { expired: 2 } },
+    { purge: {doc: "d2", path: "/age", reason: "ticket 4713", as: {id: "officer", tiers: [admin], roles: [dpo]}},
+      expect: { purge_log_count: 2 } },
+    { get: "d2", expect: { document: "{}" } }
+  ]
+}

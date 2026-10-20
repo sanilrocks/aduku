@@ -44,6 +44,7 @@ TOP_KEYS = {
     "roles",
     "lenient",
     "rejection_audit",
+    "purge_by",
     "impure_failure_mode",
     "deferred_on_failure",
     "fields",
@@ -163,6 +164,11 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
 
     audit = _audit(top.get("rejection_audit"), problems)
 
+    purge_by = _names(top["purge_by"], "purge_by", problems) if "purge_by" in top else ()
+    for name in purge_by:
+        if name not in tiers and name not in roles:
+            problems.append(f"UNKNOWN_TIER: purge_by names {name!r}, which is neither a tier nor a declared role")
+
     mode = top.get("impure_failure_mode", "reject_on_failure")
     if mode not in FAILURE_MODES:
         problems.append(f'"impure_failure_mode" must be one of {sorted(FAILURE_MODES)}')
@@ -196,6 +202,7 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
         lenient_contributors=lenient_contributors,
         roles=roles,
         rejection_audit=audit,
+        purge_by=tuple(dict.fromkeys(purge_by)),
         document_validate=document_validate,
         impure_failure_mode=str(mode),
         deferred_on_failure=str(on_failure),

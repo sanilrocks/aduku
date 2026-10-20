@@ -17,18 +17,31 @@ from aduku.engine.compute import compute_fields
 from aduku.engine.derive import Prepared, build_document, derive, fold_entries, merge_tiers
 from aduku.engine.document import value_at
 from aduku.engine.effects import EffectView
-from aduku.ion_codec import ABSENT, Annotated, FrozenStruct, to_canonical
+from aduku.engine.layer_codec import decode_layer
+from aduku.ion_codec import ABSENT, Annotated, FrozenStruct, IonError, to_canonical
 from aduku.model import Entry, Explanation, ModelError
 from aduku.paths import Path, PathError, format_path, parse_path
 from aduku.schema.model import FieldSpec, Schema
 
-__all__ = ["explain"]
+__all__ = ["entry_touches", "explain"]
 
 
 def _touches(entry_path: Path, path: Path) -> bool:
     """True if a write at `entry_path` can change the value at `path`: it is the path, above it, or inside it."""
     shorter = min(len(entry_path), len(path))
     return entry_path[:shorter] == path[:shorter]
+
+
+def entry_touches(entry: Entry, path: Path) -> bool:
+    """True if `entry` can change (or, if purged, could have changed) the value at `path`."""
+    return _touching(entry, path)
+
+
+def _touching(entry: Entry, path: Path) -> bool:
+    """True if `entry` can change the value at `path`. A `layer` entry (feature 005) touches every path its layer holds."""
+    if entry.op == "layer":
+        return any(_touches(written, path) for written in decode_layer(entry.value))
+    return _touches(parse_path(entry.path), path)
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -64,9 +77,11 @@ def explain(
     skipped = set(full.state.skipped)
     relevant = []
     for entry in entries:
+        if entry.purged:  # a placeholder: it has no effect, so it is neither winner, input nor shadowed (feature 005)
+            continue
         try:
-            touching = _touches(parse_path(entry.path), path)
-        except PathError:
+            touching = _touching(entry, path)
+        except (PathError, IonError):
             continue
         if touching and entry.seq not in skipped and entry.tier in schema.tiers:
             relevant.append(entry)

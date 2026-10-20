@@ -1,0 +1,10 @@
+// Schema for the feature 005 walkthrough (specs/005-snapshots-compaction-time-travel/quickstart.md): a document whose history is
+// read, compacted and purged. `dpo` may purge.
+schema::{
+  id: "customer", version: 1, tiers: [backfill, user, admin], roles: [dpo], purge_by: [dpo],
+  fields: {
+    "/name": {type: string, merge: lww},
+    "/age": {type: int, merge: max},
+    "/email": {type: string, merge: lww}
+  }
+}

@@ -101,6 +101,8 @@ cross-field document validators run after merge; violations become rejections or
 
 ## Feature 5: Storage, snapshots, compaction and time travel
 
+*Done: specified, planned and implemented in `specs/005-snapshots-compaction-time-travel/` (2026-10-20).*
+
 Make reads fast and history manageable. Read SPEC 12.2, 15.
 
 **Why:** Replaying the entire ledger on every read does not scale, but results must stay identical.

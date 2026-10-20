@@ -1,0 +1,37 @@
+// Feature 005, US4: compaction and schema versions. A range written under two versions is refused; a version that folds
+// differently is applied to compacted history from the archive while it is kept and refused once it is expired; a version that only
+// changes validation reuses the compacted entries.
+case::{
+  name: "compaction-versions",
+  schemas: [
+    schema::{ id: "t", version: 1, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} } },
+    schema::{ id: "t", version: 2, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww, validate: [max_len::{n: 3}]}, "/age": {type: int, merge: max} } },
+    schema::{ id: "t", version: 3, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: min} } }
+  ],
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "ann"}, {tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { activate_schema: 2 },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 2}] },
+      expect: { accepted: [{seq: 3}] } },
+
+    // the range holds entries written under versions 1 and 2
+    { compact: {doc: "d1", through_seq: 3}, expect: { refused: MIXED_SCHEMA_RANGE } },
+    { compact: {doc: "d1", through_seq: 2}, expect: { watermark: 2, replaced: 2, remaining: 2 } },
+
+    // a version that folds differently (age takes the minimum) is derived from the archived originals
+    { activate_schema: 3 },
+    { get: "d1", expect: { document: "{age: 2, name: \"ann\"}" } },
+    { as_of: {doc: "d1", seq: 2}, expect: { document: "{age: 5, name: \"ann\"}" } },
+    { activate_schema: 2 },
+
+    // after expiry that version is refused, and a validation-only version still works
+    { expire: {doc: "d1", through_seq: 2}, expect: { expired: 2 } },
+    { activate_schema: 3, expect: { refused: HISTORY_COMPACTED } },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\"}" } }
+  ]
+}

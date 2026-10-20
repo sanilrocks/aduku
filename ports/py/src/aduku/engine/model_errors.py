@@ -11,7 +11,7 @@ give the same attribution.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from aduku.behaviors.registry import BehaviorRegistry
@@ -31,6 +31,7 @@ from aduku.paths import Path, format_path
 from aduku.schema.model import Schema
 
 __all__ = [
+    "Base",
     "Extension",
     "Origin",
     "Replay",
@@ -42,6 +43,25 @@ __all__ = [
     "render",
     "replay",
 ]
+
+
+@dataclass(frozen=True)
+class Base:
+    """What a replay of requests had computed when a compaction replaced them (feature 005, research R-8): the model errors
+    with who introduced each, and the seqs the fold could not use. A replay seeds them after the compaction's synthetic entries."""
+
+    errors: tuple[ModelError, ...]
+    skipped: tuple[int, ...] = ()
+
+
+def _with_base(extension: Extension, base: Base) -> Extension:
+    """`extension` (a state that has just folded a compaction's synthetic entries) with the base's attribution and skips."""
+    known = {error.identity: error for error in base.errors}
+    errors = tuple(
+        known.get(error.identity, error) for error in extension.errors
+    )  # an error the base knew keeps its origin
+    skipped = tuple(sorted({*base.skipped, *extension.state.skipped}))
+    return replace(extension, state=replace(extension.state, errors=errors, skipped=skipped))
 
 
 @dataclass(frozen=True)
@@ -225,6 +245,8 @@ def replay(
     entries: Sequence[Entry],
     capture: str | None = None,
     effects: EffectView | None = None,
+    bases: Mapping[str, Base] | None = None,
+    trail: dict[str, tuple[tuple[ModelError, ...], tuple[ModelError, ...]]] | None = None,
 ) -> Replay:
     """Derive from scratch: the document under `read_schema`, and each error attributed as the ledger dictates.
 
@@ -235,15 +257,21 @@ def replay(
     """
     ordered = sorted(entries, key=lambda e: e.seq)
     read = prepare_for(read_schema)
+    bases = bases or {}
     if not can_have_errors(read_schema):  # nothing can be an error under this version, whatever the history was
-        return Replay(
-            extend(
-                read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), effects=effects
-            )
+        only = extend(
+            read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), effects=effects
         )
+        skipped = {
+            seq for key, base in bases.items() if any(e.request_id == key for e in ordered) for seq in base.skipped
+        }
+        if skipped - set(only.state.skipped):
+            only = replace(only, state=replace(only.state, skipped=tuple(sorted({*skipped, *only.state.skipped}))))
+        return Replay(only)
 
     errors: tuple[ModelError, ...] = ()
     state: DerivationState | None = None
+    carried: set[int] = set()
     done: list[Entry] = []
     current: int | None = None
     before: tuple[ModelError, ...] = ()
@@ -258,14 +286,23 @@ def replay(
                 refolded = fold_entries(schema, behaviors, None, done, prepared)
                 _, violations, _, _ = _evaluate(schema, behaviors, prepared, refolded, effects)
                 errors = update_errors(errors, violations, Origin(schema_version=version))
-                state = replace(refolded, errors=errors)
+                # the entries a compaction replaced are not here to be skipped again: their skips are carried over
+                state = replace(refolded, errors=errors, skipped=tuple(sorted({*refolded.skipped, *carried})))
             current = version
         if capture == group[0].request_id:
             before = errors
+        errors_before = errors
         last = extend(
             schema, behaviors, prepared, state, group, Origin(request_id=group[0].request_id), errors, effects
         )
+        base = bases.get(group[0].request_id)
+        if base is not None:
+            # the synthetic entries of a compaction: take over what the requests it replaced had computed
+            last = _with_base(last, base)
+            carried.update(base.skipped)
         state, errors = last.state, last.errors
+        if trail is not None:  # the errors each request found and left, for every request (feature 005)
+            trail[group[0].request_id] = (errors_before, errors)
         if capture == group[0].request_id:
             after = errors
         done.extend(group)
@@ -275,4 +312,10 @@ def replay(
     final = extend(
         read_schema, behaviors, read, None, ordered, Origin(schema_version=read_schema.version), errors, effects
     )
+    if bases:  # the read schema differs from the last request's: keep the attribution and skips the bases carried
+        known = {error.identity: error for base in bases.values() for error in base.errors}
+        final = _with_base(
+            final,
+            Base(tuple(known.get(e.identity, e) for e in errors), tuple(s for b in bases.values() for s in b.skipped)),
+        )
     return Replay(final, before, after)

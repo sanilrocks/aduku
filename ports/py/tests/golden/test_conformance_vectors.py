@@ -18,7 +18,8 @@ def _marked(path: pathlib.Path):  # type: ignore[no-untyped-def]
     return pytest.param(path, id=path.stem, marks=marks)
 
 
+@pytest.mark.parametrize("layers", [True, False], ids=["layers", "no-layers"])  # feature 005, SC-008
 @pytest.mark.parametrize("path", [_marked(p) for p in CASES])
-def test_vector(path: pathlib.Path, backend: Storage) -> None:
+def test_vector(path: pathlib.Path, backend: Storage, layers: bool) -> None:
     case = load_case(path.read_text())
-    run_case(case, build_service(case, backend))
+    run_case(case, build_service(case, backend, layers=layers))

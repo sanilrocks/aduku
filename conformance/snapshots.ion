@@ -1,0 +1,37 @@
+// Feature 005, US1/US2: saved layers never change a result. The same steps are run with layers on and off by the runner (SC-008);
+// a restart (a new service on the same storage) uses the saved layers, a damaged layer is found and repaired by rebuild.
+case::{
+  name: "snapshots",
+  schema: schema::{
+    id: "t", version: 1, tiers: [backfill, user, admin],
+    fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max}, "/tags": {type: "list<string>", merge: union} }
+  },
+  steps: [
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]},
+                entries: [{tier: backfill, path: "/name", value: "A. Smith"}, {tier: backfill, path: "/age", value: 30}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "Alice"}, {tier: user, path: "/tags", value: ["x"]}] },
+      expect: { accepted: [{seq: 3}, {seq: 4}] } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]},
+                entries: [{tier: admin, path: "/tags", value: ["z"]}, {tier: admin, path: "/age", op: delete}] },
+      expect: { accepted: [{seq: 5}, {seq: 6}] } },
+    { get: "d1", expect: { document: "{name: \"Alice\", tags: [\"x\", \"z\"]}" } },
+
+    // a restarted service gives the same answer, and a write after the restart folds on top of the saved layers
+    { restart: {} },
+    { get: "d1", expect: { document: "{name: \"Alice\", tags: [\"x\", \"z\"]}" } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/age", value: 31}] },
+      expect: { accepted: [{seq: 7}] } },
+    { restart: {} },
+    { get: "d1", expect: { document: "{age: 31, name: \"Alice\", tags: [\"x\", \"z\"]}" } },
+
+    // nothing differs; then a layer is damaged by hand: rebuild finds it, repairs it, and a second rebuild is clean
+    { rebuild: "d1", expect: { identical: true, layers_differing: 0 } },
+    { damage_layer: { doc: "d1", tier: user } },
+    { rebuild: "d1", expect: { identical: false, layers_differing: 1 } },
+    { rebuild: "d1", expect: { identical: true, layers_differing: 0 } },
+    { restart: {} },
+    { get: "d1", expect: { document: "{age: 31, name: \"Alice\", tags: [\"x\", \"z\"]}" } }
+  ]
+}

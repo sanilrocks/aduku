@@ -312,6 +312,7 @@ class Schema:
     lenient_contributors: tuple[str, ...] = ()
     roles: tuple[str, ...] = ()
     rejection_audit: AuditSettings = AuditSettings()
+    purge_by: tuple[str, ...] = ()  # tiers and roles that may purge a document (feature 005); nobody by default
     document_validate: tuple[BehaviorRef, ...] = ()
     impure_failure_mode: str = "reject_on_failure"
     deferred_on_failure: str = "error"  # the default `on_failure` of deferred fields (feature 003)
@@ -323,6 +324,16 @@ class Schema:
         A cached view is only used when it was derived under the same fingerprint (FR-026).
         """
         return hashlib.sha256(_describe(self).encode()).hexdigest()[:16]
+
+    @cached_property
+    def fold_fingerprint(self) -> str:
+        """A digest of what decides how entries fold into per-tier layers: the tiers and, for each field pattern, its type,
+        merge behavior and whether it is derived. Validation, computed and deferred details, defaults and authority are
+        left out, so a version that only changes those can reuse compacted history (feature 005, research R-10)."""
+        fields = sorted(
+            (spec.pattern, spec.type or "", _describe(spec.merge), spec.derived or "") for spec in self.fields
+        )
+        return hashlib.sha256(_describe((self.tiers, tuple(fields))).encode()).hexdigest()[:16]
 
     def on_failure_of(self, spec: FieldSpec) -> str:
         """What a deferred field does when its source fails: its own setting, else the schema's, else `error`."""

@@ -35,7 +35,13 @@ def longest(path: object, old: object, new: object, ctx: object) -> object:
     return max(old, new, key=lambda text: (len(text), text))  # type: ignore[arg-type]
 
 
+def add(path: object, old: object, new: object, ctx: object) -> object:
+    """Fixture merge: a running total. Associative and commutative, and not idempotent (a repeat counts twice)."""
+    return new if old is ABSENT else old + new  # type: ignore[operator]
+
+
 MERGES = {
+    "acme.add@1": ("acme.add", 1, add, Laws(associative=True, commutative=True)),
     "acme.subtract@1": ("acme.subtract", 1, subtract, Laws()),
     "acme.longest@1": ("acme.longest", 1, longest, Laws(associative=True, commutative=True, idempotent=True)),
 }
