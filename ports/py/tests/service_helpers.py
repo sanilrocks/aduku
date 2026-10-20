@@ -41,6 +41,7 @@ def make_service(
     clock: Clock | None = None,
     schema: str | None = None,
     ids: IdSource | None = None,
+    schema_state: bool = True,
 ) -> Aduku:
     behaviors = BehaviorRegistry.with_builtins()
     register_fixtures(behaviors)
@@ -53,6 +54,7 @@ def make_service(
         clock=clock or FakeClock(step_seconds=1),
         ids=ids or SequentialIds(),
         behaviors=behaviors,
+        schema_state=schema_state,
     )
 
 

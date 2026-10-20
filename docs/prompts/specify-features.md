@@ -115,6 +115,8 @@ provenance; P3 auditable purge for legal erasure.
 
 ## Feature 6: Schema versioning and evolution
 
+*Done: specified, planned and implemented in `specs/006-schema-evolution/` (2026-10-20). Per-field precedence and multi-region seq were decided out of v1 (SPEC 17 items 2 and 6).*
+
 Read SPEC 14. **Why:** Schemas change; merged results must remain reproducible and breaking changes safe.
 
 **Stories:** P1 immutable versions and activation; P1 breaking-change classification with dry-run diff and

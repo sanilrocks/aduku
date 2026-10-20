@@ -125,6 +125,16 @@ def _conforms(type_text: str, value: Any) -> bool:
     return _scalar_conforms(kind, value)
 
 
+def differing_parts(old: dict[str, Any], new: dict[str, Any], limit: int = 5) -> list[str]:
+    """The field patterns (and `(top-level settings)`) whose parts differ between two versions, at most `limit`, in order."""
+    found: list[str] = []
+    if old.get("top") != new.get("top"):
+        found.append("(top-level settings)")
+    names = sorted({*old.get("fields", {}), *new.get("fields", {})})
+    found.extend(name for name in names if old.get("fields", {}).get(name) != new.get("fields", {}).get(name))
+    return found[:limit]
+
+
 def _describe(value: Any) -> str:
     """A stable text for a schema tree: dataclasses by field, sequences in order, Ion values as canonical text."""
     if value is MISSING:
@@ -316,6 +326,25 @@ class Schema:
     document_validate: tuple[BehaviorRef, ...] = ()
     impure_failure_mode: str = "reject_on_failure"
     deferred_on_failure: str = "error"  # the default `on_failure` of deferred fields (feature 003)
+
+    @cached_property
+    def content_fingerprint(self) -> str:
+        """The full SHA-256 of everything in this version (its identity across restarts, feature 006)."""
+        return hashlib.sha256(_describe(self).encode()).hexdigest()
+
+    @cached_property
+    def fingerprint_parts(self) -> dict[str, Any]:
+        """`{top: digest, fields: {pattern: digest}}`: a digest of the settings that are not fields and of each field, so that a
+        mismatch of two fingerprints can name where the versions differ without keeping the schema text."""
+        top = tuple(
+            (item.name, _describe(getattr(self, item.name)))
+            for item in dc_fields(self)
+            if item.name not in ("fields", "version")
+        )
+        return {
+            "top": hashlib.sha256(repr(top).encode()).hexdigest(),
+            "fields": {spec.pattern: hashlib.sha256(_describe(spec).encode()).hexdigest() for spec in self.fields},
+        }
 
     @cached_property
     def rules_fingerprint(self) -> str:

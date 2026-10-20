@@ -123,7 +123,7 @@ def test_a_once_dependent_keeps_its_value_when_the_upstream_refreshes_unless_it_
             f'"/limit": {deferred(hook="fx.down@1", depends=chr(34) + "/rate" + chr(34), **({"on_dependency_change": "recompute"} if opt_in else {}))}'
         )
         extra = together(scored(log, "fx.up", lambda inputs, c=counter: next(c)), scored(log, "fx.down", 5))
-        built = build(backend, fields, extra=extra, sources=[], prefix=f"p{opt_in}")
+        built = build(backend, fields, extra=extra, sources=[], prefix=f"p{opt_in}", schema_state=False)
         doc = f"d{opt_in}"
         built.service.append(doc, [put("/name", "Alice")], contributor=ALICE)
         built.service.get(doc)

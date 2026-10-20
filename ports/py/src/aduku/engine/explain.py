@@ -23,13 +23,18 @@ from aduku.model import Entry, Explanation, ModelError
 from aduku.paths import Path, PathError, format_path, parse_path
 from aduku.schema.model import FieldSpec, Schema
 
-__all__ = ["entry_touches", "explain"]
+__all__ = ["entry_touches", "explain", "paths_touch"]
 
 
 def _touches(entry_path: Path, path: Path) -> bool:
     """True if a write at `entry_path` can change the value at `path`: it is the path, above it, or inside it."""
     shorter = min(len(entry_path), len(path))
     return entry_path[:shorter] == path[:shorter]
+
+
+def paths_touch(entry_path: Path, path: Path) -> bool:
+    """True if a write at `entry_path` can change the value at `path` (the same path, above it or inside it)."""
+    return _touches(entry_path, path)
 
 
 def entry_touches(entry: Entry, path: Path) -> bool:

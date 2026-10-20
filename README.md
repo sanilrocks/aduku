@@ -19,6 +19,7 @@ Language ports are named `aduku-<lang>`: `aduku-py`, `aduku-java`, `aduku-rs`, `
 | `specs/003-deferred-fields/` | Feature 003: deferred computed fields (IO hooks with refresh policies), same set of documents |
 | `specs/004-validation-authority/` | Feature 004: the validation rule library and per-field authority, same set of documents |
 | `specs/005-snapshots-compaction-time-travel/` | Feature 005: saved layers, `as_of` reads, compaction and purge, same set of documents |
+| `specs/006-schema-evolution/` | Feature 006: schema versions in the store, change classification, dry run, pins and migration, shadow reasons, same set of documents |
 | `.specify/` | [Spec Kit](https://github.com/github/spec-kit) scaffolding; `memory/constitution.md` is the project constitution |
 | `.claude/skills/` | Spec Kit skills for Claude Code (`/speckit-*`) |
 
@@ -26,7 +27,7 @@ Language ports are named `aduku-<lang>`: `aduku-py`, `aduku-java`, `aduku-rs`, `
 
 Constitution ratified. Features 001 (core ledger and merge engine), 002 (computed fields, impure computes, the effect
 log), 003 (deferred fields: fetch policies, scheduler, notifications, failure handling) and 004 (the validation rule
-library and per-field authority) and 005 (saved per-tier layers, `as_of` reads, compaction and purge) are implemented in `ports/py/`: all tests pass against the shared vectors. Feature 6 is still to be specified (`docs/prompts/specify-features.md`).
+library and per-field authority) 005 (saved per-tier layers, `as_of` reads, compaction and purge) and 006 (schema versions shared through the store, change classification, dry run, activation with acknowledgement and rollback, pins and migration, reasons for shadowed entries) are implemented in `ports/py/`: all tests pass against the shared vectors.
 
 To try it: `cd ports/py && uv sync && uv run pytest`, then the walkthrough in
 `specs/001-core-ledger-merge-engine/quickstart.md`.

@@ -14,19 +14,27 @@ if TYPE_CHECKING:
     from aduku.errors import AdukuError, ComputeFault, RejectedError, SchemaError, StorageError
     from aduku.hooks import HookRunner
     from aduku.model import (
+        ActivationReport,
         AppendResult,
         ArchiveReport,
         AsOf,
         AsOfInfo,
+        Change,
+        ChangeList,
         CompactionReport,
         DeferredInfo,
         DeferredStatus,
+        DocumentChange,
         DocumentResult,
+        DryRunReport,
         EffectInfo,
         EntryInput,
         ExpiryReport,
         Explanation,
+        HistoryRecord,
         Identity,
+        MigrationProgress,
+        MigrationReport,
         PurgedMark,
         PurgeRecord,
         PurgeReport,
@@ -34,7 +42,9 @@ if TYPE_CHECKING:
         RebuildReport,
         RecomputeReport,
         SchedulerReport,
+        Shadowed,
     )
+    from aduku.schema.diff import schema_changes
     from aduku.schema.loader import load_schema
     from aduku.schema.registry import SchemaRegistry
     from aduku.service import Aduku
@@ -78,6 +88,16 @@ _EXPORTS = {
     "PurgeScope": "aduku.model",
     "PurgedMark": "aduku.model",
     "HistoryCompactedError": "aduku.errors",
+    "ActivationReport": "aduku.model",
+    "Change": "aduku.model",
+    "ChangeList": "aduku.model",
+    "DocumentChange": "aduku.model",
+    "DryRunReport": "aduku.model",
+    "HistoryRecord": "aduku.model",
+    "MigrationProgress": "aduku.model",
+    "MigrationReport": "aduku.model",
+    "Shadowed": "aduku.model",
+    "schema_changes": "aduku.schema.diff",
     "load_schema": "aduku.schema.loader",
 }
 
@@ -117,6 +137,16 @@ __all__ = [
     "PurgeScope",
     "PurgedMark",
     "HistoryCompactedError",
+    "ActivationReport",
+    "Change",
+    "ChangeList",
+    "DocumentChange",
+    "DryRunReport",
+    "HistoryRecord",
+    "MigrationProgress",
+    "MigrationReport",
+    "Shadowed",
+    "schema_changes",
     "load_schema",
 ]
 

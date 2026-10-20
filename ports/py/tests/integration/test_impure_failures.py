@@ -29,7 +29,7 @@ def impure(hook: str = "fx.fail@1", mode: str = "", retry: int = 1, on_missing: 
     )
 
 
-def build(backend: Storage, field: str, top: str = "", prefix: str = "s") -> Aduku:
+def build(backend: Storage, field: str, top: str = "", prefix: str = "s", schema_state: bool = True) -> Aduku:
     behaviors = BehaviorRegistry.with_builtins()
     register_fixtures(behaviors)
     registry = SchemaRegistry()
@@ -39,7 +39,7 @@ def build(backend: Storage, field: str, top: str = "", prefix: str = "s") -> Adu
         )
     )
     registry.activate(1)
-    return Aduku(backend, registry, behaviors=behaviors, ids=SequentialIds(prefix))
+    return Aduku(backend, registry, behaviors=behaviors, ids=SequentialIds(prefix), schema_state=schema_state)
 
 
 def computed(value: object) -> Annotated:
@@ -129,6 +129,7 @@ def test_7_the_field_setting_overrides_the_schema_setting(backend: Storage) -> N
         impure(),
         top="impure_failure_mode: model_error_on_failure, lenient: {allowed: [backfill]},",
         prefix="w",
+        schema_state=False,  # a second schema on the same storage (feature 006: the store would hold the first)
     )
     schema_wide.append("d2", [put("/country", "US")], contributor=ALICE)  # the schema's setting applies
     assert [e.rule_id for e in schema_wide.get("d2").model_errors] == ["impure:/taxId"]

@@ -1,0 +1,51 @@
+// Feature 006, US3: a pinned document keeps its version while the active one moves on; a migration moves it, one document or a
+// batch, and can be run again. d3's history was compacted and its originals expired, so version 2 cannot fold it: it is reported
+// failed and stays on version 1. Pinned documents are left out of a dry run (the library's integration tests count them).
+case::{
+  name: "schema-pins",
+  schemas: [
+    schema::{ id: "t", version: 1, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} } },
+    schema::{ id: "t", version: 2, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: min} } }
+  ],
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "A"}, {tier: user, path: "/age", value: 3}, {tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "A"}, {tier: user, path: "/age", value: 3}, {tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { append: { doc: "d3", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "A"}, {tier: user, path: "/age", value: 3}, {tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+
+    // all three are held on version 1 while version 2 becomes the active one
+    { pin: {doc: "d1", version: 1, operator: "ops"} },
+    { pin: {doc: "d2", version: 1, operator: "ops"} },
+    { pin: {doc: "d3", version: 1, operator: "ops"} },
+    { activate_schema: { version: 2, operator: "ops", acknowledge_breaking: true }, expect: { class: breaking } },
+    { get: "d1", expect: { document: "{age: 5, name: \"A\"}" } },
+
+    // d3's originals are gone, so version 2 cannot fold it
+    { compact: {doc: "d3", through_seq: 3}, expect: { watermark: 3, replaced: 3, remaining: 1 } },
+    { expire: {doc: "d3", through_seq: 3}, expect: { expired: 3 } },
+    { pin: {doc: "d3", version: 2, operator: "ops"}, expect: { refused: HISTORY_COMPACTED } },
+
+    // one document, then a document that is not pinned in the same batch
+    { migrate: {docs: [d1, ghost], operator: "ops"}, expect: { moved: [d1], already_moved: [], not_pinned: [ghost], failed: [] } },
+    { get: "d1", expect: { document: "{age: 3, name: \"A\"}" } },
+
+    // every pinned document: d2 moves, d3 cannot be derived and stays where it is
+    { migrate: {operator: "ops"}, expect: { moved: [d2], already_moved: [], not_pinned: [], failed: [d3] } },
+    { get: "d2", expect: { document: "{age: 3, name: \"A\"}" } },
+    { get: "d3", expect: { document: "{age: 5, name: \"A\"}" } },
+
+    // run again: what moved is reported and left alone
+    { migrate: {docs: [d1, d2], operator: "ops"}, expect: { moved: [], already_moved: [d1, d2], not_pinned: [], failed: [] } },
+
+    // a document asked about alone that is not pinned is refused
+    { migrate: {docs: [ghost], operator: "ops"}, expect: { refused: NOT_PINNED } },
+    { unpin: {doc: "d3", operator: "ops"} }
+  ]
+}

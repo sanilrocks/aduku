@@ -1,6 +1,6 @@
 # aduku — Specification
 
-Status: Draft 0.12 · Audience: implementers and reviewers
+Status: Draft 0.13 · Audience: implementers and reviewers
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** are used as in RFC 2119.
 
@@ -534,6 +534,16 @@ cannot be bypassed by the non-rejection flag.
 If a field **becomes** derived in a later schema version, historic accepted entries for it are retained but
 **shadowed**: they are ignored by folds under the new schema and visible in provenance as `shadowed`.
 
+**Why an entry is left out.** An entry the version in force cannot use is left out of the document, listed by seq in `skipped`,
+and given one reason, worked out from the ledger and the version each time and never stored (so it cannot disagree with them):
+`tier_not_in_schema` (its tier is not in the schema), `now_derived` (its field, or one above it, is now computed or deferred),
+`no_longer_conforms` (it was admitted under another version and its value does not conform to the type now in force, a
+parameterized type such as a list of strings included; a validation rule is a model error, not a shadow) or `cannot_be_merged`
+(the merge rule cannot take its value). The checks run in that order and the first that applies names the reason. Reading
+under the version that wrote the entries leaves out none. `get` returns the reasons with the document (`shadowed`), `explain`
+lists those that touch the path (`shadowed_by_schema`; its `shadowed` keeps the meaning of 12.3) and the dry run of 14 counts them
+per reason.
+
 ### 9.3 Computed fields
 
 - Evaluated at P4, **after the full merge** (P1–P3).
@@ -741,6 +751,9 @@ that error is not *new* when the first request arrives; the request is still rej
   and re-derives from the ledger under the current version, recomputing model errors.
 - Violations found are recorded as model errors and returned with the document. Previously accepted entries are never
   retroactively rejected or removed, and the ledger is not modified.
+- Activating a version touches no document: each one re-derives on its next read. An operator MAY ask for an eager `rebuild`
+  with the activation, and MAY first run a **dry run** (14) that derives documents under the current and the target version
+  over the same entries and recorded outcomes and reports what would differ; a dry run writes nothing and calls no hook or source.
 
 ### 10.6 The rule library
 
@@ -798,7 +811,7 @@ get(doc, {
   consistency?:  cached | fresh,                // fresh forces per_fetch hooks and P1–P6 recompute
   include?:      [provenance, pending],
   tiers?:        [..]                           // debug: merge a subset of tiers
-}) -> { document, model_errors: [ ... ], status, provenance? }
+}) -> { document, model_errors: [ ... ], status, skipped: [seq], shadowed: [ { seq, entry, tier, path, reason, detail } ], provenance? }
 ```
 A read normally makes no IO. The one exception is an impure compute with no recorded outcome for its current input
 fingerprint (for example after a schema change): the read calls the hook once, records the outcome (section 9.3.1) and
@@ -832,6 +845,7 @@ explain(doc, path) -> {
   rule:     behavior name@version,
   inputs:   [ entry ids / dependency values that contributed ],
   shadowed: [ entry ids ],
+  shadowed_by_schema: [ { seq, entry, tier, path, reason, detail } ],   // entries this version leaves out that touch the path (9.2)
   model_errors: [ model errors whose scope includes this path ]
 }
 ```
@@ -847,7 +861,7 @@ touched the path with when and why they were erased.
 
 `list_entries`, `rebuild(doc|all)`, `compact(doc, policy)`, `verify_archive(doc)`, `expire_archive(doc, through_seq)`,
 `purge(doc, scope, reason)` (permitted only to the tiers and roles the schema lists in `purge_by`; `NOT_AUTHORIZED` otherwise),
-`purge_log(doc)`, `schema.put/activate`, `hook.invalidate(doc?, field)`,
+`purge_log(doc)`, `schema.put/activate`, the operations of 14 (`schema_changes`, `plan_schema`, `activate_schema`, `pin_document`, `unpin_document`, `plan_migration`, `migrate`, `schema_history`), `hook.invalidate(doc?, field)`,
 `scheduler.run(hook)` (both permitted only to the tiers and roles a field lists in `invalidate_by`; `NOT_AUTHORIZED` otherwise), `list_rejections(doc, { since?, limit? })`, `set_rejection_audit(doc, enabled|inherit)`,
 `prune_rejections(doc?)`, `recompute(doc, field?)`, `list_effects(doc, field?)`, `prune_effects(doc?)`.
 
@@ -861,7 +875,7 @@ and otherwise fills a missing outcome once (9.3.1).
 
 `FIELD_NOT_WRITABLE`, `NOT_AUTHORIZED`, `TIER_NOT_PERMITTED`, `UNKNOWN_PATH`, `TYPE_MISMATCH`,
 `OP_NOT_ALLOWED`, `VALIDATION_FAILED`, `MODEL_ERROR_INTRODUCED`, `COMPUTE_FAULT`, `IMPURE_COMPUTE_FAILED`, `LENIENT_NOT_PERMITTED`, `DUPLICATE_IDEM_KEY`, `REQUEST_KEY_REUSED`, `IDEM_KEY_REQUIRED`, `SEQ_CONFLICT`, `SCHEMA_INACTIVE`, `BAD_VALID_TIME`, `AS_OF_AMBIGUOUS`, `HISTORY_COMPACTED`, `MIXED_SCHEMA_RANGE`, `IDEM_KEY_MISSING`,
-`COMPACTION_CHECK_FAILED`, `LEDGER_CHANGED`, `PURGE_REASON_REQUIRED`, `UNKNOWN_ENTRY`, `STORAGE_ERROR` (an error, not a rejection).
+`COMPACTION_CHECK_FAILED`, `LEDGER_CHANGED`, `PURGE_REASON_REQUIRED`, `UNKNOWN_ENTRY`, `BREAKING_CHANGE_NOT_ACKNOWLEDGED`, `NOT_PINNED`, `STORAGE_ERROR` (an error, not a rejection). Refusals of an activation or a pin that are schema errors carry `TIER_IN_USE`, `HISTORY_COMPACTED`, `SCHEMA_STATE_CHANGED` or `SCHEMA_VERSION_CHANGED` (14).
 
 ---
 
@@ -886,26 +900,65 @@ and otherwise fills a missing outcome once (9.3.1).
   for reads.
 - Merged results are a pure function of `(ledger, schema version)`. Re-reading under a new version discards any cached
   derived view and re-runs P1–P7, recomputing model errors (10.4).
+- **Immutable across restarts.** A version is *served* from its first activation or pin. The store keeps a fingerprint of every
+  served version, whole and per field, so that registering a version again with other content is refused
+  (`SCHEMA_VERSION_CHANGED`, naming up to five fields that differ) while identical content is accepted. A version that was only
+  registered, never served, may still be changed.
+- **One place decides which version serves.** The active version and the pins are kept in the store, read through a generation
+  that changes with them, so every process on the store serves the same version, and each change is one transaction with its
+  history record. A process that lacks the stored active version refuses reads and writes with `SCHEMA_INACTIVE` naming it.
 - Changes are classed:
 
 | Change | Class | Effect |
 |---|---|---|
-| Add field, add validator, add tier at top | Compatible | None to existing docs, except new defaults/derived fields appear. |
-| Change default | Visible | Docs without a contribution change on read. |
-| Change merge rule | **Breaking** | Folds change; stored snapshots MUST be invalidated and rebuilt. |
-| Change type / tighten constraint | **Breaking** | Existing entries may no longer conform; they are *shadowed* with a recorded reason or the change is refused. |
-| Add or tighten a validation rule | Visible | Existing entries are kept; documents gain model errors on next read (10.4). |
-| Add, change or remove an `authority` list (11) | Visible | Applies to entries admitted from then on; recorded entries stay. A child without a list also takes a parent's new list. |
-| Make field derived | **Breaking** | Historic entries shadowed (9.2). |
-| Change an impure compute's hook version or `depends` | Visible | Recorded outcomes for the old version or fingerprint are not reused; the next derivation that needs the value calls the hook again (a read may therefore do IO once). |
-| Change `failure_mode` / `impure_failure_mode` | Visible | Applies from the next request or derivation; existing model errors and recorded outcomes stay. |
+| Add field (plain, computed or deferred), add tier at top, declare a role, change `rejection_audit` | Compatible | None to existing docs, except new defaults/derived fields appear. |
+| Remove a field | Visible | New writes to it are refused; its recorded values still show in documents, merged by last-write-wins and no longer governed by a type, rule or authority. Nothing is shadowed. |
+| Change default or `on_delete` | Visible | Docs without a contribution change on read. |
+| Change merge rule | **Breaking** | Folds change; stored snapshots MUST be invalidated and rebuilt. Entries the new rule cannot take are shadowed (`cannot_be_merged`). |
+| Change type / tighten constraint | **Breaking** | Entries admitted under another version that no longer conform are *shadowed* (`no_longer_conforms`), never refused, and counted by the dry run. |
+| Add or tighten a validation rule, add, change or remove a document rule | Visible | Existing entries are kept; documents gain model errors on next read (10.4). |
+| Add, change or remove an `authority` list, `ops` or `redact` (11) | Visible | Applies to entries admitted from then on; recorded entries stay. A child without a list also takes a parent's new list. |
+| Make field derived | **Breaking** | Historic entries shadowed (`now_derived`, 9.2). |
+| Make a derived field plain | **Breaking** | The field takes recorded writes again. |
+| Change a computed field's macro, arguments or `on_missing` | Visible | Recomputed on the next read. |
+| Change an impure compute's hook version or `depends` (or its call settings) | Visible | Recorded outcomes for the old version or fingerprint are not reused; the next derivation that needs the value calls the hook again (a read may therefore do IO once). |
+| Change a deferred field's source, `depends`, `refresh`, `ttl`, `on_failure` or `invalidate_by` | Visible | The stored value is reused only while it answers the same question (9.5). |
+| Change `failure_mode` / `impure_failure_mode` / `deferred_on_failure` / leniency | Visible | Applies from the next request or derivation; existing model errors and recorded outcomes stay. |
 | Add, change or remove `purge_by` (15.5) | Visible | Applies to purges asked from then on. |
 | Change merge rules, types, tiers or which fields are derived, on a document with compacted history (15.3) | **Breaking** | The document is derived from the archived originals; once they are expired the version is refused for it (`HISTORY_COMPACTED`). A version that only changes validation, computed or deferred rules reuses the compacted entries. |
-| Insert/reorder tier | **Breaking** | `(tier, seq)` order changes; rebuild required. |
-| Drop or rename a tier used by existing entries | **Breaking** | Refused at activation while any entry in the ledger uses it. |
+| Insert/reorder/drop/rename a tier below the top | **Breaking** | `(tier, seq)` order changes; entries of a tier the schema lacks are shadowed (`tier_not_in_schema`). |
+| Drop or rename a tier used by existing entries | **Breaking** | Refused at activation or pin while any entry (of that document, for a pin) uses it (`TIER_IN_USE`). |
+| Any other difference | Visible, **not classified** | Listed as such, so that nothing is missed silently. |
 
-- Documents MAY pin a schema version (`doc.pinned_schema`) until migrated.
-- Breaking changes SHOULD ship with a dry-run (`rebuild` in shadow mode) that diffs old vs new merged documents.
+- **Change list.** A function of two schemas alone lists every difference with its kind, path, class and one sentence that never
+  holds a stored value, in a fixed order, and marks the changes that can shadow entries and for which reasons. When a field changes
+  in several ways each is its own entry; a renamed field is a removal and an addition. The overall class is the worst of them.
+- **Dry run.** `plan_schema(target)` derives each document under the current and the target version over the same entries and
+  recorded outcomes and reports, per document, whether it differs, the model errors added and resolved (by rule and path), the
+  skipped entries before and after, the shadowed entries per reason, whether the target would call a hook, and a document that
+  cannot be derived (with its code). It writes nothing and calls no hook or source. Every document is examined unless a list of
+  documents or a limit is given (a limit takes the first N by a hash of the name, the same N each time); the report says how many
+  were examined and left out. Documents pinned to a version are left out: an activation does not touch them. What the dry run
+  reports as unchanged reads unchanged after the activation, and what it reports as changed reads as reported.
+- **Activation** is an operator's act: the operator is named and recorded. A breaking target is refused
+  (`BREAKING_CHANGE_NOT_ACKNOWLEDGED`, naming the class and the first breaking changes) unless the operator acknowledges it; a
+  compatible or visible one needs no acknowledgement. The checks of the table (`TIER_IN_USE`, `HISTORY_COMPACTED`), an
+  unregistered version (`SCHEMA_INACTIVE`) and a stale expected generation (`SCHEMA_STATE_CHANGED`) refuse it and record
+  nothing. Activating the active version is a no-op. Activation touches no document and its cost does not grow with their
+  number; an eager `rebuild` MAY be asked for, refreshes the saved layers and views of the unpinned documents, reports those that
+  changed and those it could not derive, never writes to the ledger, and the activation stands whatever it finds.
+- **Rollback** is activating an older version again. It is allowed whenever the checks above pass, needs no acknowledgement, is
+  recorded as a rollback with its class, changes no entry, and every document reads byte for byte as it did before.
+- **Pins and migration.** A document MAY be pinned to a version (`doc.pinned_schema`): it is read and written under that version
+  whatever is active, and a pin is refused for the reasons an activation is. A migration moves a pinned document to a chosen
+  version (the active one by default), unpinning it when that is the active version, in one transaction with its record and
+  without touching its entries. A dry run for one document is available. A batch works over a list or every pinned document,
+  reports progress, goes on past a document that cannot be derived under the target (reported, left on its version) and is safe to
+  run again after a stop: what moved is reported and left alone. Migrating a document that is not pinned is refused
+  (`NOT_PINNED`).
+- **History.** Every bootstrap, activation, rollback, pin, unpin and migration is a record (who, when, from and to version,
+  document if any, class) that is never changed or removed and never read by a derivation. Anyone with access to the library or
+  command line MAY act; the schema lists nobody (as for `rebuild` and `compact`).
 
 ---
 
@@ -1131,6 +1184,7 @@ Every question below was decided on 2026-10-18. The Decision line says what is i
 
 ## Appendix A. Changelog
 
+- **0.13**: Schema versioning and evolution as built in feature 006: versions are immutable across restarts by fingerprint (`SCHEMA_VERSION_CHANGED`), the active version and the pins live in the store with a history, the classification table of 14 grows (a removed field is visible; unclassified differences are listed), the change list, the dry run, the acknowledgement of a breaking activation, rollback, per-document pins and migration, and the reasons for shadowed entries (9.2) shown with `get` and `explain` (12.2, 12.3); type tightening shadows instead of refusing; new codes in 12.5.
 - **0.12**: Snapshots, time travel, compaction and purge as built in feature 005: saved per-tier layers with an epoch (15.1, 15.2), `as_of` by seq, `tx_time` and `valid_time` with the rules of 12.2 and 15.4, compaction with one `layer` entry per tier, an archive, its check and its expiry (15.3), and purge with `purge_by`, placeholders and the purge log (15.5); the append-only rule of 4.2 names compaction and purge as its only exceptions; `valid_time` joins the request hash only when given (4.1, 4.2).
 
 - **0.11**: Rule library and authority as clarified for feature 004: the rules of 10.6, authority inheritance and the wording of `NOT_AUTHORIZED` reasons (11).

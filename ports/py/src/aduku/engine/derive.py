@@ -17,6 +17,7 @@ from aduku.engine.document import assemble
 from aduku.engine.graph import order
 from aduku.engine.layer_codec import decode_layer, encode_layer
 from aduku.engine.merge_layers import apply_layer, overlay
+from aduku.engine.shadow import entry_nonconformity
 from aduku.engine.squash import Layer, entry_layer
 from aduku.engine.tombstones import apply_tombstones
 from aduku.ion_codec import FrozenStruct
@@ -126,6 +127,12 @@ def fold_entries(
             del layer[path]
         if shadowed:
             skipped.append(entry.seq)
+        # feature 006: an entry written under another version is not checked again by admission, so a value that no longer
+        # conforms to the type now in force is left out (an entry of the version in force always conforms)
+        if entry.schema_version != schema.version and entry_nonconformity(schema, ctx, entry) is not None:
+            if not shadowed:
+                skipped.append(entry.seq)
+            continue
         if entry.tier not in copied:
             layers[entry.tier] = dict(layers.get(entry.tier, {}))
             copied.add(entry.tier)

@@ -17,8 +17,8 @@ FIELDS2 = FIELDS + ', "/country": {type: string, merge: lww}, ' + IMPURE
 AUDIT = "rejection_audit: {enabled: true, mode: full, retention: {max_entries: 10}},"
 
 
-def svc(backend: Storage, audit: str = ""):  # type: ignore[no-untyped-def]
-    return make_service(backend, schema=schema_text(audit=audit, fields=FIELDS2))
+def svc(backend: Storage, audit: str = "", **options):  # type: ignore[no-untyped-def]
+    return make_service(backend, schema=schema_text(audit=audit, fields=FIELDS2), **options)
 
 
 def untouched(service) -> bool:  # type: ignore[no-untyped-def]
@@ -73,7 +73,8 @@ def test_5_no_tier_or_identity_gets_through(backend: Storage) -> None:
 
 
 def test_6_auditing_on_keeps_exactly_one_record_off_keeps_none(backend: Storage) -> None:
-    on, off = svc(backend, AUDIT), svc(backend)
+    # two services on one storage whose schemas differ under the same version: each keeps its own choice (feature 006)
+    on, off = svc(backend, AUDIT, schema_state=False), svc(backend, schema_state=False)
     for service in (on, off):
         with pytest.raises(RejectedError):
             service.append("d1", [put("/displayName", "HACKED", tier="admin")], contributor=ROOT)

@@ -40,7 +40,7 @@ def setup(backend: Storage, policy: str = "error", refresh: str = "per_fetch", *
 def test_a_source_that_is_down_never_changes_what_a_write_does(backend: Storage) -> None:
     built, source = setup(backend)
     source.down = True
-    plain = build(backend, '"/note": {type: string, merge: lww}', prefix="y")
+    plain = build(backend, '"/note": {type: string, merge: lww}', prefix="y", schema_state=False)
     outcomes = []
     for number, service in enumerate((built.service, plain.service)):
         doc = f"w{number}"

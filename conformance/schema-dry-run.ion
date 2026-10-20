@@ -1,0 +1,61 @@
+// Feature 006, US2: the dry run says what activating a version would change; the activation and the reads then agree with it.
+// Version 2 folds /age with min (breaking), version 3 makes /age a string (the integers no longer conform), version 4 drops the
+// admin tier that d2 uses. A rollback reads byte for byte as before. (Pinned documents left out of a dry run, and a hook the target
+// would call, are in the integration tests of the library: they need a pin step and a hook.)
+case::{
+  name: "schema-dry-run",
+  schemas: [
+    schema::{ id: "t", version: 1, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} } },
+    schema::{ id: "t", version: 2, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: min} } },
+    schema::{ id: "t", version: 3, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: string, merge: lww} } },
+    schema::{ id: "t", version: 4, tiers: [backfill, user],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max} } }
+  ],
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "ann"}, {tier: user, path: "/age", value: 3}, {tier: user, path: "/age", value: 5}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "bob"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d2", contributor: {id: "root", tiers: [admin]}, entries: [{tier: admin, path: "/age", value: 4}] },
+      expect: { accepted: [{seq: 2}] } },
+    { append: { doc: "d3", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "cy"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\"}", skipped: [] } },
+
+    // what version 2 would do: only d1 reads differently (the minimum of its two ages)
+    { plan: { target: 2 },
+      expect: { examined: 3, left_out: 0, changed: 1, unchanged: 2, failed: 0, would_call_hook: 0,
+                documents: { d1: { document_changed: true, skipped_after: [] } } } },
+    // version 3: the integers no longer conform, so those entries are shadowed
+    { plan: { target: 3 },
+      expect: { examined: 3, left_out: 0, changed: 2, unchanged: 1, failed: 0, would_call_hook: 0,
+                documents: { d1: { document_changed: true, skipped_after: [2, 3], shadowed: { no_longer_conforms: 2 } },
+                             d2: { document_changed: true, skipped_after: [2], shadowed: { no_longer_conforms: 1 } } } } },
+    // version 4 drops a tier d2 uses: its entry would be shadowed
+    { plan: { target: 4 },
+      expect: { examined: 3, left_out: 0, changed: 1, unchanged: 2, failed: 0,
+                documents: { d2: { document_changed: true, skipped_after: [2], shadowed: { tier_not_in_schema: 1 } } } } },
+    // a list of documents and a limit say how much was examined
+    { plan: { target: 2, docs: [d2, d3] }, expect: { examined: 2, left_out: 1, changed: 0, unchanged: 2 } },
+    { plan: { target: 2, limit: 1 }, expect: { examined: 1, left_out: 2 } },
+    { plan: { target: 2, limit: 1 }, expect: { examined: 1, left_out: 2 } },
+
+    // the activation: a breaking version needs the acknowledgement, a used tier cannot be dropped
+    { activate_schema: { version: 2, operator: "ops" }, expect: { refused: BREAKING_CHANGE_NOT_ACKNOWLEDGED } },
+    { activate_schema: { version: 4, operator: "ops", acknowledge_breaking: true }, expect: { refused: TIER_IN_USE } },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\"}" } },
+    { activate_schema: { version: 2, operator: "ops", acknowledge_breaking: true }, expect: { class: breaking, rollback: false } },
+
+    // the reads are what the dry run said
+    { get: "d1", expect: { document: "{age: 3, name: \"ann\"}", skipped: [] } },
+    { get: "d2", expect: { document: "{age: 4, name: \"bob\"}" } },
+
+    // a rollback changes no entry and reads as before
+    { activate_schema: { version: 1, operator: "ops" }, expect: { class: breaking, rollback: true } },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\"}", skipped: [], shadowed: [] } }
+  ]
+}

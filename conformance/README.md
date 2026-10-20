@@ -100,3 +100,17 @@ document, the model errors and the `explain` of every path before and after and 
 
 Every vector of every case file is also run with saved layers off; the results must be identical (Feature 005 SC-008). The 16.1 and 16.2
 vectors are unchanged.
+
+## Feature 006: schema versioning and evolution
+
+Cases added: `schema-changes` (one pair of versions per row of the classification table in `specs/006-schema-evolution/contracts/changes.md`,
+several changes at once and a renamed field; the unclassified difference is in the unit tests, since one registry holds one schema id), `schema-dry-run` (a dry run, then the activation and the reads it predicted; a limit;
+`tier_not_in_schema` and `no_longer_conforms` counted per reason; a breaking activation refused without the acknowledgement; `TIER_IN_USE`; a rollback that reads byte-identically), `schema-shadow`
+(`now_derived` and `no_longer_conforms`, and none under the version that wrote the entries or after a rollback; the other two reasons cannot arise from a live activation and are in the dry-run vector and the unit tests) and `schema-pins` (pin, a write under the pin, a single
+migration, a batch with a document that cannot be derived, a re-run; pinned documents left out of a dry run are in the library's integration tests).
+
+New steps: `{ diff: { old: V, new: V } }` with `expect: { overall, changes: [{ kind, path, class, classified }] }`; `{ plan: { target: V,
+limit: N, docs: [..] } }` with `expect: { examined, left_out, changed, unchanged, failed, would_call_hook, documents }`; `activate_schema`
+extended with `operator`, `acknowledge_breaking`, `rebuild` and `expect: { refused: CODE }`; `{ pin: { doc, version, operator } }`,
+`{ unpin: { doc, operator } }` and `{ migrate: { docs, to, operator } }` with `expect: { moved, already_moved, not_pinned, failed }`; and the
+expectation `shadowed: [{ seq, reason }]` on `get`. The vectors of Features 1 to 5 are unchanged.

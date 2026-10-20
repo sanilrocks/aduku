@@ -55,6 +55,7 @@ def test_a_database_made_before_this_feature_opens_and_reads_unchanged(tmp_path:
         INSERT INTO doc_seq VALUES ('d', 1);
         """
     )
+    connection.execute("PRAGMA user_version = 0")  # older code never stamped the version
     connection.commit()
     connection.close()
     reopened = SqliteStorage(path)

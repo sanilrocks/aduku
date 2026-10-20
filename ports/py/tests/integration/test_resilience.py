@@ -144,7 +144,7 @@ class Counting:
 
 def test_an_append_is_one_write_transaction_and_carries_its_view(backend: Storage) -> None:
     counting = Counting(backend)
-    service = make_service(counting)  # type: ignore[arg-type]
+    service = make_service(counting, schema_state=False)  # type: ignore[arg-type]
     counting.reads = counting.writes = 0  # starting up reads the tiers in use, to check the active schema
     result = service.append("d1", [put("/name", "A"), put("/age", 4)], contributor=ALICE)
     # one read to warm the in-memory state outside the write lock (first use only), then one write transaction

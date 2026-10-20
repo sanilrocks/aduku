@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -10,10 +11,14 @@ from aduku.errors import Reason
 from aduku.ion_codec import Value
 
 __all__ = [
+    "ActivationReport",
     "AppendResult",
     "ArchiveReport",
     "AsOf",
     "AsOfInfo",
+    "Change",
+    "ChangeClass",
+    "ChangeList",
     "CompactionPlan",
     "CompactionRecord",
     "CompactionReport",
@@ -28,18 +33,25 @@ __all__ = [
     "DeferredInfo",
     "DeferredStatus",
     "DerivedRecord",
+    "DocumentChange",
     "DocumentResult",
+    "DryRunReport",
     "EffectInfo",
     "EffectRecord",
     "Entry",
     "EntryInput",
     "Explanation",
+    "HistoryRecord",
     "Identity",
+    "MigrationProgress",
+    "MigrationReport",
     "ModelError",
     "RebuildReport",
     "RecomputeReport",
     "SchedulerReport",
     "SchedulerRun",
+    "Shadowed",
+    "StateChange",
     "Violation",
 ]
 
@@ -133,6 +145,8 @@ class DocumentResult:
     deferred: tuple[DeferredStatus, ...] = ()
     # Feature 005: set only by an `as_of` read.
     as_of: AsOfInfo | None = None
+    # Feature 006: why each skipped entry is left out (worked out when read, never stored); same seqs as `skipped`.
+    shadowed: tuple[Shadowed, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -197,6 +211,9 @@ class Explanation:
     purged: tuple[PurgedMark, ...] = ()
     originals_kept: bool | None = None
     sources: tuple[str, ...] = ()
+    # Feature 006: entries this version leaves out that touch the path, with their reasons. (`shadowed` above keeps its
+    # Feature 001 meaning: entries whose contribution makes no difference to the value.)
+    shadowed_by_schema: tuple[Shadowed, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -470,3 +487,167 @@ class CompactionPlan:
     retired_keys: tuple[str, ...]  # idempotency keys of the replaced contributed entries
     # (request id, model errors it added, model errors it resolved) as canonical text: what a retry of it is answered with
     request_effects: tuple[tuple[str, str, str], ...] = ()
+
+
+# -- feature 006: schema versioning and evolution -------------------------------------------------------------------------
+
+ChangeClass = Literal["compatible", "visible", "breaking"]
+_WORST = {"compatible": 0, "visible": 1, "breaking": 2}
+
+
+@dataclass(frozen=True)
+class Change:
+    """One difference between two schema versions, with its class (docs/SPEC.md 14, contracts/changes.md)."""
+
+    kind: str
+    path: str  # a field pattern, a tier name, or "" for a top-level setting
+    description: str  # one sentence; never a stored value
+    change_class: ChangeClass
+    classified: bool = True  # False: a difference the table does not name (listed as visible)
+    detail: tuple[str, ...] = ()  # for a change that can shadow entries: the reasons it can give
+
+
+@dataclass(frozen=True)
+class ChangeList:
+    old_version: int
+    new_version: int
+    changes: tuple[Change, ...]
+
+    @classmethod
+    def of(cls, old_version: int, new_version: int, changes: Sequence[Change]) -> ChangeList:
+        """A list in the fixed order (path, kind): the same two versions always give the same list."""
+        return cls(old_version, new_version, tuple(sorted(changes, key=lambda c: (c.path, c.kind))))
+
+    @property
+    def overall(self) -> ChangeClass:
+        worst: ChangeClass = "compatible"
+        for item in self.changes:
+            if _WORST[item.change_class] > _WORST[worst]:
+                worst = item.change_class
+        return worst
+
+
+@dataclass(frozen=True)
+class Shadowed:
+    """An entry a version leaves out of a document, and why (worked out each time, never stored)."""
+
+    seq: int
+    entry_id: str
+    tier: str
+    path: str
+    reason: str  # tier_not_in_schema | now_derived | no_longer_conforms | cannot_be_merged
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class HistoryRecord:
+    id: int
+    at: datetime
+    operator: str
+    action: str  # bootstrap | activate | rollback | pin | unpin | migrate
+    doc: str | None
+    from_version: int | None
+    to_version: int | None
+    change_class: str | None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class StateChange:
+    """One change of the shared schema state, written with its history record in a single transaction.
+
+    `active` is the new active version (None leaves it); `pin_doc` with `pin_version` pins, with None unpins;
+    `served` lists (version, fingerprint, parts) for versions served for the first time.
+    """
+
+    schema_id: str
+    action: str  # bootstrap | activate | rollback | pin | unpin | migrate
+    operator: str
+    at: datetime
+    doc: str | None
+    from_version: int | None
+    to_version: int | None
+    change_class: str | None
+    note: str
+    active: int | None
+    pin_doc: str | None
+    pin_version: int | None
+    served: tuple[tuple[int, str, str], ...] = ()
+    pins: tuple[
+        tuple[str, int], ...
+    ] = ()  # more pins set by this change (the bootstrap adopts all of a registry's pins)
+
+
+@dataclass(frozen=True)
+class DocumentChange:
+    """What would change in one document under another version (a dry run), or why that cannot be told."""
+
+    doc: str
+    document_changed: bool
+    errors_added: tuple[str, ...]  # "rule@path" identities
+    errors_resolved: tuple[str, ...]
+    skipped_before: tuple[int, ...]
+    skipped_after: tuple[int, ...]
+    shadowed_by_reason: tuple[tuple[str, int], ...]
+    would_call_hook: bool
+    failure_code: str | None = None
+    conflicts_changed: bool = False
+
+    @property
+    def failed(self) -> bool:
+        return self.failure_code is not None
+
+    @property
+    def changed(self) -> bool:
+        return (
+            self.document_changed
+            or bool(self.errors_added or self.errors_resolved)
+            or self.skipped_before != self.skipped_after
+            or self.conflicts_changed
+        )
+
+
+@dataclass(frozen=True)
+class DryRunReport:
+    change_list: ChangeList
+    target: int
+    generation: int  # the shared schema state it compared against
+    examined: int
+    left_out: int
+    changed: int
+    unchanged: int
+    failed: int
+    would_call_hook: int
+    documents: tuple[DocumentChange, ...]
+
+
+@dataclass(frozen=True)
+class ActivationReport:
+    version: int
+    previous: int | None
+    change_class: str | None
+    rollback: bool
+    rebuild: RebuildReport | None = None
+    changed: tuple[str, ...] = ()  # with a rebuild: the documents whose answer changed (the dry run's list)
+
+
+@dataclass(frozen=True)
+class MigrationProgress:
+    """Where a batch migration stands after a batch (the counts are of everything processed so far)."""
+
+    batch: int
+    processed: int
+    total: int
+    moved: int
+    already_moved: int
+    not_pinned: int
+    failed: int
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    moved: tuple[str, ...]
+    already_moved: tuple[str, ...]
+    not_pinned: tuple[str, ...]
+    failed: tuple[tuple[str, str], ...]  # (document, code)
+    batches: int

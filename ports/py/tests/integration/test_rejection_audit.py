@@ -132,7 +132,7 @@ def test_per_document_override(backend: Storage) -> None:
     service.set_rejection_audit("d1", "disabled")
     reject(service, "d1")
     assert len(service.list_rejections("d1")) == 1
-    on = make_service(backend, audit=audit(enabled=True))
+    on = make_service(backend, audit=audit(enabled=True), schema_state=False)
     on.set_rejection_audit("d3", "disabled")
     reject(on, "d3")
     assert on.list_rejections("d3") == []

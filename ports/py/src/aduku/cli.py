@@ -16,7 +16,19 @@ from aduku.audit import AuditRecord
 from aduku.behaviors.registry import BehaviorRegistry
 from aduku.errors import AdukuError, HistoryCompactedError, RejectedError, SchemaError
 from aduku.ion_codec import ABSENT, FrozenStruct, IonError, parse, to_canonical
-from aduku.model import AsOf, AsOfInfo, Entry, EntryInput, Identity, ModelError, PurgeScope
+from aduku.model import (
+    AsOf,
+    AsOfInfo,
+    ChangeList,
+    DocumentChange,
+    Entry,
+    EntryInput,
+    Identity,
+    ModelError,
+    PurgeScope,
+    Shadowed,
+)
+from aduku.schema.diff import schema_changes
 from aduku.schema.loader import load_schema
 from aduku.schema.model import Schema
 from aduku.schema.registry import SchemaRegistry
@@ -45,10 +57,20 @@ def _caller_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--role", action="append", default=[], help="a role the caller holds (repeatable)")
 
 
+def _operator_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--operator", required=True, help="who is doing this; recorded in the schema history")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aduku", description="aduku-py command line")
     parser.add_argument("--db", default=os.environ.get("ADUKU_DB", "aduku.db"))
-    parser.add_argument("--schema", default=os.environ.get("ADUKU_SCHEMA"))
+    parser.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="a schema file or a directory of *.ion files, one version each; repeatable (default: $ADUKU_SCHEMA)",
+    )
     parser.add_argument("--format", choices=("json", "ion"), default="json")
     parser.add_argument(
         "--behaviors",
@@ -151,6 +173,37 @@ def _parser() -> argparse.ArgumentParser:
     schema = sub.add_parser("schema", help="schema tools")
     schema_sub = schema.add_subparsers(dest="schema_command", required=True)
     schema_sub.add_parser("check", help="load and validate a schema file").add_argument("file")
+    diff = schema_sub.add_parser("diff", help="the changes between two schema files and how risky they are (no store)")
+    diff.add_argument("old")
+    diff.add_argument("new")
+    plan = schema_sub.add_parser("plan", help="the dry run: what activating a version would change (writes nothing)")
+    plan.add_argument("--target", type=int, required=True, metavar="V")
+    plan.add_argument("--limit", type=int, help="examine only the first N documents (the same N each time)")
+    plan.add_argument("--doc", action="append", default=[], help="examine only this document (repeatable)")
+    activate = schema_sub.add_parser("activate", help="make a version the active one for every process on the store")
+    activate.add_argument("version", type=int)
+    _operator_option(activate)
+    activate.add_argument("--acknowledge-breaking", action="store_true", help="accept a breaking change")
+    activate.add_argument("--rebuild", action="store_true", help="refresh saved layers and views of unpinned documents")
+    history = schema_sub.add_parser(
+        "history", help="who changed the active version or a pin, when, and how risky it was"
+    )
+    history.add_argument("--limit", type=int)
+    history.add_argument("--doc")
+
+    pin = sub.add_parser("pin", help="serve one document from a version whatever the active version is")
+    pin.add_argument("doc")
+    pin.add_argument("version", type=int)
+    _operator_option(pin)
+    unpin = sub.add_parser("unpin", help="serve a pinned document from the active version again")
+    unpin.add_argument("doc")
+    _operator_option(unpin)
+    migrate = sub.add_parser("migrate", help="move pinned documents to a version (the active one by default)")
+    migrate.add_argument("docs", nargs="*", help="documents to move (default: every pinned document)")
+    migrate.add_argument("--to", type=int, metavar="V")
+    _operator_option(migrate)
+    migrate.add_argument("--dry-run", action="store_true", help="show what would change and move nothing")
+    migrate.add_argument("--batch", type=int, default=100, help="documents per batch")
 
     audit = sub.add_parser("audit", help="rejection audit log")
     audit_sub = audit.add_subparsers(dest="audit_command", required=True)
@@ -169,10 +222,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as stop:
         return int(stop.code or 0) if isinstance(stop.code, int) else 2
     try:
-        if args.command == "schema":
+        if args.command == "schema" and args.schema_command == "check":
             return _check_schema(args)
+        if args.command == "schema" and args.schema_command == "diff":
+            return _schema_diff(args)
         service = _service(args)
         return _run(args, service)
+    except ValueError as error:  # an empty operator name, a negative limit
+        print(f"aduku: {error}", file=sys.stderr)
+        return 2
     except _UsageError as error:
         print(f"aduku: {error}", file=sys.stderr)
         return 2
@@ -299,19 +357,210 @@ def _check_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schema_files(args: argparse.Namespace) -> list[str]:
+    """The schema files named by --schema (a directory stands for its *.ion files), in name order."""
+    given = args.schema or ([os.environ["ADUKU_SCHEMA"]] if os.environ.get("ADUKU_SCHEMA") else [])
+    files: list[str] = []
+    for entry in given:
+        if os.path.isdir(entry):
+            files.extend(sorted(os.path.join(entry, name) for name in os.listdir(entry) if name.endswith(".ion")))
+        else:
+            files.append(entry)
+    if not files:
+        raise _UsageError("no schema: pass --schema PATH (a file or a directory of *.ion files) or set ADUKU_SCHEMA")
+    return files
+
+
 def _service(args: argparse.Namespace) -> Aduku:
-    if not args.schema:
-        raise _UsageError("no schema: pass --schema PATH or set ADUKU_SCHEMA")
+    files = _schema_files(args)
     behaviors = _behaviors(args)
-    try:
-        with open(args.schema, encoding="utf-8") as handle:
-            schema = load_schema(handle.read(), behaviors)
-    except OSError as error:
-        raise _UsageError(f"cannot read schema: {error}") from error
     registry = SchemaRegistry()
-    registry.put(schema)
-    registry.activate(schema.version)
+    versions: list[int] = []
+    for name in files:
+        try:
+            with open(name, encoding="utf-8") as handle:
+                schema = load_schema(handle.read(), behaviors)
+        except OSError as error:
+            raise _UsageError(f"cannot read schema: {error}") from error
+        registry.put(schema)
+        versions.append(schema.version)
+    # the highest version is the one a store with no state adopts; a store that has state serves what it was told to
+    registry.activate(max(versions))
     return Aduku(SqliteStorage(args.db), registry, behaviors=behaviors)
+
+
+def _change_rows(changes: ChangeList) -> list[dict[str, Any]]:
+    return [
+        {
+            "kind": c.kind,
+            "path": c.path,
+            "description": c.description,
+            "class": c.change_class,
+            "classified": c.classified,
+        }
+        for c in changes.changes
+    ]
+
+
+def _schema_diff(args: argparse.Namespace) -> int:
+    """The changes between two schema files; needs no store (exit 0 whatever the class)."""
+    behaviors = _behaviors(args)
+    loaded = []
+    for name in (args.old, args.new):
+        try:
+            with open(name, encoding="utf-8") as handle:
+                loaded.append(load_schema(handle.read(), behaviors))
+        except OSError as error:
+            raise _UsageError(f"cannot read schema: {error}") from error
+    changes = schema_changes(loaded[0], loaded[1])
+    _emit(
+        args,
+        {
+            "old": changes.old_version,
+            "new": changes.new_version,
+            "overall": changes.overall,
+            "changes": _change_rows(changes),
+        },
+    )
+    return 0
+
+
+def _refused_text(args: argparse.Namespace, code: str, message: str) -> int:
+    _emit(args, {"rejected": {"code": code, "reasons": [{"code": code, "message": message}]}})
+    print(f"{code}: {message}", file=sys.stderr)
+    return 1
+
+
+def _schema_command(args: argparse.Namespace, service: Aduku) -> int:
+    try:
+        if args.schema_command == "plan":
+            report = service.plan_schema(args.target, docs=args.doc or None, limit=args.limit)
+            _emit(
+                args,
+                {
+                    "target": report.target,
+                    "generation": report.generation,
+                    "examined": report.examined,
+                    "left_out": report.left_out,
+                    "changed": report.changed,
+                    "unchanged": report.unchanged,
+                    "failed": report.failed,
+                    "would_call_hook": report.would_call_hook,
+                    "overall": report.change_list.overall,
+                    "changes": _change_rows(report.change_list),
+                    "documents": [_document_change(c) for c in report.documents],
+                },
+            )
+            return 0
+        if args.schema_command == "activate":
+            done = service.activate_schema(
+                args.version,
+                operator=args.operator,
+                acknowledge_breaking=args.acknowledge_breaking,
+                rebuild=args.rebuild,
+            )
+            payload: dict[str, Any] = {
+                "version": done.version,
+                "previous": done.previous,
+                "class": done.change_class,
+                "rollback": done.rollback,
+                "changed": list(done.changed),
+            }
+            if done.rebuild is not None:
+                payload["rebuild"] = {
+                    "checked": list(done.rebuild.checked),
+                    "differing": list(done.rebuild.differing),
+                    "refreshed": list(done.rebuild.refreshed),
+                    "failed": [{"doc": doc, "error": error} for doc, error in done.rebuild.failed],
+                }
+            _emit(args, payload)
+            return 0
+        _emit(
+            args,
+            {
+                "history": [
+                    {
+                        "id": r.id,
+                        "at": r.at.isoformat(),
+                        "operator": r.operator,
+                        "action": r.action,
+                        "doc": r.doc,
+                        "from": r.from_version,
+                        "to": r.to_version,
+                        "class": r.change_class,
+                        "note": r.note,
+                    }
+                    for r in service.schema_history(limit=args.limit, doc=args.doc)
+                ],
+                "served": {str(version): fp for version, fp in service.served_versions().items()},
+            },
+        )
+        return 0
+    except RejectedError as rejection:
+        return _refused(args, rejection)
+    except SchemaError as refusal:  # TIER_IN_USE, HISTORY_COMPACTED, SCHEMA_STATE_CHANGED
+        return _refused_text(args, refusal.codes[0] if refusal.codes else "SCHEMA_ERROR", "; ".join(refusal.problems))
+
+
+def _pin_command(args: argparse.Namespace, service: Aduku) -> int:
+    try:
+        if args.command == "pin":
+            service.pin_document(args.doc, args.version, operator=args.operator)
+            _emit(args, {"pinned": args.doc, "version": args.version})
+        elif args.command == "unpin":
+            service.unpin_document(args.doc, operator=args.operator)
+            _emit(args, {"unpinned": args.doc})
+        elif args.dry_run:
+            if not args.operator.strip():  # the same rule as a real run, though nothing is recorded
+                raise ValueError("an operator name is required to change which schema version serves")
+            names = args.docs or sorted(service.schemas.pins())
+            changes = [service.plan_migration(name, args.to) for name in names]
+            target = args.to if args.to is not None else service.schemas.active().version
+            _emit(args, {"target": target, "documents": [_document_change(c) for c in changes]})
+        else:
+            report = service.migrate(args.docs or None, to=args.to, operator=args.operator, batch=args.batch)
+            _emit(
+                args,
+                {
+                    "moved": list(report.moved),
+                    "already_moved": list(report.already_moved),
+                    "not_pinned": list(report.not_pinned),
+                    "failed": [{"doc": doc, "code": code} for doc, code in report.failed],
+                    "batches": report.batches,
+                },
+            )
+        return 0
+    except RejectedError as rejection:
+        return _refused(args, rejection)
+    except SchemaError as refusal:
+        return _refused_text(args, refusal.codes[0] if refusal.codes else "SCHEMA_ERROR", "; ".join(refusal.problems))
+
+
+def _document_change(change: DocumentChange) -> dict[str, Any]:
+    """What differs in one document: whether, never what (no document text, no value)."""
+    return {
+        "doc": change.doc,
+        "document_changed": change.document_changed,
+        "errors_added": list(change.errors_added),
+        "errors_resolved": list(change.errors_resolved),
+        "skipped_before": list(change.skipped_before),
+        "skipped_after": list(change.skipped_after),
+        "shadowed_by_reason": dict(change.shadowed_by_reason),
+        "conflicts_changed": change.conflicts_changed,
+        "would_call_hook": change.would_call_hook,
+        "failure_code": change.failure_code,
+    }
+
+
+def _shadowed(item: Shadowed) -> dict[str, Any]:
+    return {
+        "seq": item.seq,
+        "entry": item.entry_id,
+        "tier": item.tier,
+        "path": item.path,
+        "reason": item.reason,
+        "detail": item.detail,
+    }
 
 
 def _run(args: argparse.Namespace, service: Aduku) -> int:
@@ -336,11 +585,16 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     "deferred": [_deferred_status(d) for d in result.deferred],
                     "model_errors": [_model_error(e) for e in result.model_errors],
                     "skipped": list(result.skipped),
+                    "shadowed": [_shadowed(item) for item in result.shadowed],
                     "conflicts": list(result.conflicts),
                     "status": result.status,
                 },
             )
             return 0
+        if args.command == "schema":
+            return _schema_command(args, service)
+        if args.command in ("pin", "unpin", "migrate"):
+            return _pin_command(args, service)
         if args.command == "recompute":
             return _recompute(args, service)
         if args.command in ("invalidate", "scheduler"):
@@ -402,6 +656,7 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     "rule": why.rule,
                     "inputs": list(why.inputs),
                     "shadowed": list(why.shadowed),
+                    "shadowed_by_schema": [_shadowed(item) for item in why.shadowed_by_schema],
                     "model_errors": [_model_error(e) for e in why.model_errors],
                     "dependencies": [
                         {"path": path, "value": None if value is ABSENT else to_canonical(value)}

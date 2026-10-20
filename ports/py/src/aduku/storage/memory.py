@@ -18,10 +18,12 @@ from aduku.model import (
     CompactionRecord,
     DerivedRecord,
     Entry,
+    HistoryRecord,
     PurgeApplication,
     PurgeRecord,
     SchedulerRun,
     SourceRow,
+    StateChange,
 )
 from aduku.storage.base import (
     AuditRow,
@@ -59,6 +61,13 @@ class _State:
     expiries: list[tuple[str, int, datetime, int]] = field(default_factory=list)
     request_effects: dict[str, tuple[str, str]] = field(default_factory=dict)  # request id -> (added, resolved) text
     purges: list[PurgeRecord] = field(default_factory=list)
+    tiers_used: set[str] = field(
+        default_factory=set
+    )  # tiers of every entry ever appended, so the whole ledger need not be read
+    schema_states: dict[str, tuple[int, int | None]] = field(default_factory=dict)  # id -> (generation, active)
+    schema_pins: dict[str, dict[str, int]] = field(default_factory=dict)  # id -> doc -> version
+    schema_served: dict[str, dict[int, tuple[str, str]]] = field(default_factory=dict)  # id -> version -> (fp, parts)
+    schema_log: list[tuple[str, HistoryRecord]] = field(default_factory=list)  # (id, record), oldest first
 
 
 class _MemoryTx:
@@ -92,8 +101,13 @@ class _MemoryTx:
 
     @live
     def tiers_in_use(self, doc: str | None = None) -> set[str]:
-        rows = self._s.entries.get(doc, []) if doc is not None else [e for r in self._s.entries.values() for e in r]
-        return {entry.tier for entry in rows}
+        if doc is None:
+            return set(self._s.tiers_used)
+        return {entry.tier for entry in self._s.entries.get(doc, [])}
+
+    @live
+    def compacted_docs(self) -> list[str]:
+        return sorted(name for name, epoch in self._s.epochs.items() if epoch > 0)
 
     @live
     def doc_ids(self) -> list[str]:
@@ -136,6 +150,8 @@ class _MemoryTx:
         state.by_request[request.request_id] = list(entries)
         state.idem_keys |= new_idem
         state.requests[request.request_id] = request
+        new_tiers = {entry.tier for entry in entries} - state.tiers_used
+        state.tiers_used |= new_tiers
         if request.request_key is not None:
             state.request_keys[key] = request.request_id
 
@@ -145,6 +161,7 @@ class _MemoryTx:
                 state.entries.pop(request.doc, None)
             del state.by_request[request.request_id]
             state.idem_keys -= new_idem
+            state.tiers_used -= new_tiers
             del state.requests[request.request_id]
             if request.request_key is not None:
                 del state.request_keys[key]
@@ -532,6 +549,78 @@ class _MemoryTx:
         if held is not None and held[0] == owner:
             self._set_lease(hook, None)
 
+    @live
+    def schema_generation(self, schema_id: str) -> int:
+        return self._s.schema_states.get(schema_id, (0, None))[0]
+
+    @live
+    def schema_state(self, schema_id: str) -> tuple[int, int | None, dict[str, int]]:
+        generation, active = self._s.schema_states.get(schema_id, (0, None))
+        return generation, active, dict(self._s.schema_pins.get(schema_id, {}))
+
+    @live
+    def served_versions(self, schema_id: str) -> dict[int, tuple[str, str]]:
+        return dict(self._s.schema_served.get(schema_id, {}))
+
+    @live
+    def apply_schema_change(self, change: StateChange, expect_generation: int | None) -> int:
+        state = self._s
+        sid = change.schema_id
+        generation, active = state.schema_states.get(sid, (0, None))
+        if expect_generation is not None and expect_generation != generation:
+            raise ConstraintError(f"schema state generation is {generation}, expected {expect_generation}")
+        served = state.schema_served.setdefault(sid, {})
+        for version, fingerprint, _parts in change.served:
+            if version in served and served[version][0] != fingerprint:
+                raise ConstraintError(f"schema version {version} was already served with another fingerprint")
+        pins = state.schema_pins.setdefault(sid, {})
+        touched = [*([change.pin_doc] if change.pin_doc is not None else []), *(doc for doc, _ in change.pins)]
+        before_pins = {doc: pins.get(doc) for doc in touched}
+        added = [version for version, _, _ in change.served if version not in served]
+        for version, fingerprint, parts in change.served:
+            served.setdefault(version, (fingerprint, parts))
+        if change.pin_doc is not None:
+            if change.pin_version is None:
+                pins.pop(change.pin_doc, None)
+            else:
+                pins[change.pin_doc] = change.pin_version
+        pins.update(change.pins)
+        new_active = active if change.active is None else change.active
+        state.schema_states[sid] = (generation + 1, new_active)
+        record = HistoryRecord(
+            id=len(state.schema_log) + 1,
+            at=change.at,
+            operator=change.operator,
+            action=change.action,
+            doc=change.doc,
+            from_version=change.from_version,
+            to_version=change.to_version,
+            change_class=change.change_class,
+            note=change.note,
+        )
+        state.schema_log.append((sid, record))
+
+        def undo() -> None:
+            state.schema_log.pop()
+            state.schema_states[sid] = (generation, active)
+            if generation == 0:
+                state.schema_states.pop(sid, None)
+            for version in added:
+                served.pop(version, None)
+            for doc, before in before_pins.items():
+                if before is None:
+                    pins.pop(doc, None)
+                else:
+                    pins[doc] = before
+
+        self._undo.append(undo)
+        return generation + 1
+
+    @live
+    def schema_history(self, schema_id: str, limit: int | None = None, doc: str | None = None) -> list[HistoryRecord]:
+        found = [r for sid, r in self._s.schema_log if sid == schema_id and (doc is None or r.doc == doc)]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
     def _matching(self, fields: Sequence[str], docs: Sequence[str] | None) -> list[DerivedRecord]:
         return sorted(
             (r for (d, f), r in self._s.derived.items() if f in fields and (docs is None or d in docs)),
@@ -626,6 +715,9 @@ class _MemoryReadTx(_MemoryTx):
         raise RuntimeError("read-only transaction")
 
     def release_lease(self, hook: str, owner: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_schema_change(self, change: StateChange, expect_generation: int | None) -> int:
         raise RuntimeError("read-only transaction")
 
 

@@ -104,12 +104,16 @@ declared. Try it with [`examples/rules.schema.ion`](examples/rules.schema.ion) a
 ## Fast reads, time travel, compaction and purge (feature 005)
 
 ```python
-from aduku import AsOf   # get(doc, as_of=AsOf(seq=7)); also AsOf(tx_time=...) and AsOf(valid_time=...)
-db.get("acme", as_of=AsOf(seq=7))                      # the document right after entry 7, with its model errors
-db.get("acme", as_of=AsOf(valid_time=march_first))     # only what was true then (entries with no valid_time always take part)
-db.compact("acme", through_seq=10_000)                 # one `layer` entry per tier; the originals go to the archive
-db.verify_archive("acme"); db.expire_archive("acme", through_seq=10_000)
-db.purge("acme", PurgeScope(path="/email"), reason="ticket 4711", caller=dpo)   # the schema's `purge_by` says who may
+from aduku import AsOf  # get(doc, as_of=AsOf(seq=7)); also AsOf(tx_time=...) and AsOf(valid_time=...)
+
+db.get("acme", as_of=AsOf(seq=7))  # the document right after entry 7, with its model errors
+db.get(
+    "acme", as_of=AsOf(valid_time=march_first)
+)  # only what was true then (entries with no valid_time always take part)
+db.compact("acme", through_seq=10_000)  # one `layer` entry per tier; the originals go to the archive
+db.verify_archive("acme")
+db.expire_archive("acme", through_seq=10_000)
+db.purge("acme", PurgeScope(path="/email"), reason="ticket 4711", caller=dpo)  # the schema's `purge_by` says who may
 ```
 
 Saved per-tier layers make a cold start and an append fold only what is new; they are a cache, so losing them changes
@@ -119,6 +123,33 @@ compacted ledger and refuses if anything differs; a purge leaves a placeholder p
 value and logs the act without it. The command line has `get --as-of`, `explain --as-of`, `append --valid-time`, `compact`,
 `archive verify|expire`, `purge` and `purge-log`. Try [`examples/demo_history.py`](examples/demo_history.py), as in
 [`quickstart.md`](../../specs/005-snapshots-compaction-time-travel/quickstart.md).
+
+## Schema versions and evolution (feature 006)
+
+```python
+from aduku import schema_changes
+
+schema_changes(old, new)  # every difference with its class (compatible, visible, breaking); two schemas in, no store
+db.plan_schema(2)  # the dry run: what activating version 2 would change, document by document; writes and calls nothing
+db.activate_schema(
+    2, operator="alice", acknowledge_breaking=True, rebuild=True
+)  # a breaking change needs the acknowledgement
+db.activate_schema(1, operator="alice")  # a rollback is activating the older version again
+db.pin_document("acme", 1, operator="alice")  # hold one document on a version ...
+db.migrate(["acme"], operator="alice")  # ... and move it when ready (a batch can be stopped and run again)
+db.schema_history()  # who changed what, when, and how risky it was
+db.get(
+    "acme"
+).shadowed  # why each skipped entry is left out: tier_not_in_schema, now_derived, no_longer_conforms, cannot_be_merged
+```
+
+The active version and the per-document pins live in the store, so every process on it serves the same version
+(`Aduku(..., schema_state=False)` keeps them in the process only, as before; no merged result depends on it). The store also
+keeps a fingerprint of every version that was served, so a restart with other content under the same number is refused
+(`SCHEMA_VERSION_CHANGED`, naming the fields). An activation touches no document and its cost does not grow with their number.
+The command line has `schema diff|plan|activate|history`, `pin`, `unpin` and `migrate`, and `--schema` may be repeated or name a
+directory of versions. Try [`examples/demo_evolution.py`](examples/demo_evolution.py), as in
+[`quickstart.md`](../../specs/006-schema-evolution/quickstart.md).
 
 The full API is in
 [`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields and

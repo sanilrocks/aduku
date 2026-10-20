@@ -1,0 +1,30 @@
+// Feature 006, US4: an entry a version cannot use is left out of the document and says why. Version 2 makes /nick computed and
+// tightens /age to a string. The entries stay in the ledger; reading under version 1 again shows none of them shadowed.
+// (The reasons tier_not_in_schema and cannot_be_merged cannot arise from a live activation: a tier in use cannot be dropped, and a
+// merge that cannot take a stored value is a defect of that merge. They are in the dry-run vector and the unit tests.)
+case::{
+  name: "schema-shadow",
+  schemas: [
+    schema::{ id: "t", version: 1, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: int, merge: max}, "/nick": {type: string, merge: lww} } },
+    schema::{ id: "t", version: 2, tiers: [backfill, user, admin],
+              fields: { "/name": {type: string, merge: lww}, "/age": {type: string, merge: lww},
+                        "/nick": {type: string, computed: {macro: upper, args: ["/name"]}} } }
+  ],
+  steps: [
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]},
+                entries: [{tier: user, path: "/name", value: "ann"}, {tier: user, path: "/age", value: 5}, {tier: user, path: "/nick", value: "a"}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\", nick: \"a\"}", skipped: [], shadowed: [] } },
+
+    { activate_schema: 2 },
+    { get: "d1", expect: { document: "{name: \"ann\", nick: computed::\"ANN\"}", skipped: [2, 3],
+                           shadowed: [{seq: 2, reason: no_longer_conforms}, {seq: 3, reason: now_derived}] } },
+    { explain: {doc: "d1", path: "/nick"}, expect: { shadowed_by_schema: [{seq: 3, reason: now_derived}] } },
+    { explain: {doc: "d1", path: "/name"}, expect: { shadowed_by_schema: [] } },
+
+    // a rollback shows every entry again, byte for byte
+    { activate_schema: 1 },
+    { get: "d1", expect: { document: "{age: 5, name: \"ann\", nick: \"a\"}", skipped: [], shadowed: [] } }
+  ]
+}

@@ -18,10 +18,12 @@ from aduku.model import (
     DerivedRecord,
     EffectRecord,
     Entry,
+    HistoryRecord,
     PurgeApplication,
     PurgeRecord,
     SchedulerRun,
     SourceRow,
+    StateChange,
 )
 
 __all__ = [
@@ -184,6 +186,9 @@ class Tx(Protocol):
     def doc_ids(self) -> list[str]:
         """Every document that has an entry, in name order."""
 
+    def compacted_docs(self) -> list[str]:
+        """The documents that were compacted at least once, in name order (the other documents have nothing to check)."""
+
     def find_request(self, doc: str, contributor: str, request_key: str) -> RequestRecord | None: ...
 
     def idem_key_seen(self, doc: str, idem_key: str) -> bool: ...
@@ -314,6 +319,25 @@ class Tx(Protocol):
 
     def release_lease(self, hook: str, owner: str) -> None:
         """Free the lease if `owner` holds it."""
+
+    def schema_generation(self, schema_id: str) -> int:
+        """The generation of the shared schema state (0 when nothing was ever written); one single-row read."""
+
+    def schema_state(self, schema_id: str) -> tuple[int, int | None, dict[str, int]]:
+        """(generation, active version or None, document -> pinned version)."""
+
+    def served_versions(self, schema_id: str) -> dict[int, tuple[str, str]]:
+        """version -> (fingerprint, parts) of every version served so far; written once and never changed."""
+
+    def apply_schema_change(self, change: StateChange, expect_generation: int | None) -> int:
+        """Write state, fingerprints and the history record together and bump the generation by one.
+
+        Raises ConstraintError if `expect_generation` is given and is not the stored generation, or if a served
+        version already has another fingerprint. Returns the new generation.
+        """
+
+    def schema_history(self, schema_id: str, limit: int | None = None, doc: str | None = None) -> list[HistoryRecord]:
+        """The history of the state, oldest first; `limit` keeps the newest N, `doc` only that document's records."""
 
 
 class Storage(Protocol):

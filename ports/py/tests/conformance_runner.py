@@ -61,6 +61,12 @@ STEP_KINDS = (
     "compact",
     "expire",
     "purge",
+    # feature 006
+    "diff",
+    "plan",
+    "pin",
+    "unpin",
+    "migrate",
 )
 _DURATION = re.compile(r"(\d+)(ms|s|m|h|d)\Z")
 _UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
@@ -119,19 +125,119 @@ def restart_service(service: Any) -> Any:
 
 
 def _activate(step: Step, service: Any, label: str) -> None:
-    """`activate_schema: N`, with `expect: {refused: CODE}` when the version must be refused (feature 005)."""
-    from aduku.errors import SchemaError
+    """`activate_schema: N` (the registry's own activation) or `activate_schema: {version, operator, acknowledge_breaking?,
+    rebuild?}` (the operation of feature 006), with `expect: {refused: CODE}` when the version must be refused and, for the
+    second form, `class` and `rollback`."""
+    from aduku.errors import RejectedError, SchemaError
 
+    operation = isinstance(step.arg, FrozenStruct)
     try:
-        service.schemas.activate(int(step.arg))
-    except SchemaError as error:
+        if operation:
+            report = service.activate_schema(
+                int(step.arg["version"]),
+                operator=str(step.arg.get("operator", "conformance")),
+                acknowledge_breaking=bool(step.arg.get("acknowledge_breaking", False)),
+                rebuild=bool(step.arg.get("rebuild", False)),
+            )
+        else:
+            service.schemas.activate(int(step.arg))
+    except (SchemaError, RejectedError) as error:
         wanted = step.expect.get("refused")
         assert wanted is not None, f"{label}: unexpected refusal {error}"
-        assert str(wanted) in error.codes, f"{label}: codes {error.codes} lack {wanted}"
+        codes = error.codes if isinstance(error, SchemaError) else (error.code.value,)
+        assert str(wanted) in codes, f"{label}: codes {codes} lack {wanted}"
         return
     assert step.expect.get("refused") is None, (
         f"{label}: expected {step.expect['refused']} but the version was activated"
     )
+    if operation:
+        if "class" in step.expect:
+            assert report.change_class == str(step.expect["class"]), f"{label}: class {report.change_class}"
+        if "rollback" in step.expect:
+            assert report.rollback == bool(step.expect["rollback"]), f"{label}: rollback {report.rollback}"
+
+
+def _pins(step: Step, service: Any, label: str) -> None:
+    """`pin: {doc, version, operator}`, `unpin: {doc, operator}` or `migrate: {docs?, to?, operator}` (feature 006), with
+    `expect: {refused: CODE}` or, for a migration, `{moved, already_moved, not_pinned, failed}` (document names)."""
+    from aduku.errors import RejectedError, SchemaError
+
+    operator = str(step.arg.get("operator", "conformance"))
+    try:
+        if step.kind == "pin":
+            service.pin_document(str(step.arg["doc"]), int(step.arg["version"]), operator=operator)
+        elif step.kind == "unpin":
+            service.unpin_document(str(step.arg["doc"]), operator=operator)
+        else:
+            report = service.migrate(
+                [str(d) for d in step.arg["docs"]] if "docs" in step.arg else None,
+                to=int(step.arg["to"]) if "to" in step.arg else None,
+                operator=operator,
+            )
+    except (SchemaError, RejectedError) as error:
+        wanted = step.expect.get("refused")
+        assert wanted is not None, f"{label}: unexpected refusal {error}"
+        codes = error.codes if isinstance(error, SchemaError) else (error.code.value,)
+        assert str(wanted) in codes, f"{label}: codes {codes} lack {wanted}"
+        return
+    assert step.expect.get("refused") is None, f"{label}: expected {step.expect['refused']} but it was accepted"
+    if step.kind == "migrate":
+        got = {
+            "moved": list(report.moved),
+            "already_moved": list(report.already_moved),
+            "not_pinned": list(report.not_pinned),
+            "failed": [doc for doc, _ in report.failed],
+        }
+        for key, names in got.items():
+            if key in step.expect:
+                assert names == [str(d) for d in step.expect[key]], f"{label}: {key} {names}"
+
+
+def _plan(step: Step, service: Any, label: str) -> None:
+    """`plan: {target, limit?, docs?}` with `expect: {examined, left_out, changed, unchanged, failed, would_call_hook,
+    documents: {doc: {document_changed?, skipped_after?, shadowed?: {reason: n}, errors_added?, errors_resolved?}}}`; the
+    documents named are exactly the ones the report lists."""
+    report = service.plan_schema(
+        int(step.arg["target"]),
+        docs=[str(d) for d in step.arg["docs"]] if "docs" in step.arg else None,
+        limit=int(step.arg["limit"]) if "limit" in step.arg else None,
+    )
+    for key in ("examined", "left_out", "changed", "unchanged", "failed", "would_call_hook"):
+        if key in step.expect:
+            assert getattr(report, key) == int(step.expect[key]), f"{label}: {key} {getattr(report, key)}"
+    if "documents" in step.expect:
+        listed = {c.doc: c for c in report.documents}
+        assert sorted(listed) == sorted(str(d) for d in step.expect["documents"]), (
+            f"{label}: documents {sorted(listed)}"
+        )
+        for doc, wanted in step.expect["documents"].items():
+            change = listed[str(doc)]
+            if "document_changed" in wanted:
+                assert change.document_changed == bool(wanted["document_changed"]), f"{label}: {doc} document_changed"
+            if "skipped_after" in wanted:
+                assert list(change.skipped_after) == [int(n) for n in wanted["skipped_after"]], (
+                    f"{label}: {doc} skipped"
+                )
+            if "shadowed" in wanted:
+                got = dict(change.shadowed_by_reason)
+                assert got == {str(k): int(v) for k, v in wanted["shadowed"].items()}, f"{label}: {doc} shadowed {got}"
+            for key in ("errors_added", "errors_resolved"):
+                if key in wanted:
+                    assert list(getattr(change, key)) == [str(e) for e in wanted[key]], f"{label}: {doc} {key}"
+
+
+def _diff(step: Step, service: Any, label: str) -> None:
+    """`diff: {old: V, new: V}` with `expect: {overall, changes: [{kind, path, class, classified?}]}` (feature 006)."""
+    from aduku.schema.diff import schema_changes
+
+    found = schema_changes(service.schemas.get(int(step.arg["old"])), service.schemas.get(int(step.arg["new"])))
+    got = [(c.kind, c.path, c.change_class, c.classified) for c in found.changes]
+    want = [
+        (str(c["kind"]), str(c["path"]), str(c["class"]), bool(c.get("classified", True)))
+        for c in step.expect.get("changes", ())
+    ]
+    assert got == want, f"{label}: changes {got} != {want}"
+    assert found.overall == str(step.expect["overall"]), f"{label}: overall {found.overall}"
 
 
 def _as_of(step: Step, service: Any, label: str) -> None:
@@ -267,11 +373,22 @@ def run_case(case: Case, service: Any) -> None:
                 if key == "purged_entries":  # feature 005: how many purged entries the answer names
                     assert len(explanation.purged) == int(wanted), f"{label}: purged marks {explanation.purged}"
                     continue
+                if key == "shadowed_by_schema":  # feature 006: [{seq, reason}]
+                    got = [(item.seq, item.reason) for item in explanation.shadowed_by_schema]
+                    want = [(int(item["seq"]), str(item["reason"])) for item in wanted]
+                    assert got == want, f"{label}: shadowed_by_schema {got} != {want}"
+                    continue
                 assert getattr(explanation, key) == wanted, (
                     f"{label}: {key} {getattr(explanation, key)!r} != {wanted!r}"
                 )
         elif step.kind == "activate_schema":
             _activate(step, service, label)
+        elif step.kind == "diff":
+            _diff(step, service, label)
+        elif step.kind == "plan":
+            _plan(step, service, label)
+        elif step.kind in ("pin", "unpin", "migrate"):
+            _pins(step, service, label)
         elif step.kind == "load_schema":
             _load_schema(step, service, label)
         elif step.kind == "hook_calls":
@@ -523,6 +640,12 @@ def _check_document(expect: FrozenStruct, result: Any, label: str) -> None:
         assert to_canonical(result.document) == to_canonical(parse(str(expect["document"]))), (
             f"{label}: document differs"
         )
+    if "skipped" in expect:
+        assert list(result.skipped) == [int(seq) for seq in expect["skipped"]], f"{label}: skipped {result.skipped}"
+    if "shadowed" in expect:  # feature 006: [{seq, reason}] in seq order
+        got = [(item.seq, item.reason) for item in result.shadowed]
+        want = [(int(item["seq"]), str(item["reason"])) for item in expect["shadowed"]]
+        assert got == want, f"{label}: shadowed {got} != {want}"
     if "model_errors" in expect:
         got = sorted((e.rule_id, e.path_scope) for e in result.model_errors)
         want = sorted((str(e["rule"]), str(e["path"])) for e in expect["model_errors"])

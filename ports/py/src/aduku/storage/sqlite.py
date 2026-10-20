@@ -16,10 +16,12 @@ from aduku.model import (
     CompactionRecord,
     DerivedRecord,
     Entry,
+    HistoryRecord,
     PurgeApplication,
     PurgeRecord,
     SchedulerRun,
     SourceRow,
+    StateChange,
 )
 from aduku.storage.base import (
     AuditRow,
@@ -31,6 +33,8 @@ from aduku.storage.base import (
     effects_to_prune,
     live,
 )
+
+SCHEMA_VERSION = 6  # raise it when SCHEMA or the upgrade steps below change; features 001 to 005 left it at 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
@@ -264,6 +268,52 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
 CREATE INDEX IF NOT EXISTS scheduler_runs_hook ON scheduler_runs (hook, id);
 CREATE TABLE IF NOT EXISTS scheduler_leases (hook TEXT PRIMARY KEY, owner TEXT NOT NULL, expires TEXT NOT NULL);
 
+-- Shared schema state (feature 006): active version, pins, served fingerprints, and an insert-only history.
+CREATE TABLE IF NOT EXISTS schema_state (
+    schema_id TEXT PRIMARY KEY,
+    active_version INTEGER,
+    generation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS doc_pins (
+    schema_id TEXT NOT NULL,
+    doc TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    PRIMARY KEY (schema_id, doc)
+);
+CREATE TABLE IF NOT EXISTS schema_versions (
+    schema_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    parts TEXT NOT NULL,
+    first_served TEXT NOT NULL,
+    PRIMARY KEY (schema_id, version)
+);
+CREATE TABLE IF NOT EXISTS schema_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    action TEXT NOT NULL,
+    doc TEXT,
+    from_version INTEGER,
+    to_version INTEGER,
+    change_class TEXT,
+    note TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schema_history_id ON schema_history (schema_id, id);
+DROP TRIGGER IF EXISTS schema_history_no_update;
+CREATE TRIGGER schema_history_no_update BEFORE UPDATE ON schema_history
+BEGIN SELECT RAISE(ABORT, 'the schema history is append-only'); END;
+DROP TRIGGER IF EXISTS schema_history_no_delete;
+CREATE TRIGGER schema_history_no_delete BEFORE DELETE ON schema_history
+BEGIN SELECT RAISE(ABORT, 'the schema history is append-only'); END;
+DROP TRIGGER IF EXISTS schema_versions_no_update;
+CREATE TRIGGER schema_versions_no_update BEFORE UPDATE ON schema_versions
+BEGIN SELECT RAISE(ABORT, 'schema versions are append-only'); END;
+DROP TRIGGER IF EXISTS schema_versions_no_delete;
+CREATE TRIGGER schema_versions_no_delete BEFORE DELETE ON schema_versions
+BEGIN SELECT RAISE(ABORT, 'schema versions are append-only'); END;
+
 -- Audit-only data: never read by derivation (SPEC 4.5).
 CREATE TABLE IF NOT EXISTS rejection_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -444,10 +494,19 @@ class _SqliteTx:
     @live
     def tiers_in_use(self, doc: str | None = None) -> set[str]:
         if doc is None:
-            rows = self._c.execute("SELECT DISTINCT tier FROM entries")
+            # a loose index scan: one probe of the tier index per tier, not a pass over every entry
+            rows = self._c.execute(
+                "WITH RECURSIVE t(tier) AS (SELECT MIN(tier) FROM entries UNION ALL"
+                " SELECT (SELECT MIN(tier) FROM entries WHERE tier > t.tier) FROM t WHERE tier IS NOT NULL)"
+                " SELECT tier FROM t WHERE tier IS NOT NULL"
+            )
         else:
             rows = self._c.execute("SELECT DISTINCT tier FROM entries WHERE doc = ?", (doc,))
         return {str(row[0]) for row in rows}
+
+    @live
+    def compacted_docs(self) -> list[str]:
+        return [str(row[0]) for row in self._c.execute("SELECT doc FROM doc_epoch WHERE epoch > 0 ORDER BY doc")]
 
     @live
     def doc_ids(self) -> list[str]:
@@ -1029,6 +1088,114 @@ class _SqliteTx:
     def release_lease(self, hook: str, owner: str) -> None:
         self._c.execute("DELETE FROM scheduler_leases WHERE hook = ? AND owner = ?", (hook, owner))
 
+    @live
+    def schema_generation(self, schema_id: str) -> int:
+        row = self._c.execute("SELECT generation FROM schema_state WHERE schema_id = ?", (schema_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    @live
+    def schema_state(self, schema_id: str) -> tuple[int, int | None, dict[str, int]]:
+        row = self._c.execute(
+            "SELECT generation, active_version FROM schema_state WHERE schema_id = ?", (schema_id,)
+        ).fetchone()
+        pins = {
+            str(r[0]): int(r[1])
+            for r in self._c.execute("SELECT doc, version FROM doc_pins WHERE schema_id = ?", (schema_id,))
+        }
+        if row is None:
+            return 0, None, pins
+        return int(row[0]), (None if row[1] is None else int(row[1])), pins
+
+    @live
+    def served_versions(self, schema_id: str) -> dict[int, tuple[str, str]]:
+        rows = self._c.execute(
+            "SELECT version, fingerprint, parts FROM schema_versions WHERE schema_id = ?", (schema_id,)
+        )
+        return {int(r[0]): (str(r[1]), str(r[2])) for r in rows}
+
+    @live
+    def apply_schema_change(self, change: StateChange, expect_generation: int | None) -> int:
+        sid = change.schema_id
+        row = self._c.execute(
+            "SELECT generation, active_version FROM schema_state WHERE schema_id = ?", (sid,)
+        ).fetchone()
+        generation = int(row[0]) if row else 0
+        active = None if row is None or row[1] is None else int(row[1])
+        if expect_generation is not None and expect_generation != generation:
+            raise ConstraintError(f"schema state generation is {generation}, expected {expect_generation}")
+        for version, fingerprint, parts in change.served:
+            known = self._c.execute(
+                "SELECT fingerprint FROM schema_versions WHERE schema_id = ? AND version = ?", (sid, version)
+            ).fetchone()
+            if known is None:
+                self._c.execute(
+                    "INSERT INTO schema_versions (schema_id, version, fingerprint, parts, first_served) VALUES (?,?,?,?,?)",
+                    (sid, version, fingerprint, parts, _stamp(change.at)),
+                )
+            elif known[0] != fingerprint:
+                raise ConstraintError(f"schema version {version} was already served with another fingerprint")
+        if change.pin_doc is not None:
+            if change.pin_version is None:
+                self._c.execute("DELETE FROM doc_pins WHERE schema_id = ? AND doc = ?", (sid, change.pin_doc))
+            else:
+                self._c.execute(
+                    "INSERT INTO doc_pins (schema_id, doc, version) VALUES (?,?,?)"
+                    " ON CONFLICT (schema_id, doc) DO UPDATE SET version = excluded.version",
+                    (sid, change.pin_doc, change.pin_version),
+                )
+        for doc, version in change.pins:
+            self._c.execute(
+                "INSERT INTO doc_pins (schema_id, doc, version) VALUES (?,?,?)"
+                " ON CONFLICT (schema_id, doc) DO UPDATE SET version = excluded.version",
+                (sid, doc, version),
+            )
+        new_active = active if change.active is None else change.active
+        self._c.execute(
+            "INSERT INTO schema_state (schema_id, active_version, generation) VALUES (?,?,?)"
+            " ON CONFLICT (schema_id) DO UPDATE SET active_version = excluded.active_version,"
+            " generation = excluded.generation",
+            (sid, new_active, generation + 1),
+        )
+        self._c.execute(
+            "INSERT INTO schema_history (schema_id, at, operator, action, doc, from_version, to_version,"
+            " change_class, note) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                sid,
+                _stamp(change.at),
+                change.operator,
+                change.action,
+                change.doc,
+                change.from_version,
+                change.to_version,
+                change.change_class,
+                change.note,
+            ),
+        )
+        return generation + 1
+
+    @live
+    def schema_history(self, schema_id: str, limit: int | None = None, doc: str | None = None) -> list[HistoryRecord]:
+        sql = "SELECT * FROM schema_history WHERE schema_id = ?"
+        params: list[object] = [schema_id]
+        if doc is not None:
+            sql += " AND doc = ?"
+            params.append(doc)
+        found = [
+            HistoryRecord(
+                id=int(r["id"]),
+                at=_unstamp(r["at"]),
+                operator=str(r["operator"]),
+                action=str(r["action"]),
+                doc=r["doc"],
+                from_version=r["from_version"],
+                to_version=r["to_version"],
+                change_class=r["change_class"],
+                note=str(r["note"]),
+            )
+            for r in self._c.execute(sql + " ORDER BY id", params).fetchall()
+        ]
+        return found if limit is None else found[max(len(found) - limit, 0) :]
+
 
 class _SqliteReadTx(_SqliteTx):
     """A read-only handle: reads like any transaction, refuses every write."""
@@ -1082,6 +1249,9 @@ class _SqliteReadTx(_SqliteTx):
         raise RuntimeError("read-only transaction")
 
     def release_lease(self, hook: str, owner: str) -> None:
+        raise RuntimeError("read-only transaction")
+
+    def apply_schema_change(self, change: StateChange, expect_generation: int | None) -> int:
         raise RuntimeError("read-only transaction")
 
 
@@ -1227,20 +1397,24 @@ class SqliteStorage:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.executescript(SCHEMA)
-            columns = {row["name"] for row in connection.execute("PRAGMA table_info(views)")}
-            if "effects_seq" not in columns:  # a database made before feature 002
-                connection.execute("ALTER TABLE views ADD COLUMN effects_seq INTEGER NOT NULL DEFAULT 0")
-            if "epoch" not in columns:  # a database made before feature 005
-                connection.execute("ALTER TABLE views ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
-            entry_columns = {row["name"] for row in connection.execute("PRAGMA table_info(entries)")}
-            for column, definition in (
-                ("valid_time", "TEXT"),
-                ("synthetic", "TEXT"),
-                ("purged", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if column not in entry_columns:
-                    connection.execute(f"ALTER TABLE entries ADD COLUMN {column} {definition}")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                # only a database made by older code is brought up to date: opening a current one writes nothing, so it
+                # never waits for (or blocks) a writer to run DDL
+                connection.executescript(SCHEMA)
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(views)")}
+                if "effects_seq" not in columns:  # a database made before feature 002
+                    connection.execute("ALTER TABLE views ADD COLUMN effects_seq INTEGER NOT NULL DEFAULT 0")
+                if "epoch" not in columns:  # a database made before feature 005
+                    connection.execute("ALTER TABLE views ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
+                entry_columns = {row["name"] for row in connection.execute("PRAGMA table_info(entries)")}
+                for column, definition in (
+                    ("valid_time", "TEXT"),
+                    ("synthetic", "TEXT"),
+                    ("purged", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if column not in entry_columns:
+                        connection.execute(f"ALTER TABLE entries ADD COLUMN {column} {definition}")
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.Error as error:
             if connection is not None:
                 connection.close()  # do not leak the handle (and its locks) of a database that cannot be used

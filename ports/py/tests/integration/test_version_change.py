@@ -28,13 +28,15 @@ def text(version: int, name_rule: str = "", tiers: str = "backfill, user, admin"
     return found if "backfill" in tiers else found.replace("lenient: {allowed: [backfill]},", "")
 
 
-def build(storage: Storage, *versions: str, active: int | None = None, prefix: str = "s") -> Aduku:
+def build(
+    storage: Storage, *versions: str, active: int | None = None, prefix: str = "s", schema_state: bool = True
+) -> Aduku:
     behaviors = BehaviorRegistry.with_builtins()
     register_fixtures(behaviors)
     registry = SchemaRegistry()
     for body in versions:
         registry.put(load_schema(body, behaviors))
-    service = Aduku(storage, registry, behaviors=behaviors, ids=SequentialIds(prefix))
+    service = Aduku(storage, registry, behaviors=behaviors, ids=SequentialIds(prefix), schema_state=schema_state)
     if active is not None:
         registry.activate(active)
     return service
@@ -177,7 +179,8 @@ def test_a_read_that_has_to_derive_never_takes_the_write_lock(backend: Storage) 
 
 
 def test_a_service_refuses_an_active_version_that_drops_a_tier_the_ledger_uses(backend: Storage) -> None:
-    build(backend, V7, active=7).append("d1", [put("/name", "x", tier="backfill")], contributor=JOB)
+    # a database written before the store kept the active version: nothing stored, so the registry's own choice is adopted
+    build(backend, V7, active=7, schema_state=False).append("d1", [put("/name", "x", tier="backfill")], contributor=JOB)
     from aduku.behaviors.registry import BehaviorRegistry
     from aduku.service import Aduku
 
@@ -194,7 +197,7 @@ def test_a_service_refuses_a_pin_that_drops_a_tier_the_document_uses(backend: St
     from aduku.behaviors.registry import BehaviorRegistry
     from aduku.service import Aduku
 
-    build(backend, V7, active=7).append("d1", [put("/name", "x", tier="backfill")], contributor=JOB)
+    build(backend, V7, active=7, schema_state=False).append("d1", [put("/name", "x", tier="backfill")], contributor=JOB)
     behaviors = BehaviorRegistry.with_builtins()
     register_fixtures(behaviors)
     registry = SchemaRegistry()
@@ -204,3 +207,24 @@ def test_a_service_refuses_a_pin_that_drops_a_tier_the_document_uses(backend: St
     registry.pin("d1", 9)
     with pytest.raises(SchemaError):
         Aduku(backend, registry, behaviors=behaviors)
+
+
+def test_when_the_store_holds_state_a_registrys_own_choice_is_ignored_even_if_it_could_not_serve_the_ledger(
+    backend: Storage,
+) -> None:
+    """Feature 006: the store decides. A process whose files hold a newer version that drops a used tier still starts and serves
+    the stored version, and can repair things (activate, roll back) instead of being locked out."""
+    from aduku.behaviors.registry import BehaviorRegistry
+    from aduku.service import Aduku
+
+    build(backend, V7, active=7).append("d1", [put("/name", "x", tier="backfill")], contributor=JOB)
+    behaviors = BehaviorRegistry.with_builtins()
+    register_fixtures(behaviors)
+    registry = SchemaRegistry()
+    registry.put(load_schema(V7, behaviors))
+    registry.put(load_schema(text(9, tiers="user, admin"), behaviors))
+    registry.activate(9)
+    service = Aduku(backend, registry, behaviors=behaviors)
+    assert service.schemas.active().version == 7 and service.get("d1").document["name"] == "x"
+    with pytest.raises(SchemaError):
+        service.activate_schema(9, operator="alice", acknowledge_breaking=True)

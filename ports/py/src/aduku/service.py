@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
@@ -14,6 +15,7 @@ from typing import Any, Literal
 from aduku.audit import AuditRecord, RejectionAudit
 from aduku.behaviors.registry import BehaviorRegistry
 from aduku.engine import compaction as compaction_engine
+from aduku.engine import dryrun
 from aduku.engine import purge as purge_engine
 from aduku.engine.admission import check_request
 from aduku.engine.asof import Selection, point_of, select
@@ -26,7 +28,7 @@ from aduku.engine.derive import (
     state_from_layers,
 )
 from aduku.engine.effects import EffectView, PendingCall, fingerprint, view_from_records
-from aduku.engine.explain import entry_touches
+from aduku.engine.explain import entry_touches, paths_touch
 from aduku.engine.explain import explain as explain_path
 from aduku.engine.layer_codec import decode_layer, encode_layer
 from aduku.engine.model_errors import (
@@ -42,6 +44,7 @@ from aduku.engine.model_errors import (
 )
 from aduku.engine.project import project
 from aduku.engine.request_hash import request_hash
+from aduku.engine.shadow import shadow_reasons
 from aduku.engine.squash import spread
 from aduku.engine.validate import ValidatorFault
 from aduku.errors import (
@@ -58,20 +61,27 @@ from aduku.hooks import HookRunner
 from aduku.ion_codec import ABSENT, TOMBSTONE, FrozenStruct, IonError, normalize, parse, to_canonical, to_utc
 from aduku.log import emit
 from aduku.model import (
+    ActivationReport,
     AppendResult,
     ArchiveReport,
     AsOf,
+    ChangeList,
     CompactionReport,
     DeferredInfo,
     DeferredStatus,
+    DocumentChange,
     DocumentResult,
+    DryRunReport,
     EffectInfo,
     EffectRecord,
     Entry,
     EntryInput,
     ExpiryReport,
     Explanation,
+    HistoryRecord,
     Identity,
+    MigrationProgress,
+    MigrationReport,
     ModelError,
     PurgeApplication,
     PurgedMark,
@@ -81,11 +91,14 @@ from aduku.model import (
     RebuildReport,
     RecomputeReport,
     SchedulerReport,
+    Shadowed,
 )
 from aduku.paths import PathError, format_path, parse_path
 from aduku.scheduler import DEFAULT_BUDGET, Scheduler
+from aduku.schema.diff import schema_changes
 from aduku.schema.model import FieldSpec, Schema, conforms
 from aduku.schema.registry import SchemaRegistry
+from aduku.schema_state import StorageSchemaState
 from aduku.storage.base import Clock, ConstraintError, IdSource, LayerRow, RequestRecord, Storage, Tx, ViewRow
 
 __all__ = ["Aduku"]
@@ -117,6 +130,11 @@ def _decode_errors(text: str) -> tuple[ModelError, ...]:
         ModelError(item["rule"], item["path"], item["message"], item.get("request"), item.get("version"))
         for item in parse(text)
     )
+
+
+def _by_hash(doc: str) -> str:
+    """The order a limited dry run takes documents in: by a hash of the name, so it is the same each time."""
+    return hashlib.sha256(doc.encode()).hexdigest()
 
 
 def _fits(view: ViewRow | None, last: int, schema: Schema, effects_seq: int = 0, epoch: int = 0) -> bool:
@@ -201,8 +219,12 @@ class Aduku:
         sleep: Callable[[float], None] | None = None,
         scheduler_budget: float = DEFAULT_BUDGET,
         layers: bool = True,
+        schema_state: bool = True,
     ) -> None:
         self.storage = storage
+        # Feature 006: share the active version and the pins through the store. False keeps them in this process only
+        # (the behavior before feature 006); no merged result depends on it.
+        self.schema_state = schema_state
         # Feature 005: save and use per-tier layers. False runs the same service without them (for tests and conformance:
         # no result may depend on it).
         self.layers = layers
@@ -214,6 +236,9 @@ class Aduku:
         # In-memory per-tier layers, so that a read or an append folds only the entries it has not seen. Disposable:
         # losing it only costs a derivation from the ledger.
         self._states: OrderedDict[str, DerivationState] = OrderedDict()
+        self._shadow_cache: OrderedDict[tuple[Any, ...], tuple[Shadowed, ...]] = (
+            OrderedDict()
+        )  # reasons by ledger state
         self._views: OrderedDict[str, ViewRow] = OrderedDict()  # views derived by reads, which never write to storage
         self._hooks = hook_runner or HookRunner()
         if not 0.0 < fetch_deadline <= 60.0:
@@ -245,6 +270,11 @@ class Aduku:
         ] = {}  # per schema version: the merge context, defaults and fallbacks
         self.state_cache_size = state_cache_size  # documents kept in memory; the least recently used are dropped
         self.derivations = 0  # how many times a document was derived (not served from a cache); for tests
+        if schema_state and schemas.schema_id is not None:
+            # Feature 006: from here the store decides the active version and the pins; the registry's own are adopted
+            # only when the store holds none (and only if the ledger can be served by them). Then what is in force is checked.
+            schemas.watch(self._tiers_in_use, self._compaction_problem)
+            schemas.bind(StorageSchemaState(storage, schemas.schema_id), self.clock.now)
         schemas.guard(
             self._tiers_in_use, self._compaction_problem
         )  # activating or pinning checks it against the ledger
@@ -586,9 +616,65 @@ class Aduku:
 
     def _with_stored_deferred(self, schema: Schema, doc: str, result: AppendResult) -> AppendResult:
         """Show the deferred values already in the store in a write's view. A write never calls a source."""
-        if result.view is None or not DeferredStage.has_deferred(schema):
+        if result.view is None:
             return result
-        return replace(result, view=self._deferred.stored(schema, doc, result.view))
+        view = self._with_shadowed(doc, schema, result.view)
+        if DeferredStage.has_deferred(schema):
+            view = self._deferred.stored(schema, doc, view)
+        return replace(result, view=view)
+
+    def _with_shadowed(
+        self, doc: str, schema: Schema, result: DocumentResult, entries: Sequence[Entry] | None = None
+    ) -> DocumentResult:
+        """Say why each skipped entry is left out (feature 006). Worked out here, from the same checks as the fold, and
+        only when something was skipped; `entries` are the ones the result was derived from (the ledger's when None)."""
+        if not result.skipped:
+            return result
+        if entries is not None:  # an as-of read: its own selection of entries, nothing to cache
+            return replace(
+                result,
+                shadowed=tuple(shadow_reasons(schema, self.behaviors, self._engine(schema), entries, result.skipped)),
+            )
+        with self.storage.read() as tx:
+            key = (
+                doc,
+                schema.id,
+                schema.version,
+                schema.rules_fingerprint,
+                tx.last_seq(doc),
+                tx.epoch(doc),
+                len(tx.purge_log(doc)),  # a purge changes neither the last seq nor the epoch
+                result.skipped,
+            )
+            with self._states_lock:
+                known = self._shadow_cache.get(key)
+                if known is not None:
+                    self._shadow_cache.move_to_end(key)
+            if known is None:  # worked out once per state of the ledger and version, then served from memory
+                known = tuple(
+                    shadow_reasons(
+                        schema,
+                        self.behaviors,
+                        self._engine(schema),
+                        self._shadow_entries(tx, doc, schema),
+                        result.skipped,
+                    )
+                )
+                with self._states_lock:
+                    self._shadow_cache[key] = known
+                    while len(self._shadow_cache) > self.state_cache_size:
+                        self._shadow_cache.popitem(last=False)
+        return replace(result, shadowed=known)
+
+    def _shadow_entries(self, tx: Tx, doc: str, schema: Schema) -> list[Entry]:
+        """The entries a derivation under `schema` folded, restored from the archive where it is still kept (never raises)."""
+        entries = tx.entries(doc, 0)
+        if tx.epoch(doc) == 0:
+            return entries
+        records = tx.compactions(doc)
+        if not records or all(r.fold_fingerprint == schema.fold_fingerprint for r in records):
+            return entries
+        return self._restore(tx, doc, entries, strict=False)[0]
 
     # -- read ----------------------------------------------------------------------------------------------------
 
@@ -616,9 +702,9 @@ class Aduku:
             return self._as_of_document(doc, as_of)
         schema = self.schemas.version_for(doc)
         core = self._core(doc, schema)
-        if not DeferredStage.has_deferred(schema):
-            return core
-        return self._deferred.read(schema, doc, core, consistency=consistency, detail="pending" in include)
+        if DeferredStage.has_deferred(schema):
+            core = self._deferred.read(schema, doc, core, consistency=consistency, detail="pending" in include)
+        return self._with_shadowed(doc, schema, core)
 
     def _core(self, doc: str, schema: Schema) -> DocumentResult:
         """P1 to P6 and the projection: everything that does not depend on the derived store."""
@@ -685,9 +771,9 @@ class Aduku:
                     earliest_seq=earliest,
                 )
 
-    def _as_of_document(self, doc: str, as_of: AsOf) -> DocumentResult:
+    def _as_of_document(self, doc: str, as_of: AsOf, schema: Schema | None = None) -> DocumentResult:
         """The document at a point of its history, under the schema version it has now (feature 005, research R-11)."""
-        schema = self.schemas.version_for(doc)
+        schema = schema or self.schemas.version_for(doc)
         ready = self._engine(schema)
         selection, effects, _ = self._as_of_inputs(doc, schema, ready, as_of)
         ext = self._replay(schema, selection.entries, effects=effects).final
@@ -704,15 +790,37 @@ class Aduku:
             for spec in sorted(schema.fields, key=lambda spec: spec.pattern)
             if spec.deferred is not None
         )
-        return replace(result, deferred=unavailable, as_of=selection.info)
+        return self._with_shadowed(
+            doc, schema, replace(result, deferred=unavailable, as_of=selection.info), selection.entries
+        )
 
     def explain(self, doc: str, path: str, *, as_of: AsOf | None = None) -> Explanation:
         """Why `path` has its value in `doc`: the winning entry, the rule, and the entries that made no difference.
 
         Worked out from the ledger under the schema version the document is read under. Raises RejectedError
-        (UNKNOWN_PATH) for a path the schema does not declare.
+        (UNKNOWN_PATH) for a path the schema does not declare. `shadowed_by_schema` (feature 006) lists the entries this
+        version leaves out that touch the path, with their reasons.
         """
-        schema = self.schemas.version_for(doc)
+        schema = self.schemas.version_for(
+            doc
+        )  # once: the explanation and the shadow reasons come from the same version
+        explained = self._explain(doc, path, as_of, schema)
+        result = self._core(doc, schema) if as_of is None else self._as_of_document(doc, as_of, schema)
+        if as_of is None:
+            result = self._with_shadowed(doc, schema, result)
+        if not result.shadowed:
+            return explained
+        target = parse_path(path)
+
+        def touches(path_text: str) -> bool:
+            try:
+                return paths_touch(parse_path(path_text), target)
+            except PathError:  # a compacted layer has no single path: it may hold the one asked about
+                return True
+
+        return replace(explained, shadowed_by_schema=tuple(r for r in result.shadowed if touches(r.path)))
+
+    def _explain(self, doc: str, path: str, as_of: AsOf | None, schema: Schema) -> Explanation:
         try:
             parsed = parse_path(path)
         except PathError as error:
@@ -829,6 +937,9 @@ class Aduku:
         """
         with self.storage.read() as tx:
             names = [doc] if doc is not None else tx.doc_ids()
+        return self._rebuild_names(names)
+
+    def _rebuild_names(self, names: list[str]) -> RebuildReport:
         differing: list[str] = []
         refreshed: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -1144,6 +1255,8 @@ class Aduku:
         with self._states_lock:
             self._states.pop(doc, None)
             self._views.pop(doc, None)
+            for key in [k for k in self._shadow_cache if k[0] == doc]:
+                del self._shadow_cache[key]
             for key in [k for k in self._retried_effects if k[0] == doc]:
                 del self._retried_effects[key]
 
@@ -1718,7 +1831,7 @@ class Aduku:
     def _compaction_problem(self, schema: Schema, doc: str | None) -> str | None:
         """Why a schema version may not serve a document (or any): its compacted history cannot be re-folded under it."""
         with self.storage.read() as tx:
-            for name in [doc] if doc is not None else tx.doc_ids():
+            for name in [doc] if doc is not None else tx.compacted_docs():
                 if tx.epoch(name) == 0:
                     continue
                 records = tx.compactions(name)
@@ -1887,6 +2000,334 @@ class Aduku:
         self, doc: str, *, since: datetime | None = None, limit: int | None = None
     ) -> list[AuditRecord]:
         return self._audit.list_records(doc, since=since, limit=limit)
+
+    # -- schema versions (feature 006) -----------------------------------------------------------------------------
+
+    @staticmethod
+    def _operator(operator: str) -> str:
+        if not isinstance(operator, str) or not operator.strip():
+            raise ValueError("an operator name is required to change which schema version serves")
+        return operator
+
+    def activate_schema(
+        self,
+        version: int,
+        *,
+        operator: str,
+        acknowledge_breaking: bool = False,
+        rebuild: bool = False,
+        expect_generation: int | None = None,
+    ) -> ActivationReport:
+        """Make `version` the active one for every process on the store, recording who did it and how risky it was.
+
+        A breaking change needs `acknowledge_breaking` (a rollback needs none: it is allowed whenever the tier and compaction
+        checks pass). Activating the active version changes and records nothing. No document is touched: each re-derives on its
+        next read, unless `rebuild` asks for the saved layers and views of the unpinned documents to be refreshed now. The
+        activation stands whatever the rebuild finds (a document it cannot derive is reported); undoing it is another
+        activation. `expect_generation` refuses the change if the shared state moved since the caller looked at it.
+        """
+        self._operator(operator)
+        previous = self.schemas.active_version()  # syncs with the shared state first
+        seen = self.schemas.generation()  # the state this decision is based on: the write refuses if it moved since
+        target = self.schemas.get(version)
+        if previous == version:
+            return ActivationReport(version=version, previous=version, change_class=None, rollback=False)
+        rollback = previous is not None and version < previous
+        changes = (
+            schema_changes(self.schemas.get(previous), target)
+            if previous is not None and previous in self.schemas.versions()
+            else None
+        )
+        change_class = changes.overall if changes is not None else None
+        if change_class == "breaking" and not acknowledge_breaking and not rollback and changes is not None:
+            first = [f"{c.kind} {c.path}".strip() for c in changes.changes if c.change_class == "breaking"][:5]
+            emit(
+                "schema_activation_refused",
+                operator=operator,
+                previous=previous,
+                version=version,
+                code=ErrorCode.BREAKING_CHANGE_NOT_ACKNOWLEDGED.value,
+                first=first,
+                **{"class": change_class},
+            )
+            raise RejectedError(
+                ErrorCode.BREAKING_CHANGE_NOT_ACKNOWLEDGED,
+                message=(
+                    f"version {version} is a breaking change from version {previous} ({', '.join(first)}); "
+                    "acknowledge it to activate"
+                ),
+            )
+        changed: tuple[str, ...] = ()
+        if rebuild and previous is not None:  # which documents will read differently, worked out before the state moves
+            changed = tuple(c.doc for c in self.plan_schema(version).documents if c.changed)
+        try:
+            self.schemas.activate(
+                version,
+                operator=operator,
+                rollback=rollback,
+                change_class=change_class,
+                expect_generation=seen if expect_generation is None else expect_generation,
+            )
+        except (SchemaError, RejectedError) as refusal:
+            emit(
+                "schema_activation_refused",
+                operator=operator,
+                previous=previous,
+                version=version,
+                code=(
+                    refusal.codes[0] if isinstance(refusal, SchemaError) and refusal.codes else type(refusal).__name__
+                ),
+                **{"class": change_class},
+            )
+            raise
+        emit(
+            "schema_activated",
+            operator=operator,
+            previous=previous,
+            version=version,
+            rollback=rollback,
+            rebuild=rebuild,
+            **{"class": change_class},
+        )
+        report = self._rebuild_unpinned() if rebuild else None
+        return ActivationReport(
+            version=version,
+            previous=previous,
+            change_class=change_class,
+            rollback=rollback,
+            rebuild=report,
+            changed=changed,
+        )
+
+    def _rebuild_unpinned(self) -> RebuildReport:
+        """Refresh the saved layers and views of every document that follows the active version."""
+        pinned = self.schemas.pins()
+        with self.storage.read() as tx:
+            names = [name for name in tx.doc_ids() if name not in pinned]
+        return self._rebuild_names(names)
+
+    def schema_changes(self, old_version: int, new_version: int) -> ChangeList:
+        """The changes between two registered versions, each with its class (no store is read)."""
+        return schema_changes(self.schemas.get(old_version), self.schemas.get(new_version))
+
+    def served_versions(self) -> dict[int, str]:
+        """The full fingerprint of every version served so far, by number: what a restart must present again."""
+        return self.schemas.served_fingerprints()
+
+    def plan_schema(self, target: int, *, docs: Sequence[str] | None = None, limit: int | None = None) -> DryRunReport:
+        """What activating `target` would change, document by document, without changing anything.
+
+        Each document is derived under the version now active and under `target` over the same entries and the same recorded
+        outcomes. Nothing is written and no hook or source is called: an impure field with no recorded outcome under `target`
+        is only counted (`would_call_hook`). Every document is examined unless `docs` or `limit` narrows it; `limit` takes the
+        first N by a hash of the document name, so the same N each time. Pinned documents are left out (an activation does not
+        touch them). `examined` and `left_out` say how much was looked at. Values are never part of the report.
+        """
+        current = self.schemas.active()
+        wanted = self.schemas.get(target)
+        pinned = self.schemas.pins()
+        generation = self.schemas.generation()
+        with self.storage.read() as tx:
+            stored = tx.doc_ids()
+        candidates = list(dict.fromkeys(docs)) if docs is not None else stored
+        candidates = sorted((d for d in candidates if d not in pinned), key=_by_hash)
+        if limit is not None:
+            candidates = candidates[: max(limit, 0)]
+        changes: list[DocumentChange] = []
+        for name in candidates:
+            change = self._dry_run_one(name, current, wanted)
+            if change.failed or change.changed or change.would_call_hook:
+                changes.append(change)
+        failed = sum(1 for c in changes if c.failed)
+        changed = sum(1 for c in changes if c.changed)
+        unchanged = len(candidates) - changed - failed
+        hooks = sum(1 for c in changes if c.would_call_hook)
+        examined = set(candidates)
+        report = DryRunReport(
+            change_list=schema_changes(current, wanted),
+            target=target,
+            generation=generation,
+            examined=len(candidates),
+            left_out=len([d for d in stored if d not in examined]),
+            changed=changed,
+            unchanged=unchanged,
+            failed=failed,
+            would_call_hook=hooks,
+            documents=tuple(sorted(changes, key=lambda c: c.doc)),
+        )
+        emit(
+            "schema_planned",
+            target=target,
+            generation=generation,
+            examined=report.examined,
+            left_out=report.left_out,
+            changed=changed,
+            unchanged=unchanged,
+            failed=failed,
+            would_call_hook=hooks,
+        )
+        return report
+
+    def _dry_run_one(self, doc: str, current: Schema, wanted: Schema) -> DocumentChange:
+        """One document under two versions over the same entries. A document that cannot be derived is `failed`."""
+        try:
+            with self.storage.read() as tx:
+                entries = tx.entries(doc, 0)
+                if tx.epoch(doc) != 0:
+                    problem = self._compaction_problem(wanted, doc)
+                    if problem is not None:
+                        return dryrun.failed(doc, ErrorCode.HISTORY_COMPACTED.value)
+                    entries, _ = self._restore(tx, doc, entries, strict=False)
+                seen = {}
+                for schema in (current, wanted):
+                    seen[schema.version] = self._effect_view(tx, self._engine(schema), doc)
+            before = self._replay(current, entries, effects=seen[current.version]).final
+            after = self._replay(wanted, entries, effects=seen[wanted.version]).final
+            ready = self._engine(wanted)
+            return dryrun.compare(
+                doc,
+                self._observed(before),
+                self._observed(after),
+                shadow_reasons(wanted, self.behaviors, ready, entries, after.state.skipped),
+                bool(after.pending),
+            )
+        except (RejectedError, SchemaError, StorageError, ComputeFault, ValidatorFault) as error:
+            code = error.code.value if isinstance(error, RejectedError) else type(error).__name__
+            return dryrun.failed(doc, code)
+
+    def _observed(self, ext: Extension) -> compaction_engine.Observed:
+        _, text = self._settle(ext.document)
+        return compaction_engine.Observed(text, ext.errors, ext.state.skipped, ext.conflicts)
+
+    def plan_migration(self, doc: str, to: int | None = None) -> DocumentChange:
+        """What moving one pinned document to `to` (the active version by default) would change; writes nothing.
+
+        Raises RejectedError(NOT_PINNED) for a document that is not pinned.
+        """
+        pinned = self.schemas.pins().get(doc)
+        if pinned is None:
+            raise RejectedError(ErrorCode.NOT_PINNED, message=f"document {doc!r} is not pinned to a version")
+        target = self.schemas.get(to) if to is not None else self.schemas.active()
+        return self._dry_run_one(doc, self.schemas.get(pinned), target)
+
+    def migrate(
+        self,
+        docs: Sequence[str] | None = None,
+        *,
+        to: int | None = None,
+        operator: str,
+        batch: int = 100,
+        progress: Callable[[MigrationProgress], None] | None = None,
+    ) -> MigrationReport:
+        """Move pinned documents to `to` (the active version by default), each in its own transaction with its record.
+
+        Over `docs`, or over every pinned document when none are given. A document moved to the active version is unpinned.
+        One that cannot be derived under the target is reported `failed` and stays on its version, and the rest go on. Run
+        again after a stop, the documents already moved are reported and left alone. A document that is not pinned is reported
+        `not_pinned`; asked about alone it is refused (NOT_PINNED). `progress` is called after each batch of `batch` documents.
+        """
+        self._operator(operator)
+        if batch < 1:
+            raise ValueError("a batch holds at least one document")
+        target = self.schemas.get(to) if to is not None else self.schemas.active()
+        names = list(dict.fromkeys(docs)) if docs is not None else sorted(self.schemas.pins())
+        if docs is not None and len(names) == 1 and not self._migrated_to(names[0], target.version):
+            if names[0] not in self.schemas.pins():
+                raise RejectedError(ErrorCode.NOT_PINNED, message=f"document {names[0]!r} is not pinned to a version")
+        moved: list[str] = []
+        already: list[str] = []
+        not_pinned: list[str] = []
+        failed: list[tuple[str, str]] = []
+        batches = 0
+        for start in range(0, len(names), batch):
+            chunk = names[start : start + batch]
+            pins = self.schemas.pins()  # read once per batch, not once per document
+            active = self.schemas.active_version()
+            for name in chunk:
+                outcome = self._migrate_one(name, target, operator, pins, active)
+                if outcome == "moved":
+                    moved.append(name)
+                elif outcome == "already_moved":
+                    already.append(name)
+                elif outcome == "not_pinned":
+                    not_pinned.append(name)
+                else:
+                    failed.append((name, outcome))
+            batches += 1
+            emit(
+                "schema_migration_batch",
+                operator=operator,
+                target=target.version,
+                batch=batches,
+                moved=len(moved),
+                already_moved=len(already),
+                not_pinned=len(not_pinned),
+                failed=len(failed),
+            )
+            if progress is not None:
+                progress(
+                    MigrationProgress(
+                        batches, start + len(chunk), len(names), len(moved), len(already), len(not_pinned), len(failed)
+                    )
+                )
+        return MigrationReport(tuple(moved), tuple(already), tuple(not_pinned), tuple(failed), batches)
+
+    def _migrated_to(self, doc: str, version: int) -> bool:
+        """True if the last recorded act on the document was a migration to `version`."""
+        last = self.schemas.history(limit=1, doc=doc)
+        return bool(last) and last[0].action == "migrate" and last[0].to_version == version
+
+    def _migrate_one(self, doc: str, target: Schema, operator: str, pins: dict[str, int], active: int | None) -> str:
+        """`moved`, `already_moved`, `not_pinned`, or the code of the failure; a failure leaves the document as it was.
+
+        `pins` and `active` are what the batch read when it began; a move updates `pins`."""
+        pinned = pins.get(doc)
+        if pinned is None:
+            return "already_moved" if self._migrated_to(doc, target.version) else "not_pinned"
+        if pinned == target.version:
+            return "already_moved"
+        current = self.schemas.get(pinned)
+        change = self._dry_run_one(doc, current, target)
+        if change.failed:
+            emit("schema_migration_failed", operator=operator, doc=doc, target=target.version, code=change.failure_code)
+            return change.failure_code or "FAILED"
+        try:
+            self.schemas.pin(
+                doc,
+                None if target.version == active else target.version,
+                operator=operator,
+                action="migrate",
+                change_class=schema_changes(current, target).overall,
+                to_version=target.version,
+            )
+        except (SchemaError, RejectedError) as refusal:
+            code = refusal.codes[0] if isinstance(refusal, SchemaError) and refusal.codes else type(refusal).__name__
+            if isinstance(refusal, RejectedError):
+                code = refusal.code.value
+            emit("schema_migration_failed", operator=operator, doc=doc, target=target.version, code=code)
+            return code
+        if target.version == active:
+            pins.pop(doc, None)
+        else:
+            pins[doc] = target.version
+        emit("schema_migrated", operator=operator, doc=doc, **{"from": pinned, "to": target.version})
+        return "moved"
+
+    def pin_document(self, doc: str, version: int, *, operator: str) -> None:
+        """Serve one document from `version` whatever the active version is."""
+        self._operator(operator)
+        self.schemas.pin(doc, version, operator=operator)
+        emit("schema_pinned", operator=operator, doc=doc, version=version)
+
+    def unpin_document(self, doc: str, *, operator: str) -> None:
+        """Serve the document from the active version again."""
+        self._operator(operator)
+        self.schemas.pin(doc, None, operator=operator)
+        emit("schema_unpinned", operator=operator, doc=doc)
+
+    def schema_history(self, *, limit: int | None = None, doc: str | None = None) -> list[HistoryRecord]:
+        """The recorded changes of the active version and the pins, oldest first (`limit` keeps the newest)."""
+        return self.schemas.history(limit=limit, doc=doc)
 
     def set_rejection_audit(self, doc: str, setting: str) -> None:
         """`setting` is "enabled", "disabled" or "inherit" (the schema decides)."""

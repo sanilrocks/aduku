@@ -105,6 +105,21 @@ def test_the_snapshot_time_travel_compaction_and_purge_modules_are_pure() -> Non
         assert calls & CLOCK_CALLS == set(), f"{name} reads a clock"
 
 
+def test_schema_diff_shadow_and_dry_run_modules_are_pure() -> None:
+    """Feature 006 (Principle III): classification, shadow reasons and the dry-run comparison are pure."""
+    for name in ("schema/diff.py", "engine/shadow.py", "engine/dryrun.py"):
+        path = SRC / name
+        assert path.exists(), f"{name} is missing"
+        bad = [n for n in _imports(path) if any(n == b or n.startswith(b + ".") for b in FORBIDDEN)]
+        assert bad == [], f"{name} imports {bad}"
+        calls = {
+            node.func.attr
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls & CLOCK_CALLS == set(), f"{name} reads a clock"
+
+
 def test_the_pattern_matcher_is_a_pure_module_of_its_own() -> None:
     """Feature 004 (research R-2): the `pattern` subset has its own matcher, not the host's `re` (not portable, not linear)."""
     path = SRC / "behaviors" / "pattern.py"

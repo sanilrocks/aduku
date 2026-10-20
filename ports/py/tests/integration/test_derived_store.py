@@ -163,6 +163,7 @@ def test_a_database_made_by_feature_002_opens_and_gains_the_tables(tmp_path: pat
     raw = sqlite3.connect(path)
     for table in ("derived_values", "scheduler_runs", "scheduler_leases"):
         raw.execute(f"DROP TABLE {table}")  # what a feature 002 database looks like
+    raw.execute("PRAGMA user_version = 0")  # ... which also predates the version stamp
     raw.commit()
     raw.close()
     reopened = SqliteStorage(path)
