@@ -39,8 +39,8 @@ def validate_document(schema: Schema, behaviors: BehaviorRegistry, document: Fro
     document = strip_computed(document)  # a rule sees the value of a computed field, not its annotation
     for path, value in _nodes(document, ()):
         field = schema.field_for(path)
-        if field is None:
-            continue
+        if field is None or value is None:
+            continue  # a null (a computed field whose inputs are missing, say) is no value: there is nothing to judge
         for ref in field.validate:
             for violation in _run(behaviors, ref, Subject(NO_DOCUMENT, format_path(path), value, ref.args)):
                 found.setdefault((violation.rule_id, violation.path_scope), violation)
@@ -77,7 +77,8 @@ def _run(behaviors: BehaviorRegistry, ref: BehaviorRef, subject: Subject) -> lis
     try:
         result = behavior.impl(subject)
     except Exception as error:
-        raise ValidatorFault(ref.name, f"{type(error).__name__}: {error}") from error
+        # the kind of error only: what a rule said when it crashed may hold a value of the document
+        raise ValidatorFault(ref.name, f"it raised {type(error).__name__}") from error
     if not isinstance(result, list) or not all(isinstance(item, Violation) for item in result):
         raise ValidatorFault(ref.name, "it did not return a list of violations")
     return result

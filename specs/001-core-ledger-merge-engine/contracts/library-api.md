@@ -61,7 +61,7 @@ registry.put(schema) / registry.activate(version) / registry.pin(doc, version | 
 # activate raises SchemaError (code TIER_IN_USE) when the version drops or renames a tier used by an existing entry;
 # pin(doc, v) checks the same for that document's entries. Reading under an unregistered or inactive version: SCHEMA_INACTIVE
 behaviors.register_merge(name, version, combine, laws=Laws(associative=True, ...))
-behaviors.register_validate(name, version, check)   # a field rule is given only its value; a document rule gets the document
+behaviors.register_validate(name, version, check, check_args=None, *, args=None, applies="either")   # a field rule is given only its value; a document rule gets the document; see feature 004 for ArgSpec
 ```
 
 `register_merge` without `associative=True` succeeds, but any schema referencing the behavior is refused at load (FR-011).

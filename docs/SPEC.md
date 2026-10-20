@@ -1,6 +1,6 @@
 # aduku — Specification
 
-Status: Draft 0.10 · Audience: implementers and reviewers
+Status: Draft 0.11 · Audience: implementers and reviewers
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** are used as in RFC 2119.
 
@@ -726,6 +726,9 @@ request that would introduce a new model error is rejected with `MODEL_ERROR_INT
 - Model error identity is `(rule id, path scope)`. Two violations of the same rule at the same scope are the same error.
 - A **lenient** request from a permitted tier is **exempt** from this rule; its new violations are recorded as model errors.
 
+A document with no entries is checked like any other: a rule that needs a field (`at_least_one`, or a computed field with `on_missing: error`) already reports on it, so
+that error is not *new* when the first request arrives; the request is still rejected if it adds a different one.
+
 ### 10.4 Re-evaluation on schema or rule change
 
 - Every derived document view records the schema version (and validation-rule versions) it was derived under.
@@ -733,6 +736,17 @@ request that would introduce a new model error is rejected with `MODEL_ERROR_INT
   and re-derives from the ledger under the current version, recomputing model errors.
 - Violations found are recorded as model errors and returned with the document. Previously accepted entries are never
   retroactively rejected or removed, and the ledger is not modified.
+
+### 10.6 The rule library
+
+Field rules (arguments in braces; each reports nothing for a value of a kind it does not apply to, names the field and the rule in
+its message and never repeats the value): `non_empty`, `range{min,max}`, `max_len{n}`, `min_len{n}`, `pattern{regex}`,
+`one_of{values}`, `unique_items`. `pattern` is a small subset (literals, `.`, classes and ranges, groups, alternation, `*` `+` `?`
+`{m,n}`; no back-references or look-around) matched against the whole value in time proportional to its length.
+Document rules over a list of paths (a path has a value if it is present and not null): `all_or_none{paths}`,
+`at_least_one{paths}`, `at_most_one{paths}`, `ordered{first,second}` (a violation when the first is greater than the second or the
+two cannot be ordered; nothing when either has no value). A deployment may register further field and document rules with
+declared arguments; a schema that uses a rule with an undeclared, missing or ill-typed argument is refused at load.
 
 ### 10.5 Deferred values and validation
 
@@ -750,8 +764,10 @@ model errors.
 - P0 checks the contributor's permitted tiers and the field's authority; failure is `NOT_AUTHORIZED`.
 - Authority is checked **per entry at admission** against the schema version in force.
 - Use of the non-rejection flag is a separate permission (`lenient.allowed`, section 10.2); failure is `LENIENT_NOT_PERMITTED`.
-- Authority on a path and on its descendants follows the most specific declaration: a child's `authority` overrides its
-  parent's. `explain` and provenance obey redaction in the same way (details when `redact` is designed).
+- Authority on a path and on its descendants follows the most specific declaration: a child without its own `authority` takes
+  the nearest list above it, and a child's own list replaces its parent's (it does not add to it). `explain` and provenance obey redaction in the same way (details when `redact` is designed).
+- A `NOT_AUTHORIZED` reason names the field and the rule, not the tiers and roles that may write it; `explain` and the schema check
+  report the effective list and the field that declared it. The non-rejection flag never bypasses authority.
 - Authority is not a substitute for tier priority: authority decides *who may write*; tier decides *who wins*.
 
 ---
@@ -854,6 +870,7 @@ difference); a document that cannot be derived is reported and does not stop the
 | Change merge rule | **Breaking** | Folds change; stored snapshots MUST be invalidated and rebuilt. |
 | Change type / tighten constraint | **Breaking** | Existing entries may no longer conform; they are *shadowed* with a recorded reason or the change is refused. |
 | Add or tighten a validation rule | Visible | Existing entries are kept; documents gain model errors on next read (10.4). |
+| Add, change or remove an `authority` list (11) | Visible | Applies to entries admitted from then on; recorded entries stay. A child without a list also takes a parent's new list. |
 | Make field derived | **Breaking** | Historic entries shadowed (9.2). |
 | Change an impure compute's hook version or `depends` | Visible | Recorded outcomes for the old version or fingerprint are not reused; the next derivation that needs the value calls the hook again (a read may therefore do IO once). |
 | Change `failure_mode` / `impure_failure_mode` | Visible | Applies from the next request or derivation; existing model errors and recorded outcomes stay. |
@@ -1049,6 +1066,7 @@ Every question below was decided on 2026-10-18. The Decision line says what is i
 
 ## Appendix A. Changelog
 
+- **0.11**: Rule library and authority as clarified for feature 004: the rules of 10.6, authority inheritance and the wording of `NOT_AUTHORIZED` reasons (11).
 - **0.10**: Deferred fields as clarified and built for feature 003 (12.2 now says reads may call deferred sources): `invalidate_by` is required on every deferred field, a `per_fetch` value is reused only while its inputs are unchanged, the circuit breaker is per hook, the fetch deadline covers the whole read, and a notification only marks values out of date (9.5, 5.3, 12.4).
 - **0.9**: Computed fields as built in feature 002: null counts as a missing input, `on_missing: error` model errors count against a request, `COMPUTE_FAULT`, `on_missing` and `recompute_by` in the annotation table (5.3, 9.4, 12.5).
 - **0.8**: Impure computes declare `recompute_by` (who may call `recompute`), decided while clarifying feature 002 (9.3.1).

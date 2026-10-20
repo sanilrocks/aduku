@@ -422,3 +422,93 @@ def test_a_down_source_does_not_fail_the_read(
     monkeypatch.setenv("DEMO_DOWN", "1")
     code, out, _ = run(capsys, *deferred_env, "get", "d1")
     assert code == 0 and next(d for d in out["deferred"] if d["path"] == "/fxRate")["status"] == "error"
+
+
+# -- feature 004: rules and authority --------------------------------------------------------------------------------
+
+CONFORMANCE = pathlib.Path(__file__).resolve().parents[4] / "conformance"
+RULES_SCHEMA = """schema::{id: "r", version: 1, tiers: [backfill, user, admin], roles: [finance],
+  fields: {
+    "/plan": {type: string, merge: lww, authority: [admin], validate: [one_of::{values: ["free", "pro"]}]},
+    "/billing": {type: struct, merge: struct, authority: [finance]},
+    "/billing/note": {type: string, merge: lww, validate: [min_len::{n: 2}, pattern::{regex: "[a-z]+"}]},
+    "/phone": {type: string, merge: lww}, "/email": {type: string, merge: lww},
+    "/from": {type: int, merge: lww}, "/to": {type: int, merge: lww}
+  }}"""
+
+
+@pytest.fixture
+def rules_env(tmp_path: pathlib.Path) -> list[str]:
+    schema = tmp_path / "rules.schema.ion"
+    schema.write_text(RULES_SCHEMA)
+    return ["--db", str(tmp_path / "cli.db"), "--schema", str(schema)]
+
+
+def test_schema_check_lists_the_effective_authority_and_the_rules_of_every_field(
+    rules_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _ = run(capsys, *rules_env, "schema", "check", rules_env[3])
+    assert code == 0
+    fields = {item["field"]: item for item in out["field_rules"]}
+    assert (fields["/plan"]["authority"], fields["/plan"]["authority_from"]) == (["admin"], "/plan")
+    assert (fields["/billing/note"]["authority"], fields["/billing/note"]["authority_from"]) == (
+        ["finance"],
+        "/billing",
+    )
+    assert (fields["/phone"]["authority"], fields["/phone"]["authority_from"]) == (None, None)
+    assert [r["rule"] for r in fields["/billing/note"]["rules"]] == ["min_len@1", "pattern@1"]
+    assert fields["/billing/note"]["rules"][0]["args"] == "{n:2}"
+    assert out["document_rules"] == []
+
+
+def test_the_spec_16_1_schema_reports_the_effective_authority_of_every_field(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    schema = CONFORMANCE / "customer.schema.ion"
+    env = ["--db", str(tmp_path / "c.db"), "--schema", str(schema)]
+    code, out, _ = run(capsys, *env, "schema", "check", str(schema))
+    assert code == 0
+    found = {item["field"]: (item["authority"], item["authority_from"]) for item in out["field_rules"]}
+    assert found["/plan"] == (["admin"], "/plan")
+    assert all(value == (None, None) for field, value in found.items() if field != "/plan")
+
+
+def test_explain_prints_who_may_write_the_path(rules_env: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(capsys, *rules_env, "explain", "d1", "/billing/note")
+    assert code == 0 and (out["authority"], out["authority_from"]) == (["finance"], "/billing")
+    code, out, _ = run(capsys, *rules_env, "explain", "d1", "/phone")
+    assert (out["authority"], out["authority_from"]) == (None, None)
+
+
+def test_an_unauthorized_append_exits_1_and_the_reason_does_not_list_the_allowed_tiers(
+    rules_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(
+        capsys, *rules_env, "append", "d1", "--contributor", "alice", "--tier", "user", "--set", '/plan="pro"'
+    )
+    assert code == 1 and out["rejected"]["code"] == "NOT_AUTHORIZED"
+    assert "not authorized to write /plan" in err and "admin" not in err
+    assert out["rejected"]["reasons"][0]["rule"] == "authority"
+
+
+def test_a_rule_violation_exits_1_and_the_reason_does_not_repeat_the_value(
+    rules_env: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(
+        capsys, *rules_env, "append", "d1", "--contributor", "fin", "--tier", "user", "--role", "finance",
+        "--set", '/billing/note="SECRET-9"',
+    )  # fmt: skip
+    assert code == 1 and out["rejected"]["code"] == "VALIDATION_FAILED" and "SECRET-9" not in err and "pattern" in err
+    code, out, err = run(
+        capsys, *rules_env, "append", "d1", "--contributor", "root", "--tier", "admin", "--set", '/plan="gold-secret"'
+    )
+    assert code == 1 and "gold-secret" not in err and "one_of" in err
+
+
+def test_the_new_load_codes_exit_2(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]) -> None:
+    schema = tmp_path / "bad.schema.ion"
+    schema.write_text(
+        'schema::{id: "b", version: 1, tiers: [user], fields: {"/a": {type: int, merge: lww, authority: [], validate: []}}, document_validate: [range::{min: 1}]}'
+    )
+    code, out, _ = run(capsys, "--db", str(tmp_path / "b.db"), "schema", "check", str(schema))
+    assert code == 2 and {"EMPTY_AUTHORITY", "RULE_WRONG_PLACE"} <= set(out["codes"])

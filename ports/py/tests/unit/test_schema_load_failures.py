@@ -295,3 +295,27 @@ def test_computed_problems_are_reported_together_with_the_others() -> None:
     )
     found = codes_of(wrap(bad))
     assert {"UNKNOWN_DEPENDENCY", "DERIVED_HAS_MERGE_OR_DEFAULT"} <= found
+
+
+# -- feature 004: rule arguments, places, paths and authority lists --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fields, rules, code",
+    [
+        ('"/a": {type: int, merge: lww}, "/b": {type: int, merge: lww, validate: [all_or_none::{paths: ["/a", "/b"]}]}', "", "RULE_WRONG_PLACE"),
+        ('"/a": {type: int, merge: lww}', "range::{min: 1}", "RULE_WRONG_PLACE"),
+        ('"/a": {type: string, merge: lww, validate: [pattern::{regex: "(a"}]}', "", "BAD_BEHAVIOR_ARGS"),
+        ('"/a": {type: string, merge: lww, validate: [min_len]}', "", "BAD_BEHAVIOR_ARGS"),
+        ('"/a": {type: string, merge: lww, validate: [one_of::{values: []}]}', "", "BAD_BEHAVIOR_ARGS"),
+        ('"/a": {type: int, merge: lww}', 'all_or_none::{paths: ["/a"]}', "BAD_BEHAVIOR_ARGS"),
+        ('"/a": {type: int, merge: lww}', 'at_least_one::{paths: ["/a", "/nope"]}', "UNKNOWN_RULE_PATH"),
+        ('"/a": {type: int, merge: lww}, "/b": {type: int, merge: lww}', 'all_or_none::{paths: ["/a", "/b"]}, all_or_none::{paths: ["/a", "/b"]}', "DUPLICATE_RULE_SCOPE"),
+        ('"/a": {type: int, merge: lww, authority: []}', "", "EMPTY_AUTHORITY"),
+    ],
+)  # fmt: skip
+def test_the_rule_library_and_authority_checks_are_reported_with_stable_codes(
+    fields: str, rules: str, code: str
+) -> None:
+    top = f"document_validate: [{rules}]," if rules else ""
+    assert code in codes_of(wrap(fields, top=top))

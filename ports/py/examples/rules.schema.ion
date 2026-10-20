@@ -1,0 +1,33 @@
+// A schema for trying the rule library and authority from the command line:
+//   aduku --behaviors demo_rules --schema examples/rules.schema.ion ...   (with PYTHONPATH=examples)
+schema::{
+  id: "customer", version: 1,
+  tiers: [backfill, user, admin],
+  roles: [finance],
+  lenient: { allowed: [backfill] },
+
+  fields: {
+    // field rules
+    "/country": { type: string, merge: lww, validate: [pattern::{regex: "[A-Z]{2}"}] },
+    "/plan":    { type: string, merge: lww, authority: [admin], validate: [one_of::{values: ["free", "pro", "team"]}] },
+    "/name":    { type: string, merge: lww, validate: [min_len::{n: 2}, max_len::{n: 60}] },
+    "/tags":    { type: "list<string>", merge: lww, validate: [unique_items] },
+    "/taxId":   { type: string, merge: lww, validate: ['acme.tax_id'::{country: "DE", strict: true}] },
+
+    // authority: /billing is for finance, its children inherit that unless they say otherwise
+    "/billing":       { type: struct, merge: struct, authority: [finance] },
+    "/billing/note":  { type: string, merge: lww },
+    "/billing/limit": { type: int, merge: max, authority: [admin] },
+
+    // inputs of the document rules
+    "/street": { type: string, merge: lww }, "/city": { type: string, merge: lww }, "/zip": { type: string, merge: lww },
+    "/personalName": { type: string, merge: lww }, "/companyName": { type: string, merge: lww },
+    "/validFrom": { type: int, merge: lww }, "/validTo": { type: int, merge: lww }
+  },
+
+  document_validate: [
+    all_or_none::{paths: ["/street", "/city", "/zip"]},
+    at_most_one::{paths: ["/personalName", "/companyName"]},
+    ordered::{first: "/validFrom", second: "/validTo"}
+  ]
+}

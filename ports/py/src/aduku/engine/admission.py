@@ -16,7 +16,7 @@ from aduku.errors import ErrorCode, Reason
 from aduku.ion_codec import ABSENT, FrozenStruct
 from aduku.model import EntryInput, Identity
 from aduku.paths import Path, PathError, Segment, format_path, is_field_name, matches, parse_path
-from aduku.schema.model import FieldSpec, Schema, conforms
+from aduku.schema.model import Schema, conforms
 
 __all__ = ["check_request"]
 
@@ -76,8 +76,8 @@ def _check_entry(
 ) -> list[Reason]:
     found: list[Reason] = []
 
-    def add(code: ErrorCode, message: str) -> None:
-        found.append(Reason(code, message, entry_index=index, path=entry.path))
+    def add(code: ErrorCode, message: str, rule: str | None = None) -> None:
+        found.append(Reason(code, message, entry_index=index, rule=rule, path=entry.path))
 
     if entry.tier not in schema.tiers:
         add(ErrorCode.TIER_NOT_PERMITTED, f"tier {entry.tier!r} is not defined by the schema")
@@ -114,26 +114,32 @@ def _check_entry(
         else:
             found.extend(_check_children(schema, ctx, index, entry, path, contributor))
 
-    if not _may_write(field, entry.tier, contributor):
-        add(ErrorCode.NOT_AUTHORIZED, f"only {', '.join(field.authority or ())} may write {field.pattern}")
+    if not _may_write(schema, path, entry.tier, contributor):
+        add(ErrorCode.NOT_AUTHORIZED, f"not authorized to write {field.pattern}", "authority")
     if entry.op == "delete":  # a delete wipes everything beneath the path, so the children's rules apply to it too
         for child in schema.fields:
             below = child.path_pattern
-            if (
-                len(below) > len(path)
-                and matches(below[: len(path)], path)
-                and not _may_write(child, entry.tier, contributor)
-            ):
-                add(
-                    ErrorCode.NOT_AUTHORIZED,
-                    f"only {', '.join(child.authority or ())} may write {child.pattern}, which this delete wipes",
-                )
-                break
+            if len(below) > len(path) and matches(below[: len(path)], path):
+                declared = schema.authority_of(child)
+                if declared is not None and not _allowed(declared[0], entry.tier, contributor):
+                    add(
+                        ErrorCode.NOT_AUTHORIZED,
+                        f"not authorized to write {child.pattern}, which this delete wipes",
+                        "authority",
+                    )
+                    break
     return found
 
 
-def _may_write(field: FieldSpec, tier: str, contributor: Identity) -> bool:
-    return field.authority is None or tier in field.authority or bool(set(contributor.roles) & set(field.authority))
+def _allowed(authority: tuple[str, ...], tier: str, contributor: Identity) -> bool:
+    """One of the entry's tier or the contributor's roles is in the list (SPEC 11)."""
+    return tier in authority or bool(set(contributor.roles) & set(authority))
+
+
+def _may_write(schema: Schema, path: Path, tier: str, contributor: Identity) -> bool:
+    """Whether the effective authority of `path` (its own list, else the nearest above it) lets this entry write it."""
+    declared = schema.authority_for(path)
+    return declared is None or _allowed(declared[0], tier, contributor)
 
 
 def _bad_keys(ctx: SchemaMergeContext, path: Path, value: Any) -> list[Path]:
@@ -154,8 +160,8 @@ def _check_children(
     child must be writable by this contributor, not derived, typed right and mergeable by its rule."""
     found: list[Reason] = []
 
-    def add(code: ErrorCode, message: str) -> None:
-        found.append(Reason(code, message, entry_index=index, path=entry.path))
+    def add(code: ErrorCode, message: str, rule: str | None = None) -> None:
+        found.append(Reason(code, message, entry_index=index, rule=rule, path=entry.path))
 
     for bad in _bad_keys(ctx, path, entry.value):
         add(
@@ -181,8 +187,8 @@ def _check_children(
                     f"operation 'set' is not allowed for {where}, which this struct write sets",
                 )
                 continue
-            if not _may_write(field, entry.tier, contributor):
-                add(ErrorCode.NOT_AUTHORIZED, f"only {', '.join(field.authority or ())} may write {where}")
+            if not _may_write(schema, child, entry.tier, contributor):
+                add(ErrorCode.NOT_AUTHORIZED, f"not authorized to write {where}", "authority")
                 continue
             if field.type is not None and not conforms(field.type, state):
                 add(ErrorCode.TYPE_MISMATCH, f"the value of {where} does not conform to type {field.type}")

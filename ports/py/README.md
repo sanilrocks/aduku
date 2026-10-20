@@ -1,7 +1,7 @@
 # aduku-py
 
 The Python port of **aduku**: an append-only ledger of contributions merged into documents by a central annotated schema
-(Document Oriented Design): the core ledger and merge engine (feature 001) computed fields (feature 002) and deferred fields (feature 003). The specification is
+(Document Oriented Design): the core ledger and merge engine (feature 001) computed fields (feature 002), deferred fields (feature 003) and the validation rule library with per-field authority (feature 004). The specification is
 [`docs/SPEC.md`](../../docs/SPEC.md); the shared test vectors are in [`conformance/`](../../conformance).
 
 ## Install
@@ -69,6 +69,37 @@ The command line has the same operations (`aduku get --fresh --include pending`,
 `deferred list`); try them with [`examples/demo_sources.py`](examples/demo_sources.py) and
 [`examples/deferred.schema.ion`](examples/deferred.schema.ion), as in
 [`quickstart.md`](../../specs/003-deferred-fields/quickstart.md).
+
+### Validation rules and authority
+
+Rules check values and the whole document; authority says who may write a field. A schema uses them like this:
+
+```
+"/country": { type: string, merge: lww, validate: [pattern::{regex: "[A-Z]{2}"}] },
+"/plan":    { type: string, merge: lww, authority: [admin], validate: [one_of::{values: ["free", "pro"]}] },
+"/billing": { type: struct, merge: struct, authority: [finance] },        // its children inherit [finance]
+document_validate: [at_most_one::{paths: ["/personalName", "/companyName"]}]
+```
+
+Field rules: `non_empty`, `range`, `max_len`, `min_len`, `pattern` (a small linear-time subset), `one_of`, `unique_items`. Document
+rules: `all_or_none`, `at_least_one`, `at_most_one`, `ordered`. A rejected request lists every reason without repeating a value;
+a permitted lenient write records model errors instead; authority is never bypassed by the flag. A deployment adds its own
+rule with typed arguments, which the loader checks on every use:
+
+```python
+behaviors.register_validate(
+    "acme.tax_id",
+    1,
+    check,
+    args=[ArgSpec("country", "text"), ArgSpec("strict", "bool", required=False)],
+    applies="field",
+)
+```
+
+`aduku schema check` lists every field's effective authority and rules; `explain` says who may write a path and where that was
+declared. Try it with [`examples/rules.schema.ion`](examples/rules.schema.ion) and [`examples/demo_rules.py`](examples/demo_rules.py), as in
+[`quickstart.md`](../../specs/004-validation-authority/quickstart.md); the rules are in
+[`contracts/rules.md`](../../specs/004-validation-authority/contracts/rules.md).
 
 The full API is in
 [`contracts/library-api.md`](../../specs/001-core-ledger-merge-engine/contracts/library-api.md) and, for computed fields and

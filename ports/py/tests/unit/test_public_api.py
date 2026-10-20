@@ -39,3 +39,11 @@ def test_every_type_the_deferred_fields_contract_names_is_importable() -> None:
     from aduku import DeferredInfo, DeferredStatus, SchedulerReport  # noqa: F401
 
     assert {"DeferredInfo", "DeferredStatus", "SchedulerReport"} <= set(aduku.__all__)
+
+
+def test_the_argument_declaration_of_a_rule_is_importable() -> None:
+    """contracts/library-api.md (feature 004): rules are registered with ArgSpec arguments."""
+    import aduku
+    from aduku import ArgSpec  # noqa: F401
+
+    assert "ArgSpec" in aduku.__all__

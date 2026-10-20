@@ -162,6 +162,9 @@ class Explanation:
     # For a deferred path (feature 003): its status in the derived store and when the value shown is from.
     status: str | None = None
     as_of: datetime | None = None
+    # Who may write the path (tiers and roles; None: any permitted tier) and the field pattern that declared the list.
+    authority: tuple[str, ...] | None = None
+    authority_from: str | None = None
 
 
 @dataclass(frozen=True)

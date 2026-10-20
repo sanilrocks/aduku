@@ -77,3 +77,11 @@ def test_the_deferred_planner_and_schedule_are_pure_modules() -> None:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
         assert calls & CLOCK_CALLS == set(), f"{name} reads a clock"
+
+
+def test_the_pattern_matcher_is_a_pure_module_of_its_own() -> None:
+    """Feature 004 (research R-2): the `pattern` subset has its own matcher, not the host's `re` (not portable, not linear)."""
+    path = SRC / "behaviors" / "pattern.py"
+    assert path.exists(), "behaviors/pattern.py is missing"
+    names = _imports(path)
+    assert "re" not in names and not any(n == b or n.startswith(b + ".") for n in names for b in FORBIDDEN)

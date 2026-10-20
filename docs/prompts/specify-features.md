@@ -86,6 +86,8 @@ P3 pending state holds dependent deferred fields back.
 
 ## Feature 4: Validation and authority
 
+*Done: specified, planned and implemented in `specs/004-validation-authority/` (2026-10-20).*
+
 Add contribution-level and document-level validation, and per-field authority. Read SPEC 10, 11.
 
 **Why:** Reject bad or unauthorized contributions early, and detect when valid contributions yield an invalid

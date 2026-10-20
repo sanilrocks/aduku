@@ -135,6 +135,40 @@ case::{
     // several problems at once are all reported
     { load_schema: '''schema::{id: "t", version: 1, tiers: [a, a], rejection_audit: {enabled: true},
           fields: {"/x": {type: bool, merge: max}, "/y": {type: int, merge: telepathy}}}''',
-      expect: { problems: [DUPLICATE_TIER, AUDIT_RETENTION_REQUIRED, MERGE_TYPE_UNSUITABLE, UNKNOWN_BEHAVIOR] } }
+      expect: { problems: [DUPLICATE_TIER, AUDIT_RETENTION_REQUIRED, MERGE_TYPE_UNSUITABLE, UNKNOWN_BEHAVIOR] } },
+
+    // feature 004: the rule library and authority
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], roles: [ops],
+          document_validate: [at_least_one::{paths: ["/a", "/b"]}, ordered::{first: "/a", second: "/b"}, all_or_none::{paths: ["/a", "/b"]}],
+          fields: {"/a": {type: int, merge: lww, validate: [min_len::{n: 1}, one_of::{values: [1, 2]}, unique_items, max_len::{n: 3}]},
+                   "/b": {type: string, merge: lww, authority: [a, ops], validate: [pattern::{regex: "[a-z]+"}]}}}''',
+      expect: { ok: true } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: int, merge: lww},
+          "/b": {type: int, merge: lww, validate: [all_or_none::{paths: ["/a", "/b"]}]}}}''',
+      expect: { problems: [RULE_WRONG_PLACE] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], document_validate: [range::{min: 1}], fields: {"/a": {type: int, merge: lww}}}''',
+      expect: { problems: [RULE_WRONG_PLACE] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: string, merge: lww, validate: [pattern::{regex: "(a"}]}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: string, merge: lww, validate: [min_len]}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: string, merge: lww, validate: [one_of::{values: []}]}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: string, merge: lww, validate: [max_len::{n: 3, extra: 1}]}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], document_validate: [all_or_none::{paths: ["/a"]}], fields: {"/a": {type: int, merge: lww}}}''',
+      expect: { problems: [BAD_BEHAVIOR_ARGS] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], document_validate: [at_least_one::{paths: ["/a", "/nope"]}], fields: {"/a": {type: int, merge: lww}}}''',
+      expect: { problems: [UNKNOWN_RULE_PATH] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], document_validate: [at_least_one::{paths: ["/score", "/name"]}], fields: {
+          "/name": {type: string, merge: lww},
+          "/score": {type: int, deferred: {hook: "fx.score@1", depends: ["/name"], refresh: once, invalidate_by: [a]}}}}''',
+      expect: { problems: [DEPENDS_ON_DEFERRED] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], document_validate: [
+          all_or_none::{paths: ["/a", "/b"]}, all_or_none::{paths: ["/a", "/c"]}], fields: {
+          "/a": {type: int, merge: lww}, "/b": {type: int, merge: lww}, "/c": {type: int, merge: lww}}}''',
+      expect: { problems: [DUPLICATE_RULE_SCOPE] } },
+    { load_schema: '''schema::{id: "t", version: 1, tiers: [a], fields: {"/a": {type: int, merge: lww, authority: []}}}''',
+      expect: { problems: [EMPTY_AUTHORITY] } }
   ]
 }

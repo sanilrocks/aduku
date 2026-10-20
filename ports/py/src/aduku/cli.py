@@ -210,7 +210,29 @@ def _inventory(schema: Schema) -> dict[str, Any]:
         for spec in schema.fields
         if spec.deferred is not None
     ]
-    return {"computed": computed, "impure": impure, "deferred": deferred}
+    field_rules = []
+    for spec in schema.fields:
+        declared = schema.authority_of(spec)
+        field_rules.append(
+            {
+                "field": spec.pattern,
+                "authority": list(declared[0]) if declared else None,
+                "authority_from": declared[1] if declared else None,
+                "rules": [_rule(ref) for ref in spec.validate],
+            }
+        )
+    return {
+        "computed": computed,
+        "impure": impure,
+        "deferred": deferred,
+        "field_rules": field_rules,
+        "document_rules": [_rule(ref) for ref in schema.document_validate],
+    }
+
+
+def _rule(ref: Any) -> dict[str, Any]:
+    """A use of a validation rule, as the schema check lists it."""
+    return {"rule": f"{ref.name}@{ref.version}", "args": to_canonical(ref.args)}
 
 
 def _check_schema(args: argparse.Namespace) -> int:
@@ -345,6 +367,8 @@ def _run(args: argparse.Namespace, service: Aduku) -> int:
                     ],
                     "effect_seq": why.effect_seq,
                     "status": why.status,
+                    "authority": list(why.authority) if why.authority is not None else None,
+                    "authority_from": why.authority_from,
                     "as_of": why.as_of.isoformat() if why.as_of else None,
                 },
             )

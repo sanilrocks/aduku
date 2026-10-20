@@ -1,0 +1,71 @@
+// Feature 004, US1: the field rules min_len, pattern, one_of and unique_items (and the three older ones) at admission,
+// as model errors under the non-rejection flag, and on a computed value. A reason never repeats the submitted value.
+case::{
+  name: "validation-rules",
+  schema:
+  schema::{
+    id: "rules", version: 1,
+    tiers: [backfill, user, admin],
+    lenient: { allowed: [backfill] },
+    fields: {
+      "/country": { type: string, merge: lww, validate: [pattern::{regex: "[A-Z]{2}"}] },
+      "/plan":    { type: string, merge: lww, validate: [one_of::{values: ["free", "pro", "team"]}] },
+      "/name":    { type: string, merge: lww, validate: [min_len::{n: 3}, max_len::{n: 8}] },
+      "/tags":    { type: "list<string>", merge: lww, validate: [unique_items] },
+      "/age":     { type: int, merge: max, validate: [range::{min: 0, max: 150}, min_len::{n: 5}, pattern::{regex: "x"}, unique_items] },
+      "/ref":     { type: string, merge: lww },
+      "/code":    { type: string, computed: { macro: upper, args: ["/ref"] }, validate: [pattern::{regex: "[A-Z]{2}"}] }
+    }
+  },
+  steps: [
+    // good values are accepted, at the edge of each rule
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/country", value: "US"}, {tier: user, path: "/plan", value: "team"},
+        {tier: user, path: "/name", value: "Bob"}, {tier: user, path: "/tags", value: ["a", "b"]},
+        {tier: user, path: "/age", value: 150}, {tier: user, path: "/ref", value: "de"}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}, {seq: 4}, {seq: 5}, {seq: 6}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/name", value: "Elizabet"}] }, expect: { accepted: [{seq: 7}] } },
+    { get: "d1", expect: { model_errors: [] } },
+
+    // each bad value is rejected, naming the field and the rule
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/country", value: "usa"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/country", rule: pattern}] } } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/plan", value: "gold"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/plan", rule: one_of}] } } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Bo"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/name", rule: min_len}] } } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/name", value: "Elizabeth Ann"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/name", rule: max_len}] } } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/tags", value: ["a", "b", "a"]}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/tags", rule: unique_items}] } } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 200}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/age", rule: range}] } } },
+
+    // two bad values: both reasons, nothing recorded
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/country", value: "usa"}, {tier: user, path: "/plan", value: "gold"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/country", rule: pattern}, {path: "/plan", rule: one_of}] } } },
+    { get: "d2", expect: { document: '{code:computed::null}' } },     // nothing was recorded; the computed field has no input
+
+    // a rule on a computed value judges the computed value
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/ref", value: "usa"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/code", rule: pattern}] } } },
+
+    // the non-rejection flag: a permitted tier records the violations as model errors; another tier is refused
+    { append: { doc: "d3", contributor: {id: "job", tiers: [backfill]}, lenient: true, entries: [
+        {tier: backfill, path: "/country", value: "usa"}, {tier: backfill, path: "/plan", value: "gold"},
+        {tier: backfill, path: "/tags", value: ["a", "a"]}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { get: "d3", expect: { model_errors: [{rule: pattern, path: "/country"}, {rule: one_of, path: "/plan"}, {rule: unique_items, path: "/tags"}] } },
+    { append: { doc: "d4", contributor: {id: "alice", tiers: [user]}, lenient: true, entries: [{tier: user, path: "/country", value: "US"}] },
+      expect: { rejected: { code: LENIENT_NOT_PERMITTED } } },
+
+    // a rule does not judge a kind of value it does not apply to
+    { append: { doc: "d5", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/age", value: 3}] },
+      expect: { accepted: [{seq: 1}] } },
+    { get: "d5", expect: { model_errors: [] } },
+
+    { rebuild: "d3", expect: { identical: true } }
+  ]
+}

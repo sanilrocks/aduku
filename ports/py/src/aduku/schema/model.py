@@ -361,6 +361,37 @@ class Schema:
                 return spec
         return None
 
+    def authority_of(self, spec: FieldSpec) -> tuple[tuple[str, ...], str] | None:
+        """The effective authority of a declared field: its own list, else the nearest one on a declared parent pattern."""
+        return self._authority_table.get(spec.pattern)
+
+    @cached_property
+    def _authority_table(self) -> dict[str, tuple[tuple[str, ...], str]]:
+        """Every declared field with an effective authority, worked out once (the delete rule asks for each field)."""
+        table: dict[str, tuple[tuple[str, ...], str]] = {}
+        for spec in self.fields:
+            if spec.authority is not None:
+                table[spec.pattern] = (spec.authority, spec.pattern)
+                continue
+            pattern = spec.path_pattern
+            for length in range(len(pattern) - 1, 0, -1):
+                parent = self._index.get(pattern[:length])
+                if parent is not None and parent.authority is not None:
+                    table[spec.pattern] = (parent.authority, parent.pattern)
+                    break
+        return table
+
+    def authority_for(self, path: Sequence[Any]) -> tuple[tuple[str, ...], str] | None:
+        """Who may write `path`, and the field that said so: the first `authority` list found at the path's own pattern and
+        then at its parents', so a child without a list takes its parent's and a child's own list replaces it. None means
+        any permitted tier (SPEC 11, feature 004)."""
+        key = tuple(path)
+        for length in range(len(key), 0, -1):
+            spec = self.field_for(key[:length])
+            if spec is not None and spec.authority is not None:
+                return spec.authority, spec.pattern
+        return None
+
     @cached_property
     def _index(self) -> dict[Path, FieldSpec]:
         """Parsed patterns, computed once per schema."""

@@ -73,3 +73,14 @@ The harness uses one manual clock for wall time and monotonic time. Steps added 
 Cases: `deferred-policies` (`once`, `per_fetch`, `scheduled`), `deferred-notifications` (`notification`, a field with combined policies, a rate limit and the run's time budget; the case option `scheduler_budget` sets the budget), `deferred-failures` (the three
 `on_failure` modes, retries, the circuit breaker, a write never rejected), `deferred-promises` (chains, pending, stale accepted),
 and the extended `worked-example-16-1` (`creditScore` and `fxRate`) and `schema-load-failures`.
+
+## Feature 004: validation rules and authority
+
+Cases added: `validation-rules` (each field rule with good and bad values, a lenient write recorded as model errors, two reasons listed
+together), `document-rules` (the four document rules, null as no value, incomparable kinds, the no-new-errors rule, a schema version that
+adds a rule), `authority` (tier, role, inheritance, override, wildcard, a delete across declared children, several entries, the lenient flag,
+a derived path) and the extended `schema-load-failures`.
+
+New `explain` expectations: `authority` (a list of tiers and roles, or `null` for any permitted tier) and `authority_from` (the field
+pattern that declared the list, or `null`). A rejected `append` may list `reasons: [{ path, rule }]`; a port also checks that no reason
+text contains a value the request submitted. The 16.1 and 16.2 vectors are unchanged.

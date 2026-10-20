@@ -320,7 +320,15 @@ def _append(step: Step, service: Any, label: str) -> None:
         assert wanted is not None, f"{label}: unexpected rejection {error}"
         assert error.code.value == str(wanted["code"]), f"{label}: code {error.code.value} != {wanted['code']}"
         for reason in wanted.get("reasons", ()):
-            assert any(r.path == reason.get("path") for r in error.reasons), f"{label}: missing reason for {reason}"
+            assert any(
+                r.path == reason.get("path") and (reason.get("rule") is None or r.rule == str(reason["rule"]))
+                for r in error.reasons
+            ), f"{label}: missing reason for {reason}"
+        # a reason states the constraint and never repeats a value the request submitted (feature 004, FR-008)
+        text = " ".join(f"{r.message} {r.rule}" for r in error.reasons)
+        for entry in entries:
+            if isinstance(entry.value, str) and len(entry.value) >= 3:
+                assert entry.value not in text, f"{label}: a reason repeats the submitted value {entry.value!r}"
         return
     wanted_rejection = step.expect.get("rejected")
     assert wanted_rejection is None, (

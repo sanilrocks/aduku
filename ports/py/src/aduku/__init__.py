@@ -10,7 +10,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from aduku.behaviors.registry import BehaviorRegistry
+    from aduku.behaviors.registry import ArgSpec, BehaviorRegistry
     from aduku.errors import AdukuError, ComputeFault, RejectedError, SchemaError, StorageError
     from aduku.hooks import HookRunner
     from aduku.model import (
@@ -37,6 +37,7 @@ _EXPORTS = {
     "Aduku": "aduku.service",
     "AdukuError": "aduku.errors",
     "AppendResult": "aduku.model",
+    "ArgSpec": "aduku.behaviors.registry",
     "BehaviorRegistry": "aduku.behaviors.registry",
     "Clock": "aduku.storage.base",
     "ComputeFault": "aduku.errors",
@@ -65,6 +66,7 @@ __all__ = [
     "Aduku",
     "AdukuError",
     "AppendResult",
+    "ArgSpec",
     "BehaviorRegistry",
     "Clock",
     "ComputeFault",

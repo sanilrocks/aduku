@@ -1,0 +1,87 @@
+// Feature 004, US2: who may write a field. A field takes the nearest authority list at its own pattern or a parent's; its own
+// list replaces the parent's; a role counts like a tier; a delete needs the authority of every declared field beneath it; the
+// non-rejection flag never passes authority. A reason names the field and the rule, never the allowed list.
+case::{
+  name: "authority",
+  schema:
+  schema::{
+    id: "authority", version: 1,
+    tiers: [backfill, user, admin],
+    roles: [finance, ops],
+    lenient: { allowed: [backfill] },
+    fields: {
+      "/plan":           { type: string, merge: lww, authority: [admin] },
+      "/free":           { type: string, merge: lww },
+      "/billing":        { type: struct, merge: struct, authority: [finance] },
+      "/billing/note":   { type: string, merge: lww },
+      "/billing/limit":  { type: int, merge: max, authority: [admin] },
+      "/billing/tax":    { type: struct, merge: struct },
+      "/billing/tax/rate": { type: int, merge: max },
+      "/w":              { type: struct, merge: struct },
+      "/w/*":            { type: string, merge: lww, authority: [ops] },
+      "/shout":          { type: string, computed: { macro: upper, args: ["/free"] }, authority: [admin] }
+    }
+  },
+  steps: [
+    // a tier in the list; a tier that is not
+    { append: { doc: "d1", contributor: {id: "root", tiers: [user, admin]}, entries: [{tier: admin, path: "/plan", value: "pro"}] },
+      expect: { accepted: [{seq: 1}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/plan", value: "free"}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/plan", rule: authority}] } } },
+
+    // a role counts whatever the tier
+    { append: { doc: "d1", contributor: {id: "fin", tiers: [user], roles: [finance]}, entries: [{tier: user, path: "/billing/note", value: "n"}] },
+      expect: { accepted: [{seq: 2}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/billing/note", value: "m"}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/billing/note", rule: authority}] } } },
+
+    // inheritance through two levels; a child's own list replaces its parent's
+    { append: { doc: "d1", contributor: {id: "fin", tiers: [user], roles: [finance]}, entries: [{tier: user, path: "/billing/tax/rate", value: 5}] },
+      expect: { accepted: [{seq: 3}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/billing/tax/rate", value: 6}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/billing/tax/rate", rule: authority}] } } },
+    { append: { doc: "d1", contributor: {id: "fin", tiers: [user], roles: [finance]}, entries: [{tier: user, path: "/billing/limit", value: 9}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/billing/limit", rule: authority}] } } },
+    { append: { doc: "d1", contributor: {id: "root", tiers: [user, admin]}, entries: [{tier: admin, path: "/billing/limit", value: 9}] },
+      expect: { accepted: [{seq: 4}] } },
+
+    // a wildcard field with a list, and a field with none
+    { append: { doc: "d1", contributor: {id: "op", tiers: [user], roles: [ops]}, entries: [{tier: user, path: "/w/anything", value: "x"}] },
+      expect: { accepted: [{seq: 5}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/w/anything", value: "y"}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/w/anything", rule: authority}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/free", value: "ok"}] },
+      expect: { accepted: [{seq: 6}] } },
+
+    // a delete needs the authority of every declared field beneath the path
+    { append: { doc: "d1", contributor: {id: "fin", tiers: [user], roles: [finance]}, entries: [{tier: user, path: "/billing", op: delete}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/billing", rule: authority}] } } },
+    { append: { doc: "d1", contributor: {id: "both", tiers: [user, admin], roles: [finance]}, entries: [{tier: admin, path: "/billing", op: delete}] },
+      expect: { accepted: [{seq: 7}] } },
+
+    // several entries: every unauthorized one is listed and nothing is recorded
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/plan", value: "x"}, {tier: user, path: "/free", value: "fine"}, {tier: user, path: "/billing/note", value: "z"}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/plan", rule: authority}, {path: "/billing/note", rule: authority}] } } },
+    { get: "d1", expect: { document: '{free:"ok",plan:"pro",shout:computed::"OK",w:{anything:"x"}}' } },
+
+    // the non-rejection flag never passes authority; a tier that may not use the flag is refused for that
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, lenient: true, entries: [{tier: backfill, path: "/plan", value: "pro"}] },
+      expect: { rejected: { code: NOT_AUTHORIZED, reasons: [{path: "/plan", rule: authority}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, lenient: true, entries: [{tier: user, path: "/free", value: "x"}] },
+      expect: { rejected: { code: LENIENT_NOT_PERMITTED } } },
+
+    // a derived path is never writable, whatever its authority list
+    { append: { doc: "d1", contributor: {id: "root", tiers: [user, admin]}, entries: [{tier: admin, path: "/shout", value: "HACKED"}] },
+      expect: { rejected: { code: FIELD_NOT_WRITABLE, reasons: [{path: "/shout"}] } } },
+
+    // explain says who may write and where that was declared
+    { explain: { doc: "d1", path: "/plan" }, expect: { authority: [admin], authority_from: "/plan" } },
+    { explain: { doc: "d1", path: "/billing/note" }, expect: { authority: [finance], authority_from: "/billing" } },
+    { explain: { doc: "d1", path: "/billing/limit" }, expect: { authority: [admin], authority_from: "/billing/limit" } },
+    { explain: { doc: "d1", path: "/w/anything" }, expect: { authority: [ops], authority_from: "/w/*" } },
+    { explain: { doc: "d1", path: "/free" }, expect: { authority: null, authority_from: null } },
+
+    { rebuild: "d1", expect: { identical: true } }
+  ]
+}

@@ -1,0 +1,95 @@
+// Feature 004, US3: the document rules all_or_none, at_least_one, at_most_one and ordered, checked on the merged document after
+// all the entries of a request. Null counts as no value. A rule that needs a field already reports on an empty document, so a
+// first write adds no new error. A schema version that adds a rule shows the violation attributed to the version.
+case::{
+  name: "document-rules",
+  schemas: [
+    schema::{
+      id: "docrules", version: 1,
+      tiers: [backfill, user],
+      lenient: { allowed: [backfill] },
+      fields: {
+        "/street": { type: string, merge: lww }, "/city": { type: string, merge: lww }, "/zip": { type: any, merge: lww },
+        "/phone": { type: string, merge: lww }, "/email": { type: string, merge: lww },
+        "/personal": { type: string, merge: lww }, "/company": { type: string, merge: lww },
+        "/from": { type: int, merge: lww }, "/to": { type: int, merge: lww },
+        "/lo": { type: any, merge: lww }, "/hi": { type: any, merge: lww }, "/note": { type: string, merge: lww }
+      },
+      document_validate: [
+        all_or_none::{paths: ["/street", "/city", "/zip"]},
+        at_least_one::{paths: ["/phone", "/email"]},
+        at_most_one::{paths: ["/personal", "/company"]},
+        ordered::{first: "/from", second: "/to"}
+      ]
+    },
+    schema::{
+      id: "docrules", version: 2,
+      tiers: [backfill, user],
+      lenient: { allowed: [backfill] },
+      fields: {
+        "/street": { type: string, merge: lww }, "/city": { type: string, merge: lww }, "/zip": { type: any, merge: lww },
+        "/phone": { type: string, merge: lww }, "/email": { type: string, merge: lww },
+        "/personal": { type: string, merge: lww }, "/company": { type: string, merge: lww },
+        "/from": { type: int, merge: lww }, "/to": { type: int, merge: lww },
+        "/lo": { type: any, merge: lww }, "/hi": { type: any, merge: lww }, "/note": { type: string, merge: lww }
+      },
+      document_validate: [
+        all_or_none::{paths: ["/street", "/city", "/zip"]},
+        at_least_one::{paths: ["/phone", "/email"]},
+        at_most_one::{paths: ["/personal", "/company"]},
+        ordered::{first: "/from", second: "/to"},
+        ordered::{first: "/lo", second: "/hi"}
+      ]
+    }
+  ],
+  steps: [
+    // entries that satisfy the rules only together are one request; the first write fixes the empty document's missing phone
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/phone", value: "555"}, {tier: user, path: "/street", value: "1 Main"},
+        {tier: user, path: "/city", value: "Paris"}, {tier: user, path: "/zip", value: "75001"},
+        {tier: user, path: "/from", value: 1}, {tier: user, path: "/to", value: 2}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}, {seq: 4}, {seq: 5}, {seq: 6}] } },
+    { get: "d1", expect: { model_errors: [] } },
+
+    // each rule broken by a request is rejected, naming the rule and its first path; nothing is recorded
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/city", op: delete}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/street", rule: all_or_none}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/zip", value: null}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/street", rule: all_or_none}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/phone", op: delete}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/phone", rule: at_least_one}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/personal", value: "Pat"}, {tier: user, path: "/company", value: "Acme"}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/personal", rule: at_most_one}] } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/from", value: 9}] },
+      expect: { rejected: { code: VALIDATION_FAILED, reasons: [{path: "/from", rule: ordered}] } } },
+    { get: "d1", expect: { model_errors: [] } },
+
+    // a permitted lenient write records the violation as a model error
+    { append: { doc: "d1", contributor: {id: "job", tiers: [backfill]}, lenient: true, entries: [
+        {tier: backfill, path: "/personal", value: "Pat"}, {tier: backfill, path: "/company", value: "Acme"}] },
+      expect: { accepted: [{seq: 7}, {seq: 8}] } },
+    { get: "d1", expect: { model_errors: [{rule: at_most_one, path: "/personal"}] } },
+
+    // no-new-errors: a request that adds none is accepted although the error remains; one that adds another is not
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/note", value: "hi"}] },
+      expect: { accepted: [{seq: 9}] } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/zip", op: delete}] },
+      expect: { rejected: { code: MODEL_ERROR_INTRODUCED } } },
+    { append: { doc: "d1", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/company", op: delete}] },
+      expect: { accepted: [{seq: 10}] } },
+    { get: "d1", expect: { model_errors: [] } },
+
+    // values that cannot be ordered are a violation; a schema version that adds the rule shows it, attributed to the version
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [
+        {tier: user, path: "/phone", value: "1"}, {tier: user, path: "/lo", value: 5}, {tier: user, path: "/hi", value: "five"}] },
+      expect: { accepted: [{seq: 1}, {seq: 2}, {seq: 3}] } },
+    { get: "d2", expect: { model_errors: [] } },
+    { activate_schema: 2 },
+    { get: "d2", expect: { model_errors: [{rule: ordered, path: "/lo"}] } },
+    { append: { doc: "d2", contributor: {id: "alice", tiers: [user]}, entries: [{tier: user, path: "/hi", value: 9}] },
+      expect: { accepted: [{seq: 4}] } },
+    { get: "d2", expect: { model_errors: [] } },
+    { rebuild: "d2", expect: { identical: true } }
+  ]
+}

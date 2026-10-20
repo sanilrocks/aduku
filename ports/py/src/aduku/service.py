@@ -593,7 +593,9 @@ class Aduku:
             raise RejectedError(ErrorCode.UNKNOWN_PATH, message="the schema does not declare this path")
         derived = schema.derived_field_at_or_above(parsed)
         if derived is not None and derived.derived == "deferred":
-            return self._deferred.explain(schema, doc, self._core(doc, schema), derived.pattern, path)
+            return self._with_authority(
+                schema, parsed, self._deferred.explain(schema, doc, self._core(doc, schema), derived.pattern, path)
+            )
         ready = self._engine(schema)
         if ready.has_impure:
             self.get(doc)  # makes sure every impure field has an outcome for its current inputs
@@ -601,7 +603,15 @@ class Aduku:
             entries = tx.entries(doc, 0)
             effects = self._effect_view(tx, ready, doc)
         errors = self._replay(schema, entries, effects=effects).final.errors  # of the same entries, so one snapshot
-        return explain_path(schema, self.behaviors, ready, entries, path, errors, effects)
+        return self._with_authority(
+            schema, parsed, explain_path(schema, self.behaviors, ready, entries, path, errors, effects)
+        )
+
+    @staticmethod
+    def _with_authority(schema: Schema, parsed: Any, explanation: Explanation) -> Explanation:
+        """Add who may write the path and which field said so (SPEC 11); nobody can write a derived path."""
+        found = None if schema.derived_field_at_or_above(parsed) is not None else schema.authority_for(parsed)
+        return replace(explanation, authority=found[0] if found else None, authority_from=found[1] if found else None)
 
     def _kept_view(self, doc: str) -> ViewRow | None:
         with self._states_lock:

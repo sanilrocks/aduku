@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
-from aduku.behaviors.registry import BehaviorRegistry
+from aduku.behaviors.registry import BehaviorRegistry, arg_problems
 from aduku.engine.schedule import ScheduleError, parse_schedule
 from aduku.errors import SchemaError
 from aduku.ion_codec import Annotated, FrozenStruct, IonError, Symbol, parse
@@ -184,7 +185,7 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
 
     document_validate = _refs(top.get("document_validate", ()), "document_validate", problems)
     for ref in document_validate:
-        _check_validator("document_validate", ref, behaviors, problems)
+        _check_validator("document_validate", ref, behaviors, problems, "document")
 
     schema = Schema(
         id=schema_id if isinstance(schema_id, str) else "",
@@ -200,7 +201,9 @@ def _build(top: FrozenStruct, problems: list[str], behaviors: BehaviorRegistry) 
         deferred_on_failure=str(on_failure),
     )
     _check_computed(schema, behaviors, problems)
-    _semantic(schema, problems)  # runs even after structural problems, so that everything is reported together
+    _semantic(
+        schema, behaviors, problems
+    )  # runs even after structural problems, so that everything is reported together
     return None if problems else schema
 
 
@@ -308,6 +311,10 @@ def _field(
     if failure_mode is not None and failure_mode not in FAILURE_MODES:
         problems.append(f"{where}: failure_mode must be one of {sorted(FAILURE_MODES)}, not {failure_mode!r}")
     authority = _names(raw["authority"], f"{where}: authority", problems) if "authority" in raw else None
+    if authority is not None and not authority:
+        problems.append(
+            f"EMPTY_AUTHORITY: {where}: authority lists no tier or role; leave it out to let any permitted tier write"
+        )
     for name in authority or ():
         if name not in names:
             problems.append(
@@ -736,12 +743,19 @@ def _valid_type(text: str) -> bool:
     return True
 
 
-def _check_validator(where: str, ref: BehaviorRef, behaviors: BehaviorRegistry, problems: list[str]) -> None:
+def _check_validator(
+    where: str, ref: BehaviorRef, behaviors: BehaviorRegistry, problems: list[str], place: str = "field"
+) -> None:
     behavior = behaviors.get(ref.name, ref.version)
     if behavior is None or behavior.kind != "validate":
         problems.append(f"UNKNOWN_BEHAVIOR: {where}: no validator {ref.name}@{ref.version} is registered")
-    elif behavior.check_args is not None:
-        for problem in behavior.check_args(ref.args):
+    else:
+        if behavior.applies not in ("either", place):
+            problems.append(
+                f"RULE_WRONG_PLACE: {where}: {ref.name}@{ref.version} is a {behavior.applies} rule"
+                f" and cannot be used as a {place} rule"
+            )
+        for problem in arg_problems(behavior, ref.args):
             problems.append(f"BAD_BEHAVIOR_ARGS: {where}: {ref.name}@{ref.version}: {problem}")
 
 
@@ -830,7 +844,7 @@ def _paths_in(value: Any) -> list[str]:
     return found
 
 
-def _semantic(schema: Schema, problems: list[str]) -> None:
+def _semantic(schema: Schema, behaviors: BehaviorRegistry, problems: list[str]) -> None:
     for tier in schema.lenient_tiers:
         if tier not in schema.tiers:
             problems.append(f"UNKNOWN_TIER: lenient.allowed names {tier!r}, which is not a tier")
@@ -887,7 +901,51 @@ def _semantic(schema: Schema, problems: list[str]) -> None:
             target = deferred_target(path_text)
             if target is not None:
                 refuse(f"document validator {ref.name}", path_text, target)
+    _rule_paths(schema, behaviors, problems, deferred_target, refuse)
     _cycles(schema, problems)
+
+
+def _rule_paths(
+    schema: Schema,
+    behaviors: BehaviorRegistry,
+    problems: list[str],
+    deferred_target: Callable[[str], FieldSpec | None],
+    refuse: Callable[[str, str, FieldSpec], None],
+) -> None:
+    """The paths a rule is given as arguments (the arguments its registration declares as `path` or `paths`): each must be
+    declared and must not be deferred, and two uses of one document rule must not start at the same path."""
+    uses = [(f"field {spec.pattern}", ref, "field") for spec in schema.fields for ref in spec.validate]
+    uses += [("document_validate", ref, "document") for ref in schema.document_validate]
+    first_paths: set[tuple[str, int, str]] = set()
+    for where, ref, place in uses:
+        behavior = behaviors.get(ref.name, ref.version)
+        if behavior is None or behavior.kind != "validate" or behavior.args is None:
+            continue
+        paths: list[str] = []
+        for spec in behavior.args:
+            if spec.kind in ("path", "paths") and spec.name in ref.args:
+                value = ref.args[spec.name]
+                items = [value] if isinstance(value, str) else list(value) if isinstance(value, tuple) else []
+                paths.extend(p for p in items if isinstance(p, str))  # a malformed argument is reported with the others
+        for path_text in paths:
+            try:
+                parsed = parse_path(path_text)
+            except PathError:
+                continue  # reported with the argument problems
+            if schema.field_for(parsed) is None and schema.derived_field_at_or_above(parsed) is None:
+                problems.append(
+                    f"UNKNOWN_RULE_PATH: {where}: {ref.name}@{ref.version} reads {path_text}, which no field of the schema declares"
+                )
+            elif (target := deferred_target(path_text)) is not None:
+                refuse(f"{ref.name}@{ref.version} on {where}", path_text, target)
+        if place == "document" and paths:
+            key = (ref.name, ref.version, paths[0])
+            if key in first_paths:
+                problems.append(
+                    f"DUPLICATE_RULE_SCOPE: {where}: {ref.name}@{ref.version} is used twice starting at {paths[0]};"
+                    " both would be the same model error"
+                )
+            first_paths.add(key)
 
 
 def _cycles(schema: Schema, problems: list[str]) -> None:
