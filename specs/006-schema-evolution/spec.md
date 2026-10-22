@@ -4,7 +4,7 @@
 
 **Created**: 2026-10-20
 
-**Status**: Draft
+**Status**: Implemented
 
 **Depends on**: Features 001 to 005, all implemented; docs/SPEC.md sections 14 (versioning and evolution), 10.4 (re-evaluation
 on a schema change), 9.2 (a field that becomes derived), 4.4 (tiers) and 15.3 (compaction and schema versions).
@@ -16,7 +16,7 @@ on a schema change), 9.2 (a field that becomes derived), 4.4 (tiers) and 15.3 (c
 ### Session 2026-10-20
 
 - Q: Do the active version and each document's pin live in the shared store, or does each process choose its own? → A: The shared store holds them. An activation, pin, unpin or migration takes effect for every process on its next request or read; the application's schema files only have to contain the versions. A process whose files lack the active version stops serving with a clear refusal naming the missing version.
-- Q: When a version tightens a type or constraint, are non-conforming entries shadowed or is the change refused? → A: Shadowed, with the reason "no longer conforms"; the change is classed breaking, needs the acknowledgement, and the change list and dry run count the entries. It is never refused for that.
+- Q: When a version tightens a type or constraint (the type expression, such as a parameterized list; a validation rule is a model error, not a shadow), are non-conforming entries shadowed or is the change refused? → A: Shadowed, with the reason "no longer conforms"; the change is classed breaking, needs the acknowledgement, and the change list and dry run count the entries. It is never refused for that.
 - Q: Who may activate, roll back, pin or migrate? → A: Any operator with access to the library or command line, who must give an operator name that is recorded in the history. The schema lists nobody; access is the deployment's concern, as for `rebuild` and `compact`.
 - Q: Does an unlimited dry run examine every document or a default sample? → A: Every document, unless a limit or a list of documents is given; the report always states how many documents it examined and how many it left out.
 - Q: If one document cannot be derived during an eager rebuild after an activation, does the activation stand? → A: Yes. The activation is recorded and stands; the rebuild reports the documents it could not derive and continues with the rest. A rollback is a separate, explicit activation.
@@ -103,7 +103,7 @@ its model errors and its skipped entries are exactly what the dry run said, and 
 Some documents cannot move yet: a customer's contract data is validated under last year's schema until a review is done. An
 operator **pins** a document to a version. It reads and is written under that version while everything else follows the active
 one. When the review is done the operator **migrates** it: a dry run for that one document shows what changes, and then the
-document moves to a chosen version (usually the active one) and is unpinned. Migration can be done in batches over many
+document moves to a chosen version (usually the active one). It is unpinned when that version is the active one, and otherwise stays pinned, now to the chosen version. Migration can be done in batches over many
 documents, reports progress, can be stopped and resumed, and a failure on one document does not stop the others. Pins and
 migrations are recorded acts like activations.
 
@@ -212,7 +212,7 @@ shows none skipped.
   dropped.
 - **FR-008**: A dry run MUST report, for each examined document, whether the merged document, the model errors and the skipped
   entries would differ under a target version, with counts and the first differences, and MUST report how many documents it
-  left out.
+  left out. Documents pinned to a version are left out and counted, since an activation does not touch them.
 - **FR-009**: A dry run MUST write nothing (no view, layer, history entry or derived value), MUST NOT call a hook or a deferred
   source, and MUST report a document that would need an impure hook call as such instead of calling it.
 - **FR-010**: A dry run MUST accept a limit or a list of documents; a limit MUST pick the same documents each time.
@@ -231,7 +231,8 @@ shows none skipped.
 - **FR-014**: A pinned document MUST be read and written under its pinned version, and a pin MUST be refused for the reasons an
   activation is.
 - **FR-015**: The system MUST offer a dry run for one document and a migration of a document to a chosen version (the active one
-  by default) that unpins it, records the act, and leaves its entries as they were.
+  by default) that unpins it when that version is the active one (otherwise it stays pinned, to the chosen version), records the
+  act, and leaves its entries as they were.
 - **FR-016**: A batch migration MUST work over a list of documents or all pinned ones, report progress, continue past a document
   that cannot be derived under the target (reporting it and leaving it on its version), and be safe to run again after a stop
   without touching what already moved.
@@ -298,4 +299,4 @@ shows none skipped.
 - Reading a document under a version other than its own for comparison (a dry run) uses the same derivation as a read, without
   storing anything.
 - The conformance vectors gain version-change cases; the Python port's CLI gains `schema diff`, `schema plan`, `schema activate`,
-  `schema history`, `pin` and `migrate`.
+  `schema history`, `pin`, `unpin` and `migrate`.

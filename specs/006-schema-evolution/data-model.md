@@ -24,7 +24,7 @@ Stored text is canonical (SPEC 3.1) in both backends.
 
 ## New values
 
-- `Change(kind, path, description, change_class, classified, detail)`: `kind` such as `field_added`, `merge_changed`, `tier_reordered`;
+- `Change(kind, path, description, change_class, classified, detail)`: `kind` such as `field_added`, `merge_changed`, `tier_changed`;
   `change_class` in `compatible | visible | breaking`; `classified` false for "not classified".
 - `ChangeList(old_version, new_version, changes, overall)`.
 - `DryRunReport(change_list, target, generation, examined, left_out, changed, unchanged, failed, would_call_hook, documents)` where

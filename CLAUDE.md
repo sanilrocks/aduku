@@ -15,7 +15,7 @@ contributions merged into documents by a central annotated schema. Language port
 
 Spec Kit (hyphenated commands: `/speckit-constitution`, `-specify`, `-clarify`, `-plan`, `-tasks`, `-analyze`,
 `-implement`, `-converge`). Run Claude Code from this folder. Prompts for the features still to be specified are in `docs/prompts/specify-features.md`.
-Current step: feature 006 (schema versioning and evolution) is implemented (tasks T001 to T056 done); next `/speckit-analyze` and `/speckit-converge`. Features 001 to 005 are implemented and committed; feature 006 is not committed yet.
+Current step: feature 006 (schema versioning and evolution) is implemented and committed (tasks T001 to T059 done, including the convergence tasks T057 to T059); `/speckit-analyze` has been run and its documentation fixes applied. Features 001 to 006 are implemented and committed.
 
 ## Rules
 
